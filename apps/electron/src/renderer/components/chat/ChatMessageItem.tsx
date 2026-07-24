@@ -95,10 +95,6 @@ interface ChatMessageItemProps {
   isStreaming?: boolean
   /** 是否为最后一条 assistant 消息（用于显示 StreamingIndicator） */
   isLastAssistant?: boolean
-  /** 所有消息列表 */
-  allMessages?: ChatMessage[]
-  /** 消息在列表中的索引 */
-  messageIndex?: number
   /** 删除消息回调 */
   onDeleteMessage?: (messageId: string) => Promise<void>
   /** 重新发送用户消息 */

@@ -10,6 +10,7 @@
  */
 
 import type { AgentRuntime, PromaPermissionMode } from '@proma/shared'
+import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { getUserProfile } from './user-profile-service'
@@ -17,6 +18,11 @@ import { getWorkspaceMcpConfig } from './agent-workspace-manager'
 import { getConfigDirName } from './config-paths'
 import { buildGitAttributionPromptSection, isGitAttributionEnabled } from './agent-git-attribution'
 import { getSettings } from './settings-service'
+import {
+  buildWorkspaceKnowledgeRecoveryInstruction,
+  formatWorkspaceKnowledgeFileState,
+  type WorkspaceKnowledgeFileState,
+} from './agent-workspace-knowledge-prompt'
 
 // ===== 工具使用指南（可复用常量） =====
 
@@ -44,6 +50,8 @@ function buildWorkspacePromptPaths(workspaceSlug: string, sessionId: string) {
   const configDirName = getConfigDirName()
   const workspaceRoot = join(homedir(), configDirName, 'agent-workspaces', workspaceSlug)
   const autoMemoryDir = join(workspaceRoot, '.claude', 'memory')
+  const claudeMd = join(workspaceRoot, 'CLAUDE.md')
+  const autoMemoryIndex = join(autoMemoryDir, 'MEMORY.md')
 
   return {
     workspaceRoot,
@@ -51,9 +59,11 @@ function buildWorkspacePromptPaths(workspaceSlug: string, sessionId: string) {
     mcpConfig: join(workspaceRoot, 'mcp.json'),
     skillsDir: join(workspaceRoot, 'skills'),
     workspaceContextDir: join(workspaceRoot, 'workspace-files', '.context'),
-    claudeMd: join(workspaceRoot, 'CLAUDE.md'),
+    claudeMd,
+    claudeMdExists: existsSync(claudeMd),
     autoMemoryDir,
-    autoMemoryIndex: join(autoMemoryDir, 'MEMORY.md'),
+    autoMemoryIndex,
+    autoMemoryIndexExists: existsSync(autoMemoryIndex),
     sdkConfigDir: join(homedir(), configDirName, 'sdk-config'),
   }
 }
@@ -75,6 +85,12 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
   const workspacePaths = ctx.workspaceSlug
     ? buildWorkspacePromptPaths(ctx.workspaceSlug, ctx.sessionId)
     : undefined
+  const workspaceKnowledgeFiles: WorkspaceKnowledgeFileState[] = workspacePaths
+    ? [
+        { label: '工作区规则文件 CLAUDE.md', path: workspacePaths.claudeMd, exists: workspacePaths.claudeMdExists },
+        { label: 'Auto Memory 索引', path: workspacePaths.autoMemoryIndex, exists: workspacePaths.autoMemoryIndexExists },
+      ]
+    : []
 
   const sections: string[] = []
 
@@ -136,9 +152,9 @@ Proma 提供内置 \`collaboration\` 工具，用来创建真实可见、可追�
 - 工作区名称: ${ctx.workspaceName}
 - 工作区根目录: ${workspacePaths?.workspaceRoot}
 - 当前会话目录（cwd）: ${workspacePaths?.sessionDir}
-- 工作区 CLAUDE.md: ${workspacePaths?.claudeMd}
+- ${workspacePaths ? formatWorkspaceKnowledgeFileState(workspaceKnowledgeFiles[0]!) : '工作区规则文件 CLAUDE.md: 未配置工作区'}（这是 Proma 的工作区规则文件名，与本机是否安装 Claude Code 无关）
 - 工作区 Auto Memory 目录: ${workspacePaths?.autoMemoryDir}
-- 工作区 Auto Memory 索引: ${workspacePaths?.autoMemoryIndex}
+- ${workspacePaths ? formatWorkspaceKnowledgeFileState(workspaceKnowledgeFiles[1]!) : 'Auto Memory 索引: 未配置工作区'}
 - SDK 隔离配置目录: ${workspacePaths?.sdkConfigDir}（用于 Proma 与 Claude Code CLI 的 SDK 配置隔离；不要把它当作工作区长期 memory 目录）
 - MCP 配置: ${workspacePaths?.mcpConfig}（顶层 key 是 \`servers\`）
 - Skills 目录: ${workspacePaths?.skillsDir}/（Proma 只从此目录加载 skill；npx skills add 等外部命令安装到 .agents/skills/ 不会被加载，需手动 mv 到此目录）
@@ -153,7 +169,7 @@ Proma 提供内置 \`collaboration\` 工具，用来创建真实可见、可追�
 - 只与当前任务相关的内容 → 会话级 \`.context/\`
 - 跨会话有参考价值的内容（调研报告、架构分析等） → 工作区级 \`.context/\`
 - 用户明确指定了位置时，按用户要求
-- 新会话开始时，**两个目录都要检查**以恢复完整上下文`)
+- 仅在内容与当前任务相关时，按需检查对应目录，不要无差别枚举或全量读取`)
   }
 
   // 自主执行与最小澄清策略
@@ -226,7 +242,7 @@ Skills 用来固化可复用的流程、决策树和 SOP（"以后遇到类似�
 | 简单问答、一次性修改 | → 直接回复，不写文件 |
 | 执行计划 | → 写入 .context/plan/ 目录 |
 
-维护这些长期文件前，先按需搜索当前会话、会话级 Context、工作区级 Context、CLAUDE.md、auto memory 索引和 Skills 元数据；涉及长期副作用时，优先提出简短维护建议，让用户知道会改哪里、为什么改、下次会怎样。`)
+维护这些长期文件前，只搜索上方明确标注为当前存在的文件，并始终使用列出的绝对路径；不存在的文件直接跳过，不要用相对路径试读。涉及长期副作用时，优先提出简短维护建议，让用户知道会改哪里、为什么改、下次会怎样。`)
 
   // Git / PR 推广标识（默认开启，设置可关）
   const gitAttributionEnabled = isGitAttributionEnabled(getSettings().gitAttributionEnabled)
@@ -239,8 +255,8 @@ Skills 用来固化可复用的流程、决策树和 SOP（"以后遇到类似�
 2. 与用户确认破坏性操作后再执行
 3. 自称 Proma Agent，你会非常积极地维护 Proma 知识架构：该进 CLAUDE.md 的规则、该进 Memory 的经验、该做成 Skills 的流程、该放会话级/工作区级 Context 的任务状态和长内容要分清楚，并帮助用户用最少认知成本完成沉淀
 4. 日常交流简洁直接；但当任务的交付物本身就是文本输出时（分析报告、文档、方案对比），完整输出内容，不要压缩
-5. **会话恢复**：每次收到新任务时，先按需检查会话级和工作区级两个 \`.context/\` 目录（note.md、todo.md）、工作区根目录的 CLAUDE.md、\`.claude/memory/MEMORY.md\` 和相关 Skills，不要无差别全量读取
-6. **自检习惯**：复杂任务执行过程中，定期回顾相关的 CLAUDE.md、SDK auto memory、Skills 和两级 .context/ 内容，确保行为与已记录的规范、经验和计划保持一致
+5. **会话恢复**：${buildWorkspaceKnowledgeRecoveryInstruction(workspaceKnowledgeFiles)}
+6. **自检习惯**：复杂任务执行过程中，只回顾与任务相关且已确认存在的工作区规则、SDK auto memory、Skills 和两级 .context/ 内容；不要试读不存在的文件
 7. **定时任务**：Proma 内置了持久化的定时任务系统（Automation），适合无人值守、有稳定价值的场景——既包括长期反复的周期任务，也包括「未来某个时间点跑一次」（once）或「跑有限几次就停」（maxRuns）的延时任务。**不要用 TaskCreate、CronCreate 或 Bash cron**，它们都不是真正的 Proma 定时任务。
    \`automation\` 是 Proma 内嵌 Skill，遇到可能反复、长期、持续关注、自动检查、定期汇总、运行记录复盘、已有任务维护，或「过一会儿/X 小时后/到某个时间点自动跑一次」等需求时，宁可先触发此 Skill 判断是否适合，也不要漏掉潜在的自动化机会；再通过 Proma 内置的 automation MCP 工具创建、查看、修改、暂停、删除或试运行任务。
    如果只是纯提醒/闹钟、需要用户实时参与判断、或现在就该做完即终结的事，明确告诉用户不建议创建定时任务。

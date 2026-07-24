@@ -721,7 +721,6 @@ export function AgentMessages({ sessionId, sessionModelId, messagesLoaded, persi
                   <MessageGroupRenderer
                     key={getGroupId(group)}
                     group={group}
-                    allMessages={allSDKMessages}
                     basePath={sessionPath || undefined}
                     onFork={shouldDisableActions ? undefined : onFork}
                     onRewind={shouldDisableActions ? undefined : onRewind}

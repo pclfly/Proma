@@ -1,5 +1,5 @@
 /**
- * Nano Banana 生图工具模块（Chat 模式）
+ * AI 生图工具模块（Chat 模式）
  *
  * 基于 Gemini Image Generation API 提供 AI 生图能力。
  * 支持文生图、参考图编辑、多轮连续修改。
@@ -11,6 +11,13 @@ import type { ChatToolMeta, FileAttachment } from '@proma/shared'
 import { randomUUID } from 'node:crypto'
 import { getToolCredentials } from '../chat-tool-config'
 import { saveAttachment, readAttachmentAsBase64, isImageAttachment } from '../attachment-service'
+import {
+  DEFAULT_OPENAI_IMAGE_MODEL,
+  generateOpenAICompatibleImages,
+  getImageFileExtension,
+  resolveImageGenerationProvider,
+  type OpenAIReferenceImage,
+} from './openai-image-provider'
 
 // ===== Gemini API 类型（REST API 使用 camelCase） =====
 
@@ -75,8 +82,8 @@ const DEFAULT_MODEL = 'gemini-3.1-flash-image-preview'
 
 export const NANO_BANANA_TOOL_META: ChatToolMeta = {
   id: 'nano-banana',
-  name: 'Nano Banana',
-  description: 'AI 图片生成与编辑（基于 Gemini Image Generation）',
+  name: 'AI 生图',
+  description: 'AI 图片生成与编辑（支持 Gemini 和 OpenAI Images 兼容接口）',
   params: [
     { name: 'prompt', type: 'string', description: '图片生成/编辑描述', required: true },
   ],
@@ -85,7 +92,7 @@ export const NANO_BANANA_TOOL_META: ChatToolMeta = {
   executorType: 'builtin',
   systemPromptAppend: `
 <nano_banana_instructions>
-你拥有 AI 图片生成和编辑能力（Nano Banana）。
+你拥有 AI 图片生成能力。用户明确要求生成、绘制、设计、创作图片时，必须调用 generate_image，不要只返回提示词或文字描述。
 
 **generate_image — 生成/编辑图片：**
 当用户需要创建或修改图片时调用：
@@ -97,13 +104,14 @@ export const NANO_BANANA_TOOL_META: ChatToolMeta = {
 - prompt: 详细描述想要生成的图片内容，用英文描述效果最佳
 - aspectRatio: 可选宽高比 "1:1"(默认) / "16:9" / "4:3" / "9:16" / "3:4"
 - imageSize: 可选分辨率 "auto"(默认) / "1K" / "2K" / "4K"
+- size: OpenAI Images 兼容接口的图片尺寸 "auto" / "1024x1024" / "1536x1024" / "1024x1536"
 - numberOfImages: 可选生成数量 1-4（默认 1），用户要求多张时设置
 - useReferenceImages: 当用户上传了参考图或要求修改之前生成的图片时设为 true
 
 **使用技巧：**
 - 生成新图片时用详细的英文描述
-- 编辑图片时设置 useReferenceImages: true，并在 prompt 中描述要做的修改
-- 支持连续修改：多次调用时会自动保持上下文
+- Gemini 提供方编辑图片时设置 useReferenceImages: true，并在 prompt 中描述修改内容
+- OpenAI Images 提供方有参考图时自动使用 edits 高保真模式；同一产品的每次生成都应启用参考图
 </nano_banana_instructions>`,
 }
 
@@ -129,6 +137,11 @@ export const NANO_BANANA_TOOL_DEFINITIONS: ToolDefinition[] = [
           type: 'string',
           description: 'Resolution of the generated image',
           enum: ['auto', '1K', '2K', '4K'],
+        },
+        size: {
+          type: 'string',
+          description: 'OpenAI Images compatible output size',
+          enum: ['auto', '1024x1024', '1536x1024', '1024x1536'],
         },
         useReferenceImages: {
           type: 'string',
@@ -200,6 +213,30 @@ function collectReferenceImages(context: NanoBananaContext): GeminiPart[] {
   return parts
 }
 
+function collectOpenAIReferenceImages(context: NanoBananaContext): OpenAIReferenceImage[] {
+  const userAttachments = [
+    ...(context.currentAttachments ?? []),
+    ...(context.previousUserAttachments ?? []),
+  ].filter((attachment) => isImageAttachment(attachment.mediaType))
+  const fallbackAttachments = (context.previousAssistantAttachments ?? [])
+    .filter((attachment) => isImageAttachment(attachment.mediaType))
+  const sourceAttachments = userAttachments.length > 0 ? userAttachments : fallbackAttachments
+
+  const images: OpenAIReferenceImage[] = []
+  for (const attachment of sourceAttachments.slice(0, 4)) {
+    try {
+      images.push({
+        data: Buffer.from(readAttachmentAsBase64(attachment.localPath), 'base64'),
+        mediaType: attachment.mediaType,
+        filename: attachment.filename,
+      })
+    } catch (error) {
+      console.warn(`[AI 生图] 读取 OpenAI 参考图失败: ${attachment.localPath}`, error)
+    }
+  }
+  return images
+}
+
 /**
  * Gemini 多轮对话中，模型响应包含 thoughtSignature 后，
  * 后续所有 user 消息的 text part 也必须携带 thoughtSignature。
@@ -265,6 +302,54 @@ function buildGeminiRequest(
   return { contents, generationConfig }
 }
 
+async function executeOpenAIImagesTool(input: {
+  toolCall: ToolCall
+  context: NanoBananaContext
+  credentials: Record<string, string>
+  prompt: string
+  size?: string
+  aspectRatio?: string
+  numberOfImages: number
+  useReferenceImages: boolean
+}): Promise<ToolResult> {
+  const referenceImages = input.useReferenceImages
+    ? collectOpenAIReferenceImages(input.context)
+    : []
+  const images = await generateOpenAICompatibleImages({
+    apiKey: input.credentials.apiKey ?? '',
+    endpoint: input.credentials.baseUrl,
+    model: input.credentials.model,
+    prompt: input.prompt,
+    size: input.size,
+    aspectRatio: input.aspectRatio,
+    defaultSize: input.credentials.defaultSize,
+    numberOfImages: input.numberOfImages,
+    referenceImages,
+  })
+  const generatedAttachments: FileAttachment[] = []
+  const revisedPrompts: string[] = []
+
+  for (const image of images) {
+    const result = saveAttachment({
+      conversationId: input.context.conversationId,
+      filename: `generated-image-${randomUUID().slice(0, 8)}${getImageFileExtension(image.mediaType)}`,
+      mediaType: image.mediaType,
+      data: image.base64,
+    })
+    generatedAttachments.push(result.attachment)
+    if (image.revisedPrompt) revisedPrompts.push(image.revisedPrompt)
+  }
+
+  const promptInfo = revisedPrompts.length > 0
+    ? `\n\n优化后的提示词：\n${revisedPrompts.join('\n')}`
+    : ''
+  return {
+    toolCallId: input.toolCall.id,
+    content: `图片已成功生成（${generatedAttachments.length} 张）${promptInfo}`,
+    generatedAttachments,
+  }
+}
+
 /**
  * 执行 Nano Banana 工具调用
  */
@@ -286,7 +371,11 @@ export async function executeNanoBananaTool(
     const prompt = toolCall.arguments.prompt as string
     const aspectRatio = toolCall.arguments.aspectRatio as string | undefined
     const imageSize = toolCall.arguments.imageSize as string | undefined
-    const useReferenceImages = toolCall.arguments.useReferenceImages === 'true'
+    const size = toolCall.arguments.size as string | undefined
+    const hasCurrentImage = context.currentAttachments?.some((attachment) => (
+      isImageAttachment(attachment.mediaType)
+    )) ?? false
+    const useReferenceImages = toolCall.arguments.useReferenceImages === 'true' || hasCurrentImage
     const numberOfImages = typeof toolCall.arguments.numberOfImages === 'number'
       ? Math.min(Math.max(Math.round(toolCall.arguments.numberOfImages), 1), 4)
       : 1
@@ -297,6 +386,20 @@ export async function executeNanoBananaTool(
         content: '参数缺失: prompt',
         isError: true,
       }
+    }
+
+    if (resolveImageGenerationProvider(credentials) === 'openai-images') {
+      console.log(`[AI 生图] 调用 OpenAI Images 兼容接口: model=${credentials.model || DEFAULT_OPENAI_IMAGE_MODEL}, prompt="${prompt.slice(0, 50)}..."`)
+      return await executeOpenAIImagesTool({
+        toolCall,
+        context,
+        credentials,
+        prompt,
+        size,
+        aspectRatio,
+        numberOfImages,
+        useReferenceImages,
+      })
     }
 
     const baseUrl = credentials.baseUrl?.trim() || DEFAULT_BASE_URL

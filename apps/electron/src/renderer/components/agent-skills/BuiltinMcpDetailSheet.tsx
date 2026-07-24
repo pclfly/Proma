@@ -34,8 +34,8 @@ interface BuiltinMcpConfigInfo {
 function getConfigInfo(server: BuiltinMcpServerSummary): BuiltinMcpConfigInfo {
   if (server.id === 'nano-banana') {
     return {
-      source: 'Chat 工具 / Nano Banana',
-      description: '配置 Gemini API Key、API 地址、模型与开关后，Agent 会话才能注入生图 MCP。',
+      source: 'Chat 工具 / AI 生图',
+      description: '选择 Gemini 或 OpenAI Images 兼容协议，配置 API Key、API 地址、模型与开关后，Agent 会话即可注入生图 MCP。',
       actionLabel: '配置生图',
     }
   }

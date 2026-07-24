@@ -125,7 +125,6 @@ function segmentMessages(
 /** 单列消息渲染 */
 interface MessageColumnProps {
   messages: ChatMessage[]
-  allMessages: ChatMessage[]
   /** 当前对话 ID（用于迁移到 Agent 模式） */
   conversationId?: string
   onDeleteMessage?: (messageId: string) => Promise<void>
@@ -144,7 +143,6 @@ interface MessageColumnProps {
 
 function MessageColumn({
   messages,
-  allMessages,
   conversationId,
   onDeleteMessage,
   onResendMessage,
@@ -191,7 +189,6 @@ function MessageColumn({
             key={message.id}
             message={message}
             conversationId={conversationId}
-            allMessages={allMessages}
             onDeleteMessage={onDeleteMessage}
             onResendMessage={onResendMessage}
             onStartInlineEdit={onStartInlineEdit}
@@ -292,7 +289,6 @@ export function ParallelChatMessages({
             </div>
             <MessageColumn
               messages={userMessages}
-              allMessages={messages}
               conversationId={conversationId}
               onDeleteMessage={onDeleteMessage}
               onResendMessage={onResendMessage}
@@ -313,7 +309,6 @@ export function ParallelChatMessages({
             </div>
             <MessageColumn
               messages={assistantMessages}
-              allMessages={messages}
               conversationId={conversationId}
               onDeleteMessage={onDeleteMessage}
               onResendMessage={onResendMessage}
@@ -361,7 +356,6 @@ export function ParallelChatMessages({
                 )}
                 <MessageColumn
                   messages={segment.userMessages}
-                  allMessages={messages}
                   conversationId={conversationId}
                   onDeleteMessage={onDeleteMessage}
                   onResendMessage={onResendMessage}
@@ -384,7 +378,6 @@ export function ParallelChatMessages({
                 )}
                 <MessageColumn
                   messages={segment.assistantMessages}
-                  allMessages={messages}
                   conversationId={conversationId}
                   onDeleteMessage={onDeleteMessage}
                   onResendMessage={onResendMessage}

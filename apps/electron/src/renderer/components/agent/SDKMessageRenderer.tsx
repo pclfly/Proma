@@ -373,7 +373,7 @@ export function buildTaskProgressDataForTurn(turn: AssistantTurn): { taskActivit
 
 export interface AssistantTurnRendererProps {
   turn: AssistantTurn
-  /** 所有消息（全局，供工具结果查找跨 turn 的结果） */
+  /** 当前 turn 的消息，用于查找工具结果和任务通知 */
   allMessages: SDKMessage[]
   basePath?: string
   /** 分叉回调（传入最后一条 assistant 消息的 uuid） */
@@ -1310,7 +1310,6 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact }: Erro
 
 export interface MessageGroupRendererProps {
   group: MessageGroup
-  allMessages: SDKMessage[]
   basePath?: string
   onFork?: (upToMessageUuid: string) => void
   onRewind?: (assistantMessageUuid: string) => void
@@ -1374,7 +1373,49 @@ export function getGroupId(group: MessageGroup): string {
 
 // getGroupPreview 已迁移至 @proma/session-core（本文件从该包 import 并 re-export）
 
-export function MessageGroupRenderer({ group, allMessages, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
+function isSameMessageSequence(previous: SDKMessage[], next: SDKMessage[]): boolean {
+  if (previous === next) return true
+  if (previous.length !== next.length) return false
+  return previous.every((message, index) => message === next[index])
+}
+
+function isSameMessageGroup(previous: MessageGroup, next: MessageGroup): boolean {
+  if (previous === next) return true
+  if (previous.type !== next.type) return false
+
+  if (previous.type === 'user' && next.type === 'user') {
+    return previous.message === next.message
+  }
+  if (previous.type === 'system' && next.type === 'system') {
+    return previous.message === next.message && previous.identityMessage === next.identityMessage
+  }
+  if (previous.type === 'assistant-turn' && next.type === 'assistant-turn') {
+    return previous.model === next.model
+      && previous.createdAt === next.createdAt
+      && previous.startsAfterWake === next.startsAfterWake
+      && isSameMessageSequence(previous.assistantMessages, next.assistantMessages)
+      && isSameMessageSequence(previous.turnMessages, next.turnMessages)
+  }
+  return false
+}
+
+export function areMessageGroupRendererPropsEqual(
+  previous: MessageGroupRendererProps,
+  next: MessageGroupRendererProps,
+): boolean {
+  return isSameMessageGroup(previous.group, next.group)
+    && previous.basePath === next.basePath
+    && previous.onFork === next.onFork
+    && previous.onRewind === next.onRewind
+    && previous.onRetry === next.onRetry
+    && previous.onRetryInNewSession === next.onRetryInNewSession
+    && previous.onCompact === next.onCompact
+    && previous.isStreaming === next.isStreaming
+    && previous.stoppedByUser === next.stoppedByUser
+    && previous.sessionModelId === next.sessionModelId
+}
+
+export const MessageGroupRenderer = React.memo(function MessageGroupRenderer({ group, basePath, onFork, onRewind, onRetry, onRetryInNewSession, onCompact, isStreaming, stoppedByUser, sessionModelId }: MessageGroupRendererProps): React.ReactElement | null {
   const groupId = getGroupId(group)
 
   if (group.type === 'user') {
@@ -1397,7 +1438,7 @@ export function MessageGroupRenderer({ group, allMessages, basePath, onFork, onR
     <div data-message-id={groupId} data-message-role="assistant">
       <AssistantTurnRenderer
         turn={group}
-        allMessages={allMessages}
+        allMessages={group.turnMessages}
         basePath={basePath}
         onFork={onFork}
         onRewind={onRewind}
@@ -1410,4 +1451,4 @@ export function MessageGroupRenderer({ group, allMessages, basePath, onFork, onR
       />
     </div>
   )
-}
+}, areMessageGroupRendererPropsEqual)

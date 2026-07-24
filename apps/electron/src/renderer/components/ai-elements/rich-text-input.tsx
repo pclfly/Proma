@@ -31,6 +31,7 @@ import { richTextRenderingEnabledAtom } from '@/atoms/ui-preferences'
 import { createFileMentionSuggestion } from '@/components/file-browser/file-mention-suggestion'
 import { createSkillMentionSuggestion, createMcpMentionSuggestion, createSessionMentionSuggestion } from '@/components/agent/mention-suggestions'
 import { shouldConvertClipboardTextToAttachment } from '@/lib/clipboard-text-attachment'
+import { EditableTextContextMenu } from './text-context-menu'
 import {
   VOICE_DICTATION_INSERT_EVENT,
   getLastFocusedVoiceInputId,
@@ -697,42 +698,61 @@ export function RichTextInput({
   // 是否显示折叠按钮：启用 collapsible 且内容已自动扩展
   const showCollapseToggle = collapsible && isExpanded
 
+  const handleContextMenuPaste = useCallback((text: string): boolean => {
+    const threshold = longTextPasteThresholdRef.current
+    if (
+      threshold
+      && threshold > 0
+      && text.length >= threshold
+      && onPasteLongTextRef.current
+    ) {
+      onPasteLongTextRef.current(text)
+      return true
+    }
+    return false
+  }, [])
+
   return (
-    <div
-      onKeyDownCapture={(event) => forwardSessionQuickSwitchKeyEvent(event, 'keydown')}
-      onKeyUpCapture={(event) => forwardSessionQuickSwitchKeyEvent(event, 'keyup')}
-      className={cn(
-        'rich-text-input relative w-full overflow-y-auto overscroll-contain scrollbar-thin transition-[max-height] duration-200 ease-in-out',
-        isManuallyCollapsed
-          ? 'max-h-[101px]'
-          : isExpanded ? 'max-h-[500px]' : 'max-h-[200px]',
-        disabled && 'opacity-50 cursor-not-allowed',
-        className
-      )}
+    <EditableTextContextMenu
+      editor={editor}
+      disabled={disabled}
+      onPasteText={handleContextMenuPaste}
     >
-      <EditorContent editor={editor} className="w-full" />
-      {/* 折叠/展开切换按钮 — sticky 悬浮在滚动区域内 */}
-      {showCollapseToggle && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              type="button"
-              className="sticky bottom-1 float-right mr-2 z-10 p-0.5 rounded hover:bg-muted/80 text-muted-foreground/50 hover:text-muted-foreground transition-colors"
-              onClick={() => setIsManuallyCollapsed((prev) => !prev)}
-            >
-              {isManuallyCollapsed ? (
-                <ChevronsUpDown className="size-3.5" />
-              ) : (
-                <ChevronsDownUp className="size-3.5" />
-              )}
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="top">
-            {isManuallyCollapsed ? '展开输入框' : '折叠输入框'}
-          </TooltipContent>
-        </Tooltip>
-      )}
-      <style>{`
+      <div
+        onKeyDownCapture={(event) => forwardSessionQuickSwitchKeyEvent(event, 'keydown')}
+        onKeyUpCapture={(event) => forwardSessionQuickSwitchKeyEvent(event, 'keyup')}
+        className={cn(
+          'rich-text-input relative w-full overflow-y-auto overscroll-contain scrollbar-thin transition-[max-height] duration-200 ease-in-out',
+          isManuallyCollapsed
+            ? 'max-h-[101px]'
+            : isExpanded ? 'max-h-[500px]' : 'max-h-[200px]',
+          disabled && 'opacity-50 cursor-not-allowed',
+          className
+        )}
+      >
+        <EditorContent editor={editor} className="w-full" />
+        {/* 折叠/展开切换按钮 — sticky 悬浮在滚动区域内 */}
+        {showCollapseToggle && (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className="sticky bottom-1 float-right mr-2 z-10 p-0.5 rounded hover:bg-muted/80 text-muted-foreground/50 hover:text-muted-foreground transition-colors"
+                onClick={() => setIsManuallyCollapsed((prev) => !prev)}
+              >
+                {isManuallyCollapsed ? (
+                  <ChevronsUpDown className="size-3.5" />
+                ) : (
+                  <ChevronsDownUp className="size-3.5" />
+                )}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              {isManuallyCollapsed ? '展开输入框' : '折叠输入框'}
+            </TooltipContent>
+          </Tooltip>
+        )}
+        <style>{`
         .ProseMirror {
           outline: none;
           padding: 9px 15px 0px;
@@ -858,7 +878,8 @@ export function RichTextInput({
           mask-repeat: no-repeat;
           flex-shrink: 0;
         }
-      `}</style>
-    </div>
+        `}</style>
+      </div>
+    </EditableTextContextMenu>
   )
 }

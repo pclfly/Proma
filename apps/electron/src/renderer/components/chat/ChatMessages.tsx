@@ -34,6 +34,7 @@ import {
   ConversationScrollButton,
 } from '@/components/ai-elements/conversation'
 import { ScrollMinimap } from '@/components/ai-elements/scroll-minimap'
+import { ConversationTextContextMenu } from '@/components/ai-elements/text-context-menu'
 import type { MinimapItem } from '@/components/ai-elements/scroll-minimap'
 import { useStickToBottomContext } from 'use-stick-to-bottom'
 import { ContextDivider } from '@/components/ai-elements/context-divider'
@@ -337,23 +338,25 @@ export function ChatMessages({
   // 并排模式
   if (parallelMode) {
     return (
-      <ParallelChatMessages
-        messages={messages}
-        conversationId={conversationId}
-        streaming={streaming}
-        streamingContent={smoothContent}
-        streamingReasoning={smoothReasoning}
-        startedAt={startedAt}
-        contextDividers={contextDividers}
-        onDeleteDivider={onDeleteDivider}
-        onDeleteMessage={onDeleteMessage}
-        onResendMessage={onResendMessage}
-        onStartInlineEdit={onStartInlineEdit}
-        onSubmitInlineEdit={onSubmitInlineEdit}
-        onCancelInlineEdit={onCancelInlineEdit}
-        inlineEditingMessageId={inlineEditingMessageId}
-        loadingMore={loadingMore}
-      />
+      <ConversationTextContextMenu>
+        <ParallelChatMessages
+          messages={messages}
+          conversationId={conversationId}
+          streaming={streaming}
+          streamingContent={smoothContent}
+          streamingReasoning={smoothReasoning}
+          startedAt={startedAt}
+          contextDividers={contextDividers}
+          onDeleteDivider={onDeleteDivider}
+          onDeleteMessage={onDeleteMessage}
+          onResendMessage={onResendMessage}
+          onStartInlineEdit={onStartInlineEdit}
+          onSubmitInlineEdit={onSubmitInlineEdit}
+          onCancelInlineEdit={onCancelInlineEdit}
+          inlineEditingMessageId={inlineEditingMessageId}
+          loadingMore={loadingMore}
+        />
+      </ConversationTextContextMenu>
     )
   }
 
@@ -383,7 +386,6 @@ export function ChatMessages({
                     conversationId={conversationId}
                     isStreaming={false}
                     isLastAssistant={false}
-                    allMessages={messages}
                     onDeleteMessage={onDeleteMessage}
                     onResendMessage={onResendMessage}
                     onStartInlineEdit={onStartInlineEdit}

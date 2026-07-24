@@ -8,10 +8,16 @@
 
 import { randomUUID } from 'node:crypto'
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs'
-import { extname, resolve, isAbsolute, join } from 'node:path'
+import { basename, extname, resolve, isAbsolute, join } from 'node:path'
 import { getToolState, getToolCredentials } from '../chat-tool-config'
 import { getBuiltinMcpName } from '../builtin-mcp/baseline'
 import { saveAttachment, isImageAttachment } from '../attachment-service'
+import {
+  generateOpenAICompatibleImages,
+  getImageFileExtension,
+  resolveImageGenerationProvider,
+  type OpenAIReferenceImage,
+} from './openai-image-provider'
 
 // ===== Gemini API 类型（REST API 使用 camelCase） =====
 
@@ -77,6 +83,15 @@ type McpContent = McpTextContent | McpImageContent
 interface McpToolResult {
   content: McpContent[]
   [key: string]: unknown
+}
+
+export interface AgentImageGenerationOptions {
+  size?: string
+  aspectRatio?: string
+  imageSize?: string
+  referenceImagePaths?: string[]
+  cwd?: string
+  numberOfImages?: number
 }
 
 // ===== Gemini API 调用 =====
@@ -188,7 +203,7 @@ function buildGeminiRequest(
 async function callGeminiAndBuildResult(
   prompt: string,
   sessionId: string,
-  options: { aspectRatio?: string; imageSize?: string; referenceImagePaths?: string[]; cwd?: string; numberOfImages?: number },
+  options: AgentImageGenerationOptions,
 ): Promise<McpToolResult> {
   const credentials = getToolCredentials('nano-banana')
   const baseUrl = credentials.baseUrl?.trim() || DEFAULT_BASE_URL
@@ -318,6 +333,111 @@ async function callGeminiAndBuildResult(
   return { content: mcpContent }
 }
 
+function readOpenAIReferenceImages(paths: string[], cwd?: string): OpenAIReferenceImage[] {
+  const images: OpenAIReferenceImage[] = []
+  for (const rawPath of paths.slice(0, 4)) {
+    try {
+      const filePath = isAbsolute(rawPath) ? rawPath : resolve(cwd ?? process.cwd(), rawPath)
+      if (!existsSync(filePath)) {
+        console.warn(`[AI 生图] 参考图不存在: ${filePath}`)
+        continue
+      }
+      const mediaType = EXT_TO_MIME[extname(filePath).toLowerCase()]
+      if (!mediaType || !isImageAttachment(mediaType)) {
+        console.warn(`[AI 生图] 非图片参考文件，已跳过: ${filePath}`)
+        continue
+      }
+      images.push({
+        data: readFileSync(filePath),
+        mediaType,
+        filename: basename(filePath),
+      })
+    } catch (error) {
+      console.warn(`[AI 生图] 读取 OpenAI 参考图失败: ${rawPath}`, error)
+    }
+  }
+  return images
+}
+
+async function callOpenAIImagesAndBuildResult(
+  prompt: string,
+  sessionId: string,
+  options: AgentImageGenerationOptions,
+): Promise<McpToolResult> {
+  const credentials = getToolCredentials('nano-banana')
+  const referenceImages = options.referenceImagePaths?.length
+    ? readOpenAIReferenceImages(options.referenceImagePaths, options.cwd)
+    : []
+  if (referenceImages.length > 0) {
+    console.log(`[AI 生图] 使用 ${referenceImages.length} 张参考图调用 Images edits 高保真模式`)
+  }
+  const images = await generateOpenAICompatibleImages({
+    apiKey: credentials.apiKey ?? '',
+    endpoint: credentials.baseUrl,
+    model: credentials.model,
+    prompt,
+    size: options.size,
+    aspectRatio: options.aspectRatio,
+    defaultSize: credentials.defaultSize,
+    numberOfImages: options.numberOfImages,
+    referenceImages,
+  })
+  const content: McpContent[] = []
+  const textParts: string[] = []
+  const savedWorkspacePaths: string[] = []
+
+  for (const image of images) {
+    const filename = `generated-image-${randomUUID().slice(0, 8)}${getImageFileExtension(image.mediaType)}`
+    const result = saveAttachment({
+      conversationId: sessionId,
+      filename,
+      mediaType: image.mediaType,
+      data: image.base64,
+    })
+
+    if (options.cwd) {
+      const imageDirectory = join(options.cwd, 'generated-images')
+      mkdirSync(imageDirectory, { recursive: true })
+      const workspacePath = join(imageDirectory, filename)
+      writeFileSync(workspacePath, Buffer.from(image.base64, 'base64'))
+      savedWorkspacePaths.push(workspacePath)
+    }
+
+    content.push({ type: 'image', data: image.base64, mimeType: image.mediaType })
+    textParts.push(`[PROMA_IMAGE_ATTACHMENT:${JSON.stringify({
+      localPath: result.attachment.localPath,
+      filename: result.attachment.filename,
+      mediaType: result.attachment.mediaType,
+    })}]`)
+    if (image.revisedPrompt) textParts.push(`优化后的提示词：${image.revisedPrompt}`)
+  }
+
+  const pathInfo = savedWorkspacePaths.length > 0
+    ? `\n图片已保存到工作目录:\n${savedWorkspacePaths.map((path) => `- ${path}`).join('\n')}`
+    : ''
+  content.push({
+    type: 'text',
+    text: `图片已生成（${images.length} 张）${pathInfo}\n${textParts.join('\n')}`,
+  })
+  return { content }
+}
+
+/**
+ * Agent 运行时共用的生图入口。
+ * Claude MCP 与 Pi custom tool 必须复用此处，避免不同内核的能力漂移。
+ */
+export async function executeAgentImageGeneration(
+  prompt: string,
+  sessionId: string,
+  options: AgentImageGenerationOptions,
+): Promise<McpToolResult> {
+  const credentials = getToolCredentials('nano-banana')
+  if (resolveImageGenerationProvider(credentials) === 'openai-images') {
+    return callOpenAIImagesAndBuildResult(prompt, sessionId, options)
+  }
+  return callGeminiAndBuildResult(prompt, sessionId, options)
+}
+
 // ===== MCP Server 注入 =====
 
 /**
@@ -345,17 +465,19 @@ export async function injectNanoBananaMcpServer(
     tools: [
       sdk.tool(
         'generate_image',
-        'Generate or edit images using AI (Gemini Image Generation). Supports text-to-image, reference image editing, and iterative multi-turn editing. Use English prompts for best results. Previous generations are automatically used as context for subsequent calls. When the user uploads images (listed in <attached_files>) or mentions image files via @file:{path}, pass their absolute file paths via referenceImagePaths to use them as reference for editing.',
+        'Generate finished raster images using the configured AI image provider. You MUST call this tool whenever the user asks to generate, draw, design, or create images; do not substitute Python, HTML, SVG, or a text-only prompt. Generate at most 4 images per call and call again for larger sets. When the user provides a product or style reference, always pass its file path through referenceImagePaths so the provider can use image editing with high input fidelity.',
         {
           prompt: z.string().describe('Detailed description of the image to generate or the edits to make. English descriptions work best.'),
           referenceImagePaths: z.array(z.string()).optional().describe('File paths of reference images for editing. Can be absolute paths or relative paths (resolved from cwd). Extract from <attached_files> entries or @file:{path} mentions when the user wants to edit uploaded/referenced images.'),
           aspectRatio: z.enum(['1:1', '16:9', '4:3', '9:16', '3:4']).optional().describe('Aspect ratio (default 1:1)'),
           imageSize: z.enum(['auto', '1K', '2K', '4K']).optional().describe('Resolution (default auto)'),
+          size: z.enum(['auto', '1024x1024', '1536x1024', '1024x1536']).optional().describe('OpenAI Images compatible output size'),
           numberOfImages: z.number().int().min(1).max(4).optional().describe('Number of images to generate (1-4, default 1)'),
         },
         async (args) => {
           try {
-            return await callGeminiAndBuildResult(args.prompt, sessionId, {
+            return await executeAgentImageGeneration(args.prompt, sessionId, {
+              size: args.size,
               aspectRatio: args.aspectRatio,
               imageSize: args.imageSize,
               referenceImagePaths: args.referenceImagePaths,

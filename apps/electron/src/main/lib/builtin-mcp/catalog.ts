@@ -54,7 +54,7 @@ function resolveAvailability(
       available,
       availabilityReason: available
         ? undefined
-        : state.enabled ? '需要配置 Gemini API Key' : 'Nano Banana 未启用',
+        : state.enabled ? '需要配置生图 API Key' : 'AI 生图未启用',
     }
   }
 

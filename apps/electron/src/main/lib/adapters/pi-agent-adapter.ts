@@ -67,6 +67,7 @@ import {
 import { DEFAULT_CONTEXT_WINDOW, buildModel } from './pi-model-registry'
 import { createPartialMessageCoalescer, type PartialMessageCoalescer } from './pi-streaming-control'
 import { createPiRetryTerminalGate, mapPiNativeRetryEvent } from './pi-retry-control'
+import { buildPiToolFailureGuidance } from './pi-tool-failure-guidance'
 import {
   closePiRequestProxyDispatcher,
   createPiRequestProxyDispatcher,
@@ -1264,6 +1265,25 @@ export function installRuntimeGuardHooks(session: AgentSession, guard: AgentRunt
   }
 }
 
+export function installToolFailureGuidanceHooks(session: AgentSession): void {
+  const previousAfterToolCall = session.agent.afterToolCall
+  session.agent.afterToolCall = async (context, signal) => {
+    const previousResult = await previousAfterToolCall?.(context, signal)
+    const content = previousResult?.content ?? context.result.content
+    const guidance = buildPiToolFailureGuidance(
+      context.toolCall.name,
+      previousResult?.isError ?? context.isError,
+      content,
+    )
+    if (!guidance) return previousResult
+
+    return {
+      ...previousResult,
+      content: [...content, { type: 'text', text: guidance }],
+    }
+  }
+}
+
 export class PiAgentAdapter implements AgentProviderAdapter {
   private activeSessions = new Map<string, ActivePiSession>()
 
@@ -1423,6 +1443,7 @@ export class PiAgentAdapter implements AgentProviderAdapter {
         () => providerStreamFn(requestModel, context, options),
       )
       installRuntimeGuardHooks(session, runtimeGuard)
+      installToolFailureGuidanceHooks(session)
       installCurrentSessionCompactionHooks(session)
       active.session = session
       resolveActiveReady(active, session)

@@ -12,6 +12,13 @@ import { ExternalLink, Eye, EyeOff, Loader2, CheckCircle2, XCircle, Trash2 } fro
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { MemorySettings } from './MemorySettings'
 import { SettingsSection, SettingsCard } from './primitives'
 import { chatToolsAtom } from '@/atoms/chat-tool-atoms'
@@ -195,11 +202,50 @@ function WebSearchSettings(): React.ReactElement {
   )
 }
 
-/** Nano Banana 生图工具设置区域 */
-function NanoBananaSettings(): React.ReactElement {
+interface ImageToolCredentials extends Record<string, string> {
+  provider: 'gemini' | 'openai-images'
+  apiKey: string
+  baseUrl: string
+  model: string
+  defaultSize: string
+}
+
+const EMPTY_IMAGE_TOOL_CREDENTIALS: ImageToolCredentials = {
+  provider: 'gemini',
+  apiKey: '',
+  baseUrl: '',
+  model: '',
+  defaultSize: '1024x1024',
+}
+
+function normalizeImageToolCredentials(credentials: Record<string, string>): ImageToolCredentials {
+  return {
+    provider: credentials.provider === 'openai-images' ? 'openai-images' : 'gemini',
+    apiKey: credentials.apiKey || '',
+    baseUrl: credentials.baseUrl || '',
+    model: credentials.model || '',
+    defaultSize: credentials.defaultSize || EMPTY_IMAGE_TOOL_CREDENTIALS.defaultSize,
+  }
+}
+
+function imageToolCredentialsEqual(
+  left: ImageToolCredentials,
+  right: ImageToolCredentials,
+): boolean {
+  return left.provider === right.provider
+    && left.apiKey === right.apiKey
+    && left.baseUrl === right.baseUrl
+    && left.model === right.model
+    && left.defaultSize === right.defaultSize
+}
+
+/** AI 生图工具设置区域 */
+function ImageGenerationSettings(): React.ReactElement {
+  const [provider, setProvider] = React.useState<ImageToolCredentials['provider']>('gemini')
   const [apiKey, setApiKey] = React.useState('')
   const [baseUrl, setBaseUrl] = React.useState('')
   const [model, setModel] = React.useState('')
+  const [defaultSize, setDefaultSize] = React.useState('1024x1024')
   const [showApiKey, setShowApiKey] = React.useState(false)
   const [enabled, setEnabled] = React.useState(false)
   const [loading, setLoading] = React.useState(true)
@@ -207,7 +253,7 @@ function NanoBananaSettings(): React.ReactElement {
   const [testResult, setTestResult] = React.useState<{ success: boolean; message: string } | null>(null)
   const setChatTools = useSetAtom(chatToolsAtom)
 
-  const savedCredentialsRef = React.useRef({ apiKey: '', baseUrl: '', model: '' })
+  const savedCredentialsRef = React.useRef<ImageToolCredentials>(EMPTY_IMAGE_TOOL_CREDENTIALS)
 
   React.useEffect(() => {
     Promise.all([
@@ -216,35 +262,76 @@ function NanoBananaSettings(): React.ReactElement {
     ]).then(([tools, credentials]) => {
       const tool = tools.find((t) => t.meta.id === 'nano-banana')
       if (tool) setEnabled(tool.enabled)
-      if (credentials.apiKey) setApiKey(credentials.apiKey)
-      if (credentials.baseUrl) setBaseUrl(credentials.baseUrl)
-      if (credentials.model) setModel(credentials.model)
-      savedCredentialsRef.current = {
-        apiKey: credentials.apiKey || '',
-        baseUrl: credentials.baseUrl || '',
-        model: credentials.model || '',
-      }
+      const loadedCredentials = normalizeImageToolCredentials(credentials)
+      setProvider(loadedCredentials.provider)
+      setApiKey(loadedCredentials.apiKey)
+      setBaseUrl(loadedCredentials.baseUrl)
+      setModel(loadedCredentials.model)
+      setDefaultSize(loadedCredentials.defaultSize)
+      savedCredentialsRef.current = loadedCredentials
     }).catch((err: unknown) => {
-      console.error('[Nano Banana 设置] 加载失败:', err)
+      console.error('[AI 生图设置] 加载失败:', err)
     }).finally(() => {
       setLoading(false)
     })
   }, [])
 
+  const currentCredentials = React.useMemo<ImageToolCredentials>(() => ({
+    provider,
+    apiKey: apiKey.trim(),
+    baseUrl: baseUrl.trim(),
+    model: model.trim(),
+    defaultSize,
+  }), [apiKey, baseUrl, defaultSize, model, provider])
+
+  const saveCredentials = React.useCallback(async (credentials: ImageToolCredentials): Promise<void> => {
+    await window.electronAPI.updateChatToolCredentials('nano-banana', credentials)
+    savedCredentialsRef.current = credentials
+    await refreshChatTools(setChatTools)
+  }, [setChatTools])
+
   /** 静默保存凭据（blur 时触发） */
   const handleBlurSave = React.useCallback(async (): Promise<void> => {
-    const current = { apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim() }
-    const saved = savedCredentialsRef.current
-    if (current.apiKey === saved.apiKey && current.baseUrl === saved.baseUrl && current.model === saved.model) return
+    if (imageToolCredentialsEqual(currentCredentials, savedCredentialsRef.current)) return
     try {
-      await window.electronAPI.updateChatToolCredentials('nano-banana', current)
-      savedCredentialsRef.current = current
-      await refreshChatTools(setChatTools)
-      toast.success('Nano Banana 设置已保存')
+      await saveCredentials(currentCredentials)
+      toast.success('AI 生图设置已保存')
     } catch (error) {
-      console.error('[Nano Banana 设置] 保存失败:', error)
+      console.error('[AI 生图设置] 保存失败:', error)
     }
-  }, [apiKey, baseUrl, model, setChatTools])
+  }, [currentCredentials, saveCredentials])
+
+  const handleProviderChange = async (value: string): Promise<void> => {
+    const nextProvider = value === 'openai-images' ? 'openai-images' : 'gemini'
+    const nextCredentials: ImageToolCredentials = {
+      ...currentCredentials,
+      provider: nextProvider,
+      baseUrl: '',
+      model: '',
+    }
+    setProvider(nextProvider)
+    setBaseUrl('')
+    setModel('')
+    setTestResult(null)
+    try {
+      await saveCredentials(nextCredentials)
+    } catch (error) {
+      console.error('[AI 生图设置] 切换提供方失败:', error)
+    }
+  }
+
+  const handleDefaultSizeChange = async (value: string): Promise<void> => {
+    setDefaultSize(value)
+    const nextCredentials: ImageToolCredentials = {
+      ...currentCredentials,
+      defaultSize: value,
+    }
+    try {
+      await saveCredentials(nextCredentials)
+    } catch (error) {
+      console.error('[AI 生图设置] 保存默认尺寸失败:', error)
+    }
+  }
 
   const handleToggle = async (checked: boolean): Promise<void> => {
     try {
@@ -252,21 +339,17 @@ function NanoBananaSettings(): React.ReactElement {
       setEnabled(checked)
       await refreshChatTools(setChatTools)
     } catch (error) {
-      console.error('[Nano Banana 设置] 切换失败:', error)
+      console.error('[AI 生图设置] 切换失败:', error)
     }
   }
 
   const handleTest = async (): Promise<void> => {
     // 先保存可能的变更
-    const current = { apiKey: apiKey.trim(), baseUrl: baseUrl.trim(), model: model.trim() }
-    const saved = savedCredentialsRef.current
-    if (current.apiKey !== saved.apiKey || current.baseUrl !== saved.baseUrl || current.model !== saved.model) {
+    if (!imageToolCredentialsEqual(currentCredentials, savedCredentialsRef.current)) {
       try {
-        await window.electronAPI.updateChatToolCredentials('nano-banana', current)
-        savedCredentialsRef.current = current
-        await refreshChatTools(setChatTools)
+        await saveCredentials(currentCredentials)
       } catch (error) {
-        console.error('[Nano Banana 设置] 保存失败:', error)
+        console.error('[AI 生图设置] 保存失败:', error)
       }
     }
 
@@ -288,8 +371,8 @@ function NanoBananaSettings(): React.ReactElement {
 
   return (
     <SettingsSection
-      title="Nano Banana"
-      description="启用后 AI 可以生成和编辑图片（基于 Gemini Image Generation）"
+      title="AI 生图"
+      description="配置 Gemini 或 OpenAI Images 兼容接口，供 Chat 与 Agent 自动调用"
       action={
         <Switch
           checked={enabled}
@@ -301,25 +384,21 @@ function NanoBananaSettings(): React.ReactElement {
         <div className="space-y-4 p-4">
           {/* 引导说明 */}
           <div className="rounded-lg bg-muted/50 p-3 space-y-2 text-sm text-muted-foreground">
-            <p>Nano Banana 基于 <span className="font-medium text-foreground">Gemini Image Generation</span> 提供 AI 图片生成与编辑能力。</p>
-            <p className="text-xs">配置步骤：</p>
-            <ol className="text-xs list-decimal list-inside space-y-1">
-              <li>
-                访问{' '}
-                <a
-                  href="https://aistudio.google.com/apikey"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="text-primary hover:underline inline-flex items-center gap-0.5"
-                >
-                  Google AI Studio
-                  <ExternalLink size={10} />
-                </a>
-                {' '}获取 Gemini API Key
-              </li>
-              <li>将 API Key 填入下方，可选修改 API 地址和模型</li>
-              <li>开启开关即可在对话中使用生图能力</li>
-            </ol>
+            <p>AI 生图支持 <span className="font-medium text-foreground">Gemini Image Generation</span> 和兼容 OpenAI Images generations 协议的服务。</p>
+            <p className="text-xs">Gemini 支持参考图编辑；OpenAI Images 提供方用于文生图。开启后，AI 会在生图任务中自动调用。</p>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium">提供方</label>
+            <Select value={provider} onValueChange={handleProviderChange}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="gemini">Gemini Image Generation</SelectItem>
+                <SelectItem value="openai-images">OpenAI Images 兼容接口</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
 
           <div className="space-y-1.5">
@@ -337,7 +416,7 @@ function NanoBananaSettings(): React.ReactElement {
             <div className="relative">
               <Input
                 type={showApiKey ? 'text' : 'password'}
-                placeholder="AIza..."
+                placeholder={provider === 'openai-images' ? 'sk-...' : 'AIza...'}
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 onBlur={handleBlurSave}
@@ -358,25 +437,51 @@ function NanoBananaSettings(): React.ReactElement {
             <label className="text-sm font-medium">API 地址</label>
             <Input
               type="text"
-              placeholder="https://generativelanguage.googleapis.com"
+              placeholder={provider === 'openai-images'
+                ? 'https://image.fushengyunsuan.cn/v1/images/generations'
+                : 'https://generativelanguage.googleapis.com'}
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
               onBlur={handleBlurSave}
             />
-            <p className="text-xs text-muted-foreground">留空则使用 Gemini 官方地址</p>
+            <p className="text-xs text-muted-foreground">
+              {provider === 'openai-images'
+                ? '支持填写服务根地址、/v1 地址或完整的 /images/generations 地址'
+                : '留空则使用 Gemini 官方地址'}
+            </p>
           </div>
 
           <div className="space-y-1.5">
             <label className="text-sm font-medium">模型</label>
             <Input
               type="text"
-              placeholder="gemini-3.1-flash-image-preview"
+              placeholder={provider === 'openai-images' ? 'gpt-image-2' : 'gemini-3.1-flash-image-preview'}
               value={model}
               onChange={(e) => setModel(e.target.value)}
               onBlur={handleBlurSave}
             />
-            <p className="text-xs text-muted-foreground">留空则使用默认模型 gemini-3.1-flash-image-preview</p>
+            <p className="text-xs text-muted-foreground">
+              留空则使用默认模型 {provider === 'openai-images' ? 'gpt-image-2' : 'gemini-3.1-flash-image-preview'}
+            </p>
           </div>
+
+          {provider === 'openai-images' && (
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium">默认尺寸</label>
+              <Select value={defaultSize} onValueChange={handleDefaultSizeChange}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">自动</SelectItem>
+                  <SelectItem value="1024x1024">1024 x 1024</SelectItem>
+                  <SelectItem value="1536x1024">1536 x 1024</SelectItem>
+                  <SelectItem value="1024x1536">1024 x 1536</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">测试连接会按此尺寸实际生成 1 张测试图，可能产生 API 费用。</p>
+            </div>
+          )}
 
           {testResult && (
             <div className={`flex items-start gap-2 rounded-lg p-3 text-sm ${testResult.success ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400' : 'bg-destructive/10 text-destructive'}`}>
@@ -493,9 +598,9 @@ export function ToolSettings(): React.ReactElement {
         <WebSearchSettings />
       </div>
 
-      {/* Nano Banana 生图工具 */}
+      {/* AI 生图工具 */}
       <div ref={nanoBananaRef}>
-        <NanoBananaSettings />
+        <ImageGenerationSettings />
       </div>
 
       {/* 自定义工具 */}

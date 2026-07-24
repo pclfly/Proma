@@ -17,6 +17,7 @@ import { ArrowDownIcon } from 'lucide-react'
 import type { ComponentProps } from 'react'
 import { useCallback } from 'react'
 import { StickToBottom, useStickToBottomContext } from 'use-stick-to-bottom'
+import { ConversationTextContextMenu } from './text-context-menu'
 
 // ===== Conversation 根容器 =====
 
@@ -24,13 +25,15 @@ export type ConversationProps = ComponentProps<typeof StickToBottom>
 
 export function Conversation({ className, ...props }: ConversationProps): React.ReactElement {
   return (
-    <StickToBottom
-      className={cn('relative min-h-0 flex-1 overflow-y-hidden scrollbar-none', className)}
-      initial="instant"
-      resize="smooth"
-      role="log"
-      {...props}
-    />
+    <ConversationTextContextMenu>
+      <StickToBottom
+        className={cn('relative min-h-0 flex-1 overflow-y-hidden scrollbar-none', className)}
+        initial="instant"
+        resize="smooth"
+        role="log"
+        {...props}
+      />
+    </ConversationTextContextMenu>
   )
 }
 

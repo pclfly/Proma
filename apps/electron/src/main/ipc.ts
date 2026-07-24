@@ -2558,14 +2558,33 @@ export function registerIpcHandlers(): void {
           return { success: false, message: `连接失败: ${msg}` }
         }
       }
-      // Nano Banana 生图工具测试
+      // AI 生图工具测试
       if (toolId === 'nano-banana') {
         const { getToolCredentials: getCredentials } = await import('./lib/chat-tool-config')
+        const {
+          DEFAULT_OPENAI_IMAGE_MODEL,
+          generateOpenAICompatibleImages,
+          resolveImageGenerationProvider,
+        } = await import('./lib/chat-tools/openai-image-provider')
         const credentials = getCredentials('nano-banana')
+        const provider = resolveImageGenerationProvider(credentials)
         if (!credentials.apiKey) {
-          return { success: false, message: '请先填写 Gemini API Key' }
+          return { success: false, message: '请先填写生图 API Key' }
         }
         try {
+          if (provider === 'openai-images') {
+            const model = credentials.model?.trim() || DEFAULT_OPENAI_IMAGE_MODEL
+            await generateOpenAICompatibleImages({
+              apiKey: credentials.apiKey,
+              endpoint: credentials.baseUrl,
+              model,
+              prompt: 'A small red circle centered on a plain white background, minimal test image',
+              size: credentials.defaultSize,
+              numberOfImages: 1,
+            })
+            return { success: true, message: `连接成功，模型 ${model} 已生成 1 张测试图` }
+          }
+
           const baseUrl = credentials.baseUrl?.trim() || 'https://generativelanguage.googleapis.com'
           const model = credentials.model?.trim() || 'gemini-3.1-flash-image-preview'
           const url = `${baseUrl}/v1beta/models/${model}:generateContent?key=${credentials.apiKey}`

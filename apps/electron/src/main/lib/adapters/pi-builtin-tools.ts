@@ -37,6 +37,9 @@ import {
   isWebSearchEnabledForAgent,
   searchWeb,
 } from '../web-search-service'
+import { getToolCredentials, getToolState } from '../chat-tool-config'
+import { executeAgentImageGeneration } from '../chat-tools/nano-banana-mcp'
+import { resolveImageGenerationProvider } from '../chat-tools/openai-image-provider'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 
@@ -49,6 +52,7 @@ export interface PiBuiltinToolsContext {
   agentRuntime?: AgentRuntime
   workspaceId?: string
   workspaceSlug?: string
+  agentCwd?: string
   permissionMode?: PromaPermissionMode
   triggeredBy?: 'user' | 'automation' | 'delegation'
 }
@@ -431,7 +435,73 @@ function buildAutomationTools(sdk: PiSdk, ctx: PiBuiltinToolsContext): ToolDefin
   ] as unknown as ToolDefinition[]
 }
 
-// ===== Collaboration 工具（占位，下阶段实现） =====
+// ===== AI 生图工具 =====
+
+export function buildPiImageGenerationTools(
+  sdk: PiSdk,
+  ctx: PiBuiltinToolsContext,
+): ToolDefinition[] {
+  const credentials = getToolCredentials('nano-banana')
+  const provider = resolveImageGenerationProvider(credentials)
+  const referenceGuidance = provider === 'openai-images'
+    ? 'The configured OpenAI Images provider supports high-fidelity edits. For product consistency, ALWAYS pass the most authoritative original product image through referenceImagePaths on every generation call; do not use a previously generated image as the primary reference.'
+    : 'Gemini supports reference image editing. Pass referenced image file paths through referenceImagePaths when visual consistency is required.'
+
+  return [sdk.defineTool({
+    name: 'generate_image',
+    label: 'AI 生图',
+    description: `Generate finished raster images with Proma's configured image API. You MUST call this tool for image generation, e-commerce product visuals, posters, illustrations, or image editing instead of substituting Python, HTML, SVG, or a text-only prompt. Generate at most 4 images per call and call again when the user requests a larger set. ${referenceGuidance}`,
+    promptSnippet: 'generate_image: whenever the user asks for finished visual assets, call this tool and return its generated image attachments. Do not replace it with locally scripted graphics.',
+    parameters: Type.Object({
+      prompt: Type.String({ description: 'Detailed production prompt. Include subject identity, composition, lighting, materials, text constraints, and visual style.' }),
+      referenceImagePaths: Type.Optional(Type.Array(Type.String(), { description: 'Original reference image paths. Pass the authoritative product image on every generation call to preserve identity.' })),
+      aspectRatio: Type.Optional(Type.Union([
+        Type.Literal('1:1'),
+        Type.Literal('16:9'),
+        Type.Literal('4:3'),
+        Type.Literal('9:16'),
+        Type.Literal('3:4'),
+      ])),
+      imageSize: Type.Optional(Type.Union([
+        Type.Literal('auto'),
+        Type.Literal('1K'),
+        Type.Literal('2K'),
+        Type.Literal('4K'),
+      ])),
+      size: Type.Optional(Type.Union([
+        Type.Literal('auto'),
+        Type.Literal('1024x1024'),
+        Type.Literal('1536x1024'),
+        Type.Literal('1024x1536'),
+      ])),
+      numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
+    }),
+    async execute(_toolCallId: string, params: unknown) {
+      const args = params as {
+        prompt: string
+        referenceImagePaths?: string[]
+        aspectRatio?: string
+        imageSize?: string
+        size?: string
+        numberOfImages?: number
+      }
+      const result = await executeAgentImageGeneration(args.prompt, ctx.sessionId, {
+        referenceImagePaths: args.referenceImagePaths,
+        aspectRatio: args.aspectRatio,
+        imageSize: args.imageSize,
+        size: args.size,
+        numberOfImages: args.numberOfImages,
+        cwd: ctx.agentCwd,
+      })
+      return {
+        content: result.content,
+        details: { provider },
+      } as AgentToolResult<unknown>
+    },
+  })] as unknown as ToolDefinition[]
+}
+
+// ===== Collaboration 工具 =====
 
 // collaboration 逻辑较重（涉及子会话生命周期管理、EventBus 订阅、BlockedEvent 冒泡），
 // 需要独立桥接文件。当前阶段先确保 automation 和 proma-cloud 可用。
@@ -500,7 +570,17 @@ export async function buildPiBuiltinTools(
     }
   }
 
-  // nano-banana 当前走外部 MCP stdio，不需要 in-process 桥接
+  if (isBuiltinMcpUserEnabled('nano-banana')) {
+    const imageToolState = getToolState('nano-banana')
+    const imageCredentials = getToolCredentials('nano-banana')
+    if (imageToolState.enabled && imageCredentials.apiKey) {
+      try {
+        tools.push(...buildPiImageGenerationTools(sdk, ctx))
+      } catch (error) {
+        console.error('[Pi 桥接] 注入 AI 生图工具失败:', error)
+      }
+    }
+  }
 
   const cloudTools = buildPromaCloudTools(sdk, ctx)
   tools.push(...cloudTools)

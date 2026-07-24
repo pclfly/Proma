@@ -1273,6 +1273,7 @@ export class AgentOrchestrator {
             agentRuntime,
             workspaceId,
             workspaceSlug,
+            agentCwd,
             permissionMode: permissionModeOverride ?? sessionMeta?.permissionMode ?? PROMA_DEFAULT_PERMISSION_MODE,
             triggeredBy: input.triggeredBy,
           })
