@@ -38,6 +38,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { PIERRE_FILE_CSS } from '@/components/agent/tool-result-renderers/pierre-styles'
 import { SelectionActionPopover } from '@/components/selection/SelectionActionPopover'
 import { SELECTION_ACTION_POPOVER_SELECTOR } from '@/lib/quoted-selection'
+import type { ChangedFileEntry } from '@proma/shared'
 
 const MD_EXTS = new Set(['.md', '.markdown'])
 const PLAIN_TEXT_EDIT_EXTS = new Set(['.txt', '.text', '.log'])
@@ -231,9 +232,11 @@ interface DiffTabContentProps {
   toolbarActions?: React.ReactNode
   /** 基准 ref（如 "origin/main"），用于 worktree vs main 模式 */
   baseRef?: string
+  /** Diff 基准类型 */
+  baseline?: ChangedFileEntry['baseline']
 }
 
-export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewOnly, readOnly, basePaths, onEmptyDiff, toolbarActions, baseRef }: DiffTabContentProps): React.ReactElement {
+export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewOnly, readOnly, basePaths, onEmptyDiff, toolbarActions, baseRef, baseline }: DiffTabContentProps): React.ReactElement {
   const [viewMode, setViewMode] = useAtom(agentDiffViewModeAtom)
   const [oldContent, setOldContent] = React.useState('')
   const [newContent, setNewContent] = React.useState('')
@@ -490,8 +493,9 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   const contentCacheScope = React.useMemo(() => JSON.stringify({
     dirPath,
     gitRoot: gitRoot ?? '',
+    baseline: baseline ?? '',
     basePaths: basePaths ?? [],
-  }), [basePaths, dirPath, gitRoot])
+  }), [basePaths, baseline, dirPath, gitRoot])
 
   const getContentCacheKey = React.useCallback((mode: 'preview' | 'diff', version: number) => (
     `${sessionId}:${mode}:${filePath}@v${version}:${contentCacheScope}`
@@ -680,7 +684,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
             if (cancelled) return
             content = result?.content ?? ''
           } else {
-            const result = await window.electronAPI.getDiffContents({ dirPath, filePath, gitRoot, sessionId, baseRef })
+            const result = await window.electronAPI.getDiffContents({ dirPath, filePath, gitRoot, sessionId, baseRef, baseline })
             if (cancelled) return
             content = result?.newContent ?? ''
             old = result?.oldContent ?? ''
@@ -707,7 +711,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     load()
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filePath, dirPath, gitRoot, previewOnly, previewContentVersion, fileAccess, isPdf, isDocx, isOfficePreview, isLegacyOffice, isImage, sessionId, ext, getContentCacheKey])
+  }, [filePath, dirPath, gitRoot, previewOnly, previewContentVersion, fileAccess, isPdf, isDocx, isOfficePreview, isLegacyOffice, isImage, sessionId, ext, getContentCacheKey, baseline])
 
   // refreshVersion 触发的静默刷新：仅 diff 模式、内容有变化时才更新 state
   const prevRefreshRef = React.useRef(-1)
@@ -724,7 +728,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     let cancelled = false
     async function refresh() {
       try {
-        const result = await window.electronAPI.getDiffContents({ dirPath, filePath, gitRoot, sessionId })
+        const result = await window.electronAPI.getDiffContents({ dirPath, filePath, gitRoot, sessionId, baseline })
         if (cancelled || !result) return
         const newC = result.newContent ?? ''
         const oldC = result.oldContent ?? ''
@@ -741,7 +745,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     }
     refresh()
     return () => { cancelled = true }
-  }, [refreshVersion, previewOnly, filePath, dirPath, gitRoot, sessionId, getContentCacheKey])
+  }, [refreshVersion, previewOnly, filePath, dirPath, gitRoot, sessionId, getContentCacheKey, baseline])
 
   // diff 模式：内容加载完成后若新旧一致（无差异），通知父组件关闭预览面板
   const emptyDiffFiredRef = React.useRef(false)

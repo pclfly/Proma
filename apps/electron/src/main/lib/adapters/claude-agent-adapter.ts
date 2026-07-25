@@ -131,6 +131,8 @@ export interface ClaudeAgentQueryOptions extends AgentQueryInput {
     input: Record<string, unknown>,
     options: CanUseToolOptions,
   ) => Promise<PermissionResult>
+  /** 工具实际执行前回调；用于 bypassPermissions 等跳过 canUseTool 的执行路径 */
+  onPreToolUse?: (toolName: string, input: Record<string, unknown>) => Promise<void>
   /** 只读工具白名单 */
   allowedTools?: string[]
   /** 系统提示词（字符串为自定义提示词，对象为 claude_code preset） */
@@ -793,6 +795,23 @@ export class ClaudeAgentAdapter implements AgentProviderAdapter {
         // 在 result 消息发到 host 之前完成，故 result 处理时 backgroundTasksPending 已是最新。
         // 仅观察、绝不返回 decision:'block'（那会强制模型继续输出）。
         hooks: {
+          PreToolUse: [{
+            hooks: [async (input: unknown) => {
+              const hookInput = input as { tool_name?: unknown; tool_input?: unknown }
+              if (
+                options.onPreToolUse &&
+                typeof hookInput.tool_name === 'string' &&
+                hookInput.tool_input &&
+                typeof hookInput.tool_input === 'object'
+              ) {
+                await options.onPreToolUse(
+                  hookInput.tool_name,
+                  hookInput.tool_input as Record<string, unknown>,
+                )
+              }
+              return { continue: true }
+            }],
+          }],
           Stop: [{
             hooks: [async (input: unknown) => {
               const bt = (input as { background_tasks?: unknown[] }).background_tasks

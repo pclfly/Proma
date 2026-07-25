@@ -8,6 +8,9 @@ copyright: Copyright © 2024-2026 Erlich Liu
 # Electron 版本（CI 环境 bun workspace 下无法自动检测，需显式指定）
 electronVersion: 39.5.1
 
+# 使用项目依赖中完整的 Electron 分发目录，确保 Windows 打包包含 electron.exe。
+electronDist: node_modules/electron/dist
+
 # 目录配置
 directories:
   output: out

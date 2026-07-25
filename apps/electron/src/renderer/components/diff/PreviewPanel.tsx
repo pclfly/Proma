@@ -183,6 +183,7 @@ export function PreviewPanel({ sessionId }: PreviewPanelProps): React.ReactEleme
             dirPath={currentFile.dirPath || sessionPath}
             sessionId={sessionId}
             gitRoot={currentFile.gitRoot}
+            baseline={currentFile.baseline}
             previewOnly={currentFile.previewOnly}
             readOnly={currentFile.readOnly}
             basePaths={currentFile.basePaths}

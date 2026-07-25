@@ -6,6 +6,7 @@
 
 import { atom } from 'jotai'
 import { atomWithStorage } from 'jotai/utils'
+import type { ChangedFileEntry } from '@proma/shared'
 import { currentAgentSessionIdAtom } from './agent-atoms'
 
 // ===== 类型定义 =====
@@ -15,6 +16,8 @@ export interface PreviewFile {
   filePath: string
   dirPath?: string
   gitRoot?: string
+  /** Diff 基准类型 */
+  baseline?: ChangedFileEntry['baseline']
   /** true = 纯文件预览（不显示 diff 控件），false/undefined = diff 模式 */
   previewOnly?: boolean
   /** true = 预览只读，不允许从预览面板写回临时/源文件 */

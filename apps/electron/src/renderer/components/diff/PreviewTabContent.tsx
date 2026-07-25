@@ -117,6 +117,7 @@ export function PreviewTabContent({ sessionId }: PreviewTabContentProps): React.
           dirPath={dirPath}
           sessionId={sessionId}
           gitRoot={currentFile.gitRoot}
+          baseline={currentFile.baseline}
           previewOnly={currentFile.previewOnly}
           readOnly={currentFile.readOnly}
           basePaths={currentFile.basePaths}

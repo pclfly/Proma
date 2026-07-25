@@ -69,6 +69,8 @@ import { buildAgentRuntimeEnv, mergeRuntimeEnv, type AgentRuntimeEnv } from './a
 import { isVisibleRunMessage } from './agent-run-message-visibility'
 import { applyAgentSdkAuthEnv } from './agent-sdk-auth-env'
 import { getAgentSdkMaxOutputTokens } from './agent-sdk-output-limits'
+import { getAgentFileChangeTracker } from './agent-file-change-tracker'
+import { isBashCommandReadOnly } from './agent-bash-command-classifier'
 import { resolvePiThinkingLevel } from './agent-thinking-level'
 import { generateCodexTitle } from './adapters/pi-codex-title-generator'
 import { createFallbackTitle, sanitizeGeneratedTitle, TITLE_PROMPT } from './title-generation'
@@ -1379,32 +1381,6 @@ export class AgentOrchestrator {
         )
       }
 
-      /**
-       * 判断 Bash 命令是否是只读的（计划模式下安全可执行）
-       * 检测写操作特征：文件重定向、破坏性命令、包管理写操作、git 写操作等
-       */
-      const isBashCommandReadOnly = (command: string): boolean => {
-        // 输出重定向：匹配未被数字或 & 前置的 > 符号（排除 2>/dev/null、&> 等 fd 重定向）
-        if (/(?<![0-9&])>/.test(command)) return false
-        // 破坏性文件操作
-        if (/\b(rm|rmdir)\s/.test(command)) return false
-        if (/\bsed\s+[^|&;]*-i/.test(command)) return false  // sed -i 原地编辑
-        if (/\b(chmod|chown|chattr|truncate)\s/.test(command)) return false
-        if (/\b(mv|cp)\s/.test(command)) return false
-        if (/\b(mkdir|touch|mktemp)\s/.test(command)) return false
-        // 包管理器写操作
-        if (/\b(npm|pnpm|yarn|bun)\s+(install|i\b|add|remove|uninstall|update|upgrade|link|unlink)\b/.test(command)) return false
-        if (/\bpip[23]?\s+(install|uninstall|upgrade)\b/.test(command)) return false
-        if (/\b(apt|apt-get|brew|yum|dnf)\s+(install|remove|purge|uninstall|upgrade)\b/.test(command)) return false
-        // Git 写操作
-        if (/\bgit\s+(commit|push|checkout\s+-[bB]|branch\s+-[mMdD]|merge\b|rebase\b|reset\b|stash\s+(drop|pop)\b|add\b|apply\b|cherry-pick\b)/.test(command)) return false
-        // 进程控制
-        if (/\b(kill|killall|pkill)\s/.test(command)) return false
-        // 脚本执行（具有潜在副作用，如 node script.js / python main.py）
-        if (/\b(node|python[23]?|ruby|perl|php)\s+[^-]/.test(command)) return false
-        return true
-      }
-
       // Plan 模式下允许的只读工具（不包含 Write/Edit/Bash 等写操作）
       const PLAN_MODE_ALLOWED_TOOLS = new Set([
         'Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
@@ -1445,6 +1421,24 @@ export class AgentOrchestrator {
       // 动态 canUseTool：每次调用读取当前权限模式，支持运行中切换
       const canUseTool = async (toolName: string, input: Record<string, unknown>, options: CanUseToolOptions): Promise<PermissionResult> => {
         const currentMode = getPermissionMode()
+        const allowWithBaseline = async (result: PermissionResult): Promise<PermissionResult> => {
+          if (result.behavior !== 'allow') return result
+          try {
+            await getAgentFileChangeTracker().captureApprovedToolBaseline(
+              sessionId,
+              toolName,
+              result.updatedInput ?? input,
+              agentCwd ?? homedir(),
+              {
+                // Bash 即使表面只读也可能通过脚本或重定向写文件；仅解析显式目标，不扫描目录。
+                captureBashTargets: toolName === 'Bash',
+              },
+            )
+          } catch (error) {
+            console.warn(`[Agent 文件改动] 捕获写入前快照失败 (${sessionId}, ${toolName}):`, error)
+          }
+          return result
+        }
 
         // ── 参数校验守卫（所有模式、所有工具，优先于权限检查） ──
         const validationFailure = validateToolInput(toolName, input)
@@ -1476,7 +1470,7 @@ export class AgentOrchestrator {
           const active = toolName === 'EnterPlanMode'
           planModeEntered = active
           emitPlanModeChanged(active, 'tool')
-          return { behavior: 'allow' as const, updatedInput: input }
+          return allowWithBaseline({ behavior: 'allow' as const, updatedInput: input })
         }
 
         // ExitPlanMode：plan 模式下必须让用户确认计划。
@@ -1495,7 +1489,7 @@ export class AgentOrchestrator {
               })
             }
           }
-          return result
+          return allowWithBaseline(result)
         }
 
         // EnterPlanMode：标记进入状态，通知渲染进程
@@ -1503,42 +1497,43 @@ export class AgentOrchestrator {
           planModeEntered = true
           emitPlanModeChanged(true, 'tool')
           this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'enter_plan_mode', sessionId } })
-          return { behavior: 'allow' as const, updatedInput: input }
+          return allowWithBaseline({ behavior: 'allow' as const, updatedInput: input })
         }
 
         // AskUserQuestion：始终走交互式问答流程，不受权限模式影响
         if (toolName === 'AskUserQuestion') {
-          return askUserService.handleAskUserQuestion(
+          const result = await askUserService.handleAskUserQuestion(
             sessionId, input, options.signal,
             (request: AskUserRequest) => {
               this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'ask_user_request', request } })
             },
           )
+          return allowWithBaseline(result)
         }
 
         // ── 普通工具的权限分派 ──
 
         switch (currentMode) {
           case 'bypassPermissions':
-            return { behavior: 'allow' as const, updatedInput: input }
+            return allowWithBaseline({ behavior: 'allow' as const, updatedInput: input })
 
           case 'plan': {
             // Plan 模式：只允许只读工具 + Write/Edit 任意 .md 文件（计划文档）
             if (PLAN_MODE_ALLOWED_TOOLS.has(toolName)) {
-              return { behavior: 'allow' as const, updatedInput: input }
+              return allowWithBaseline({ behavior: 'allow' as const, updatedInput: input })
             }
             // 允许 Write/Edit 到任意 .md 文件（计划文档一定是 markdown；非 .md 仍被拒）
             if (toolName === 'Write' || toolName === 'Edit') {
               const filePath = typeof input.file_path === 'string' ? input.file_path : ''
               if (filePath.toLowerCase().endsWith('.md')) {
-                return { behavior: 'allow' as const, updatedInput: input }
+                return allowWithBaseline({ behavior: 'allow' as const, updatedInput: input })
               }
             }
             // Bash 工具：只读命令（find、grep、cat 等）允许执行，写操作拒绝
             if (toolName === 'Bash') {
               const command = typeof input.command === 'string' ? input.command : ''
               if (isBashCommandReadOnly(command)) {
-                return { behavior: 'allow' as const, updatedInput: input }
+                return allowWithBaseline({ behavior: 'allow' as const, updatedInput: input })
               }
               return { behavior: 'deny' as const, message: '计划模式下不允许执行写操作，请在计划审批通过后再执行' }
             }
@@ -1546,12 +1541,12 @@ export class AgentOrchestrator {
             // 计划模式只允许快照、截图、网络列表等调研工具；点击、输入、脚本执行等需等计划通过。
             if (toolName.startsWith('mcp__chrome_devtools__')) {
               return PLAN_MODE_READ_ONLY_CHROME_DEVTOOLS.has(toolName)
-                ? { behavior: 'allow' as const, updatedInput: input }
+                ? allowWithBaseline({ behavior: 'allow' as const, updatedInput: input })
                 : { behavior: 'deny' as const, message: '计划模式下不允许执行会改变浏览器页面状态的 Chrome DevTools 操作，请在计划审批通过后再执行' }
             }
             // 其他 MCP 工具维持既有策略：计划模式下允许调研用 MCP。
             if (toolName.startsWith('mcp__')) {
-              return { behavior: 'allow' as const, updatedInput: input }
+              return allowWithBaseline({ behavior: 'allow' as const, updatedInput: input })
             }
             if (DEFERRED_OR_PROACTIVE_TOOLS.has(toolName)) {
               return { behavior: 'deny' as const, message: '计划模式下不允许启动后台、定时、通知或脚本执行能力，请在计划审批通过后再执行' }
@@ -1560,7 +1555,7 @@ export class AgentOrchestrator {
             return { behavior: 'deny' as const, message: '计划模式下不允许执行写操作，请在计划审批通过后再执行' }
           }
           default:
-            return { behavior: 'allow' as const, updatedInput: input }
+            return allowWithBaseline({ behavior: 'allow' as const, updatedInput: input })
         }
       }
 
@@ -1696,6 +1691,23 @@ export class AgentOrchestrator {
         // 从实际 tool_use 流里同步，避免 UI 停留在计划阶段。
         allowDangerouslySkipPermissions: !canUseTool,
         canUseTool,
+        onPreToolUse: async (toolName: string, input: Record<string, unknown>) => {
+          // 非 bypass 模式由 canUseTool 在批准后采集，避免 PreToolUse 先于权限判定时记录被拒绝的写入。
+          if (getPermissionMode() !== 'bypassPermissions') return
+          try {
+            await getAgentFileChangeTracker().captureApprovedToolBaseline(
+              sessionId,
+              toolName,
+              input,
+              agentCwd ?? homedir(),
+              {
+                captureBashTargets: toolName === 'Bash',
+              },
+            )
+          } catch (error) {
+            console.warn(`[Agent 文件改动] PreToolUse 快照失败 (${sessionId}, ${toolName}):`, error)
+          }
+        },
         // claude_code preset 提供基础环境信息（platform/shell/OS/git/model/知识截止日期等）
         // buildSystemPrompt 追加 Proma 特有指令（角色定义、子 Agent 委派策略、工作区信息等）
         systemPrompt: {

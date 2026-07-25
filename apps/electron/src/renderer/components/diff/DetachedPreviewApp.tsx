@@ -115,6 +115,7 @@ export function DetachedPreviewApp(): React.ReactElement {
           dirPath={data.dirPath}
           sessionId={data.sessionId}
           gitRoot={data.gitRoot}
+          baseline={data.baseline}
           previewOnly={data.previewOnly}
           readOnly={data.readOnly}
           basePaths={data.basePaths}

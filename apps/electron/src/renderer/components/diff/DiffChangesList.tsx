@@ -16,7 +16,7 @@ import { WorktreeSelector } from './WorktreeSelector'
 
 /** 按目录分组后的数据结构 */
 interface FileGroup {
-  /** 完整 Git 仓库路径（用作 React key，避免同名目录冲突） */
+  /** 完整 Diff 根路径（用作 React key，避免同名目录冲突） */
   gitRoot: string
   /** 显示用的目录名（仓库的最后一段） */
   dirName: string
@@ -24,10 +24,11 @@ interface FileGroup {
   totalAdditions: number
   totalDeletions: number
   sources: ChangeSource[]
+  hasSessionBaseline: boolean
 }
 
 interface DiffChangesListProps {
-  /** Git 仓库根目录 */
+  /** 当前会话工作目录 */
   dirPath: string
   /** 当前 Agent 会话 ID，用于主进程路径授权 */
   sessionId: string
@@ -36,7 +37,12 @@ interface DiffChangesListProps {
   /** 工作区共享文件目录（用于 badge 计算） */
   workspaceFilesPath?: string
   /** 点击文件回调 */
-  onFileClick: (filePath: string, isUntracked: boolean, gitRoot?: string) => void
+  onFileClick: (
+    filePath: string,
+    isUntracked: boolean,
+    gitRoot?: string,
+    baseline?: ChangedFileEntry['baseline'],
+  ) => void
   /** 自动刷新信号（版本号递增触发） */
   refreshVersion?: number
   /** 当前选中的文件路径（高亮显示） */
@@ -201,6 +207,7 @@ export const DiffChangesList = React.memo(function DiffChangesList({
       totalAdditions: groupFiles.reduce((sum, f) => sum + f.additions, 0),
       totalDeletions: groupFiles.reduce((sum, f) => sum + f.deletions, 0),
       sources: [...new Set(groupFiles.map((f) => f.source))],
+      hasSessionBaseline: groupFiles.some((file) => file.baseline === 'session'),
     }))
     return { fileGroups: result, matchedFilesCount: matched }
   }, [files, searchQuery])
@@ -213,7 +220,7 @@ export const DiffChangesList = React.memo(function DiffChangesList({
 
   const isEmpty = fileGroups.length === 0 && filteredUntrackedFiles.length === 0
   const hasAnyChanges = files.length > 0 || untrackedFiles.length > 0
-  const shouldShowSearch = isGitRepo && (hasAnyChanges || searchQuery.length > 0)
+  const shouldShowSearch = hasAnyChanges || searchQuery.length > 0
   const shouldShowWorktreeSelector = Boolean(workspaceSlug || (worktreeRepoPaths?.length ?? 0) > 0)
 
   return (
@@ -261,22 +268,19 @@ export const DiffChangesList = React.memo(function DiffChangesList({
         </div>
       )}
 
-      {!isGitRepo && (
+      {!hasAnyChanges && (
         <div className="flex flex-col items-center justify-center h-full text-muted-foreground p-4">
-          <p className="text-[12px] text-center">当前目录不是 Git 仓库</p>
+          <p className="text-[12px] text-center">
+            {hasFetched ? (isGitRepo ? '没有代码改动' : '没有会话文件改动') : '加载中…'}
+          </p>
         </div>
       )}
-      {isGitRepo && !hasAnyChanges && (
-        <div className="flex flex-col items-center justify-center h-full text-muted-foreground p-4">
-          <p className="text-[12px] text-center">{hasFetched ? '没有代码改动' : '加载中…'}</p>
-        </div>
-      )}
-      {isGitRepo && hasAnyChanges && isEmpty && (
+      {hasAnyChanges && isEmpty && (
         <div className="flex flex-col items-center justify-center h-full text-muted-foreground p-4">
           <p className="text-[12px] text-center">没有匹配的文件</p>
         </div>
       )}
-      {isGitRepo && hasAnyChanges && !isEmpty && (
+      {hasAnyChanges && !isEmpty && (
         <>
           {fileGroups.map((group) => {
             const isCollapsed = collapsedDirs.has(group.gitRoot)
@@ -301,8 +305,13 @@ export const DiffChangesList = React.memo(function DiffChangesList({
                       </span>
                     )
                   })}
+                  {group.hasSessionBaseline && (
+                    <span className="rounded px-1 py-0.5 text-[12px] leading-none shrink-0 bg-emerald-500/10 text-emerald-500">
+                      会话基线
+                    </span>
+                  )}
                   <span className="ml-auto shrink-0 flex items-center gap-1.5">
-                    <span className="text-foreground/30">{group.files.length} changed files</span>
+                    <span className="text-foreground/30">{group.files.length} 个改动文件</span>
                     {group.totalAdditions > 0 && <span className="text-foreground/30">+{group.totalAdditions}</span>}
                     {group.totalDeletions > 0 && <span className="text-foreground/30">-{group.totalDeletions}</span>}
                   </span>
@@ -317,8 +326,10 @@ export const DiffChangesList = React.memo(function DiffChangesList({
                       file={file}
                       isSelected={absPath === selectedFilePath || file.filePath === selectedFilePath}
                       isUnseen={unseenFiles.has(absPath)}
-                      onClick={() => { markFileAsSeen(absPath); onFileClick(file.filePath, false, file.gitRoot) }}
-                      onRevert={() => handleRevert(file.filePath, file.gitRoot)}
+                      onClick={file.previewable === false
+                        ? undefined
+                        : () => { markFileAsSeen(absPath); onFileClick(file.filePath, false, file.gitRoot, file.baseline) }}
+                      onRevert={file.baseline === 'git' ? () => handleRevert(file.filePath, file.gitRoot) : undefined}
                       dirPath={dirPath}
                     />
                   )
@@ -358,8 +369,8 @@ function FileRow({
   dirPath,
 }: {
   file: ChangedFileEntry
-  onClick: () => void
-  onRevert: () => void
+  onClick?: () => void
+  onRevert?: () => void
   isSelected?: boolean
   isUnseen?: boolean
   dirPath: string
@@ -371,10 +382,11 @@ function FileRow({
 
   return (
     <div
-      role="button"
-      tabIndex={0}
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
       className={cn(
         'flex items-center w-full px-2 pl-3 h-[36px] text-[14px] transition-colors group',
+        file.previewable === false && 'cursor-default',
         isSelected
           ? 'session-item-selected bg-primary/10 shadow-[0_1px_2px_0_rgba(0,0,0,0.05)]'
           : 'hover:bg-primary/5',
@@ -393,6 +405,12 @@ function FileRow({
               {file.status === 'deleted' && (
                 <span className="ml-1 text-foreground/30 text-[12px]">(已删除)</span>
               )}
+              {file.status === 'untracked' && (
+                <span className="ml-1 text-emerald-500/80 text-[12px]">(新文件)</span>
+              )}
+              {file.previewable === false && (
+                <span className="ml-1 text-amber-500/80 text-[12px]">(不可预览)</span>
+              )}
             </span>
             {dir && (
               <span className="text-[11px] text-foreground/30 truncate">{dir}</span>
@@ -403,7 +421,7 @@ function FileRow({
       </Tooltip>
 
       {/* +/- 行数 — hover 时隐藏让位给操作按钮 */}
-      <span className="ml-auto shrink-0 flex items-center gap-1.5 text-[13px] group-hover:hidden">
+      <span className={cn('ml-auto shrink-0 flex items-center gap-1.5 text-[13px]', onRevert && 'group-hover:hidden')}>
         {file.additions > 0 && (
           <span style={{ color: 'rgb(34 197 94)' }}>+{file.additions}</span>
         )}
@@ -413,19 +431,21 @@ function FileRow({
       </span>
 
       {/* Hover 操作按钮 */}
-      <span className="ml-auto shrink-0 hidden group-hover:flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <span
-              className="p-0.5 rounded hover:bg-foreground/[0.08] text-foreground/40 hover:text-foreground/70 cursor-pointer"
-              onClick={onRevert}
-            >
-              <Undo2 className="size-4" />
-            </span>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">还原文件变更</TooltipContent>
-        </Tooltip>
-      </span>
+      {onRevert && (
+        <span className="ml-auto shrink-0 hidden group-hover:flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span
+                className="p-0.5 rounded hover:bg-foreground/[0.08] text-foreground/40 hover:text-foreground/70 cursor-pointer"
+                onClick={onRevert}
+              >
+                <Undo2 className="size-4" />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">还原文件变更</TooltipContent>
+          </Tooltip>
+        </span>
+      )}
     </div>
   )
 }

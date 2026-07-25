@@ -886,7 +886,7 @@ export function registerIpcHandlers(): void {
       const allowedSessionPath = sessionPath && isPathAllowed(sessionPath, access) ? sessionPath : undefined
       const allowedWorkspaceFilesPath = workspaceFilesPath && isPathAllowed(workspaceFilesPath, access) ? workspaceFilesPath : undefined
       const allowedExtraPaths = extraPaths?.filter((p) => isPathAllowed(p, access))
-      return getUnstagedChanges(dirPath, allowedSessionPath, allowedWorkspaceFilesPath, allowedExtraPaths)
+      return getUnstagedChanges(dirPath, allowedSessionPath, allowedWorkspaceFilesPath, allowedExtraPaths, sessionId)
     }
   )
 
@@ -946,7 +946,7 @@ export function registerIpcHandlers(): void {
       }
       const access = normalizeFileAccessOptions({ sessionId })
       if (!(await ensurePathAllowedWithWorktree(dirPath, access)) || (gitRoot && !(await ensurePathAllowedWithWorktree(gitRoot, access)))) return null
-      return getDiffContents(dirPath, filePath, gitRoot, input.baseRef)
+      return getDiffContents(dirPath, filePath, gitRoot, input.baseRef, sessionId, input.baseline)
     }
   )
 

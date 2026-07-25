@@ -114,7 +114,11 @@ export interface ChangedFileEntry {
   deletions: number
   /** 文件来源 */
   source: ChangeSource
-  /** 所属 Git 仓库根目录 */
+  /** Diff 基准类型：Git HEAD 或 Agent 会话首次写入前快照 */
+  baseline: 'git' | 'session'
+  /** 文件内容是否支持 Diff 预览；二进制、超大或暂时不可读文件为 false */
+  previewable?: boolean
+  /** 所属 Git 仓库根目录；会话快照模式下为文件显示根目录 */
   gitRoot: string
 }
 
@@ -162,6 +166,8 @@ export interface GetFileDiffInput {
   sessionId?: string
   /** 基准 ref（如 "origin/main"），用于 worktree vs main 模式 */
   baseRef?: string
+  /** Diff 基准类型；混合 Git/会话改动时必须按文件条目传入 */
+  baseline?: ChangedFileEntry['baseline']
 }
 
 /** 独立预览窗口输入 */
@@ -174,6 +180,8 @@ export interface DetachedPreviewWindowInput {
   dirPath: string
   /** 文件所属 Git 仓库根，多仓库场景下必须传入 */
   gitRoot?: string
+  /** Diff 基准类型 */
+  baseline?: ChangedFileEntry['baseline']
   /** true = 纯文件预览，false/undefined = diff 模式 */
   previewOnly?: boolean
   /** true = 预览只读，不允许从预览面板写回临时/源文件 */

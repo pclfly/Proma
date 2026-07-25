@@ -49,6 +49,7 @@ import { convertLegacyMessage } from '@proma/session-core'
 import { clearNanoBananaAgentHistory } from './chat-tools/nano-banana-mcp'
 import { assertEnabledModelForChannel } from './agent-model-selection'
 import { copyForkWorkspaceFiles } from './agent-fork-workspace-copy'
+import { getAgentFileChangeTracker } from './agent-file-change-tracker'
 
 /**
  * 会话索引文件格式
@@ -525,6 +526,9 @@ export function deleteAgentSession(id: string): void {
 
   // 清理 Nano Banana 生图历史
   clearNanoBananaAgentHistory(id)
+
+  // 清理非 Git 文件改动基线快照
+  getAgentFileChangeTracker().clearSession(id)
 
   // 清理 SDK 关联数据（file-history 和 projects 下的 session JSONL）
   const sdkSessionIds = [removed.sdkSessionId, removed.forkSourceSdkSessionId].filter(Boolean) as string[]

@@ -92,11 +92,17 @@ export function SidePanel({ sessionId, sessionPath, activeTab, onTabChange, widt
   const selectedWorktreeMap = useAtomValue(agentSelectedWorktreeAtom)
   const selectedWorktreePath = selectedWorktreeMap.get(sessionId) ?? null
 
-  const handleDiffFileClick = React.useCallback((filePath: string, _isUntracked: boolean, gitRoot?: string) => {
+  const handleDiffFileClick = React.useCallback((
+    filePath: string,
+    _isUntracked: boolean,
+    gitRoot?: string,
+    baseline?: 'git' | 'session',
+  ) => {
     openPreview(sessionId, {
       filePath,
       dirPath: sessionPath || undefined,
       gitRoot,
+      baseline,
       baseRef: selectedWorktreePath ? 'origin/main' : undefined,
     })
   }, [openPreview, sessionId, sessionPath, selectedWorktreePath])

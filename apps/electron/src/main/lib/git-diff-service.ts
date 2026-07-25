@@ -11,6 +11,7 @@ import { basename, dirname, isAbsolute, join, resolve, sep } from 'path'
 import type { ChangedFileEntry, UnstagedChangesResult, UntrackedFileEntry } from '@proma/shared'
 import { normalizePathForCompare } from '@proma/shared'
 import type { ChangeSource, ChangedFileStatus } from '@proma/shared'
+import { getAgentFileChangeTracker } from './agent-file-change-tracker'
 
 /** 大文件读取上限：超过则跳过，避免 IPC 序列化撑爆内存 */
 const MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
@@ -250,6 +251,7 @@ export async function getUnstagedChanges(
   sessionPath?: string,
   workspaceFilesPath?: string,
   extraPaths?: string[],
+  sessionId?: string,
 ): Promise<UnstagedChangesResult> {
   // 收集所有候选目录中的不重复 Git 仓库根
   const rawCandidates = [dirPath, sessionPath, workspaceFilesPath, ...(extraPaths || [])].filter(
@@ -267,8 +269,15 @@ export async function getUnstagedChanges(
     }
   }
 
+  const sessionFiles = sessionId
+    ? getAgentFileChangeTracker().getChanges(sessionId, rawCandidates).map((file) => ({
+        ...file,
+        source: computeSource(file.filePath, file.gitRoot, sessionPath, workspaceFilesPath),
+      }))
+    : []
+
   if (gitRoots.length === 0) {
-    return { isGitRepo: false, files: [], untrackedFiles: [], gitRootNames: [] }
+    return { isGitRepo: false, files: sessionFiles, untrackedFiles: [], gitRootNames: [] }
   }
 
   const allFiles: ChangedFileEntry[] = []
@@ -323,6 +332,7 @@ export async function getUnstagedChanges(
           deletions: stats.deletions,
           source: computeSource(filePath, gitRoot, sessionPath, workspaceFilesPath),
           gitRoot,
+          baseline: 'git',
         })
       }
     }
@@ -337,6 +347,15 @@ export async function getUnstagedChanges(
         }
       }
     }
+  }
+
+  const gitChangedPaths = new Set([
+    ...allFiles.map((file) => normalizeComparablePath(join(file.gitRoot, file.filePath))),
+    ...allUntracked.map((file) => normalizeComparablePath(join(file.gitRoot, file.filePath))),
+  ])
+  for (const file of sessionFiles) {
+    const absolutePath = normalizeComparablePath(join(file.gitRoot, file.filePath))
+    if (!gitChangedPaths.has(absolutePath)) allFiles.push(file)
   }
 
   return {
@@ -438,17 +457,47 @@ export async function getFileDiff(dirPath: string, filePath: string, gitRoot?: s
 /**
  * 获取文件的旧版本（git HEAD 或指定 baseRef）和新版本（磁盘）内容
  */
-export async function getDiffContents(dirPath: string, filePath: string, gitRoot?: string, baseRef?: string): Promise<{ oldContent: string; newContent: string } | null> {
-  const root = gitRoot || await findGitRoot(dirPath)
+export async function getDiffContents(
+  dirPath: string,
+  filePath: string,
+  gitRoot?: string,
+  baseRef?: string,
+  sessionId?: string,
+  baseline?: ChangedFileEntry['baseline'],
+): Promise<{ oldContent: string; newContent: string } | null> {
+  if (baseline === 'session') {
+    if (!sessionId) return null
+    return getAgentFileChangeTracker().getDiffContents(
+      sessionId,
+      gitRoot || dirPath,
+      filePath,
+    )
+  }
 
-  // 无 git root：纯文件预览（无 git HEAD 可比较），仅读磁盘文件，安全检查依赖 dirPath
+  const explicitGitRoot = gitRoot
+    ? await runGitCommand(['rev-parse', '--show-toplevel'], gitRoot, { quiet: true })
+    : null
+  const root = explicitGitRoot
+    ? normalizeGitRoot(explicitGitRoot)
+    : gitRoot
+      ? null
+      : await findGitRoot(dirPath)
+
+  // 无 git root：优先使用 Agent 首次写入前快照作为旧版本。
   if (!root) {
-    const safePath = normalizeSafePath(dirPath, filePath)
+    const comparisonRoot = gitRoot || dirPath
+    const sessionDiff = baseline !== 'git' && sessionId
+      ? getAgentFileChangeTracker().getDiffContents(sessionId, comparisonRoot, filePath)
+      : null
+    if (sessionDiff) return sessionDiff
+
+    // 旧会话可能没有快照，保留纯文件预览兼容行为。
+    const safePath = normalizeSafePath(comparisonRoot, filePath)
     if (!safePath) {
       console.warn('[git-diff-service] getDiffContents 拒绝不安全路径（无 git root）:', filePath)
       return null
     }
-    const fullPath = join(dirPath, safePath)
+    const fullPath = join(comparisonRoot, safePath)
     let newContent = ''
     if (existsSync(fullPath)) {
       try {
@@ -672,6 +721,7 @@ export async function getWorktreeChanges(
         deletions: stats.deletions,
         source: 'none',
         gitRoot,
+        baseline: 'git',
       }
       fileMap.set(filePath, entry)
     }
@@ -714,6 +764,7 @@ export async function getWorktreeChanges(
           deletions: stats.deletions,
           source: 'none',
           gitRoot,
+          baseline: 'git',
         })
       }
     }

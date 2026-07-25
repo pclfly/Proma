@@ -44,6 +44,8 @@ export interface SyncRuntimeDepsResult {
 }
 
 export const EXTERNAL_RUNTIME_PACKAGES: readonly string[] = [
+  // 打包器需要从 appDir 下的 Electron 包复制 electron.exe，才能生成 win-unpacked 和 NSIS 安装包。
+  'electron',
   '@anthropic-ai/claude-agent-sdk',
   '@earendil-works/pi-coding-agent',
   '@earendil-works/pi-agent-core',
