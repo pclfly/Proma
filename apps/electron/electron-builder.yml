@@ -6,7 +6,7 @@ productName: Proma
 copyright: Copyright © 2024-2026 Erlich Liu
 
 # Electron 版本（CI 环境 bun workspace 下无法自动检测，需显式指定）
-electronVersion: 39.5.1
+electronVersion: 43.2.0
 
 # 使用项目依赖中完整的 Electron 分发目录，确保 Windows 打包包含 electron.exe。
 electronDist: node_modules/electron/dist
@@ -88,6 +88,12 @@ extraResources:
 mac:
   category: public.app-category.developer-tools
   icon: resources/icon.icns
+  # Swift/AppKit 原生灵动岛宿主；须显式标记为需签名的额外二进制。
+  extraResources:
+    - from: resources/agent-island/macos-agent-island-helper
+      to: agent-island/macos-agent-island-helper
+  binaries:
+    - resources/agent-island/macos-agent-island-helper
   hardenedRuntime: true
   gatekeeperAssess: false
   entitlements: resources/entitlements.mac.plist

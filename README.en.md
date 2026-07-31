@@ -13,7 +13,7 @@ It is not just another chat box. Proma is meant to become a long-lived Agent wor
 - **Chat mode**: multi-model conversations, attachments, image input, Markdown / Mermaid / KaTeX / code highlighting, parallel conversations, system prompts, and context controls.
 - **Agent mode**: two built-in runtimes—Claude Agent SDK and Pi Agent SDK—with workspace isolation, permission modes, file operations, streaming output, plan confirmation, and ask-user interactions. Claude is the default; switch runtimes below the Agent input.
 - **Collaboration and tasks**: complex work can be split into traceable collaboration agents and tasks, with calls and results shown in the message stream.
-- **Skills & MCP**: each workspace can manage its own Skills, MCP servers, and workspace files.
+- **Skills, MCP, and project roots**: each Proma project manages its own Skills and MCP servers. Project files can use a user-selected local project root or a Proma-managed blank-project directory; local project configuration is not imported automatically.
 - **Remote bots**: Lark / Feishu bot bridging is supported, with DingTalk and WeChat bridge entry points also present in the app.
 - **Memory and tools**: Chat and Agent can share memory, with web search, built-in Chat tools, and Agent recommendation helpers.
 - **Local-first data**: conversations, workspaces, attachments, settings, and Skills are stored under `~/.proma/` as JSON / JSONL files, without a local database.
@@ -25,7 +25,25 @@ It is not just another chat box. Proma is meant to become a long-lived Agent wor
 
 Download the open-source version from [GitHub Releases](https://github.com/ErlichLiu/Proma/releases), with builds for macOS Apple Silicon, macOS Intel, and Windows.
 
-If you want fewer API setup steps, you can also use the [Proma commercial version](https://proma.cool/download). The commercial and open-source versions run in parallel; the commercial version mainly adds built-in model channels and subscription options.
+The open-source version can be used independently with self-configured AI provider channels. If you prefer Proma-provided built-in model channels and subscription options, you can optionally explore the [Proma commercial version](https://proma.cool/download). The two versions support different preferences, and you are free to choose the one that best fits your workflow.
+
+| Comparison | Open-source version | Commercial version |
+| --- | --- | --- |
+| Core desktop experience | Full Proma desktop experience with freedom to configure your workflow | The same core desktop experience |
+| Model channels | Add and manage AI provider channels and API keys yourself | Sign in to use Proma-provided model channels, while keeping the option to configure third-party channels |
+| Model pricing | Use each chosen provider under its own pricing and terms | Selected models have Proma Cloud-exclusive offers, with some priced as low as 20% of the official reference price |
+| Agent security and reliability | Evaluate each provider's security, protocol compatibility, and reliability yourself; third-party relays also add trust and data-handling considerations | Use Proma Cloud's managed official route with unified security and reliability safeguards, Agent protocol compatibility, and model health monitoring—reducing uncertainty from opaque third-party relays |
+| Web-connected and built-in AI capabilities | Configure search, image generation, and their API keys as needed | Get a more complete Proma Cloud web-connected and built-in experience, including WebSearch plus GPT Image 2 image generation and editing |
+| Public API and services | Primarily use the provider APIs that you configure yourself | Create dedicated, quota-limited Proma Cloud API keys to bring LLM, tool, and multimodal capabilities into your own apps or services |
+| Team credit management | Build your own member, credit-allocation, and usage-management processes | Team admins can allocate or reclaim shared team credits for members, automate monthly allocation, and review member usage and credit transactions |
+| Subscription and usage | Manage provider accounts, balances, and usage yourself | Manage subscriptions and balance in the app, with detailed model, Agent, and tool usage |
+| Switching from open source | — | Install over the existing app and continue using your local Proma data |
+
+> Available models, prices, and benefits may change; refer to the current in-app information.
+
+### Enterprise licensing
+
+If your organization plans to deploy Proma for hundreds or thousands of employees, enterprise licenses are available. We can also provide scoped, lightweight customization around your deployment needs. Contact us on WeChat: `geekthings`.
 
 ### First Setup
 
@@ -65,7 +83,7 @@ Use Chat for lightweight but practical analysis: compare audience needs, generat
 
 ### Agent Workbench
 
-Agent works inside a workspace, reads project files, progresses through tasks, outputs structured findings, and keeps reusable files visible in the right-side workspace panel.
+Agent works across the project root and session workspace, reads project files, progresses through tasks, outputs structured findings, and keeps reusable files visible in the right-side file panel.
 
 ![Proma Agent workbench](./docs/assets/screenshots/proma-agent-demo.png)
 
@@ -124,7 +142,7 @@ Proma stores data in local files so it is easy to back up, migrate, and inspect.
 │   └── {session-id}.jsonl
 ├── agent-workspaces/
 │   └── {workspace-slug}/
-│       ├── workspace-files/
+│       ├── workspace-files/ # Proma-managed project root for blank projects only
 │       ├── mcp.json
 │       └── skills/
 ├── attachments/
@@ -225,7 +243,7 @@ Main-process services live in `apps/electron/src/main/lib/`:
 - `agent-orchestrator.ts`: Agent orchestration, runtime routing, environment variables, SDK calls, event streams, and error handling.
 - `adapters/claude-agent-adapter.ts` / `adapters/pi-agent-adapter.ts`: runtime adapters for Claude and Pi; `runtime-routing-agent-adapter.ts` routes each session to its selected runtime.
 - `agent-session-manager.ts`: Agent session index and JSONL message persistence.
-- `agent-workspace-manager.ts`: workspaces, MCP, Skills, and workspace files.
+- `agent-workspace-manager.ts`: Proma workspaces, project roots, MCP, and Skills.
 - `chat-service.ts`: Chat streaming, Provider Adapters, tool activity.
 - `conversation-manager.ts`: Chat session index and message storage.
 - `channel-manager.ts`: channel CRUD, API key encryption, connection tests, model fetching.

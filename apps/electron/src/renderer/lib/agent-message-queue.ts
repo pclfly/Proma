@@ -85,6 +85,8 @@ export interface ParsedQueuedMessageMentions {
   mentionedSkills: string[]
   mentionedMcpServers: string[]
   mentionedSessionIds: string[]
+  mentionedTodoIds: string[]
+  mentionedCalendarEventIds: string[]
 }
 
 export interface QueuedMessageSendPayload {
@@ -92,6 +94,18 @@ export interface QueuedMessageSendPayload {
   sdkText: string
   mentions: ParsedQueuedMessageMentions
 }
+
+/** 队列预览专用片段：保留原始消息用于发送，同时把引用协议渲染为可读芯片。 */
+export type QueuedMessageReferenceType = 'file' | 'skill' | 'mcp' | 'session' | 'todo' | 'calendar_event'
+
+export type QueuedMessageDisplayPart =
+  | { type: 'text'; value: string }
+  | {
+      type: 'reference'
+      referenceType: QueuedMessageReferenceType
+      id: string
+      label: string
+    }
 
 function escapeHtml(text: string): string {
   return text
@@ -115,18 +129,98 @@ export function queuedTextToParagraphHtml(text: string): string {
 }
 
 
-const REF_PATTERN = /\/skill:(?<skill>\S+)|#mcp:(?<mcp>\S+)|&session:(?<session>\S+)/g
+const REF_PATTERN = /\/skill:(?<skill>\S+)|#mcp:(?<mcp>\S+)|&session:(?<session>[A-Za-z0-9-]+)(?:(?:~|::)\S+)?|&todo:(?<todo>[A-Za-z0-9-]+)(?:(?:~|::)\S+)?|&calendar_event:(?<calendarEvent>[A-Za-z0-9-]+)(?:(?:~|::)\S+)?/g
+const DISPLAY_REFERENCE_PATTERN = /@file:(?<file>\S+)|\/skill:(?<skill>\S+)|#mcp:(?<mcp>\S+)|&session:(?<session>[A-Za-z0-9-]+)(?:(?:~|::)(?<sessionLabel>\S+))?|&todo:(?<todo>[A-Za-z0-9-]+)(?:(?:~|::)(?<todoLabel>\S+))?|&calendar_event:(?<calendarEvent>[A-Za-z0-9-]+)(?:(?:~|::)(?<calendarEventLabel>\S+))?/g
+
+function decodeReferenceLabel(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
+}
+
+/**
+ * 将排队消息中的文件、Skill、MCP、会话和规划协议转换为展示片段。
+ * `item.text` 仍完整保留，发送时继续通过 parseQueuedMessageMentions 提取原始 ID。
+ */
+export function getQueuedMessageDisplayParts(text: string): QueuedMessageDisplayPart[] {
+  const parts: QueuedMessageDisplayPart[] = []
+  let lastIndex = 0
+
+  for (const match of text.matchAll(DISPLAY_REFERENCE_PATTERN)) {
+    if (match.index > lastIndex) {
+      parts.push({ type: 'text', value: text.slice(lastIndex, match.index) })
+    }
+
+    const groups = match.groups ?? {}
+    let referenceType: QueuedMessageReferenceType
+    let id: string
+    let rawLabel: string | undefined
+
+    if (groups.file) {
+      referenceType = 'file'
+      id = groups.file
+    } else if (groups.skill) {
+      referenceType = 'skill'
+      id = groups.skill
+    } else if (groups.mcp) {
+      referenceType = 'mcp'
+      id = groups.mcp
+    } else if (groups.session) {
+      referenceType = 'session'
+      id = groups.session
+      rawLabel = groups.sessionLabel
+    } else if (groups.todo) {
+      referenceType = 'todo'
+      id = groups.todo
+      rawLabel = groups.todoLabel
+    } else if (groups.calendarEvent) {
+      referenceType = 'calendar_event'
+      id = groups.calendarEvent
+      rawLabel = groups.calendarEventLabel
+    } else {
+      continue
+    }
+
+    const decodedId = decodeReferenceLabel(id)
+    const label = rawLabel
+      ? decodeReferenceLabel(rawLabel)
+      : referenceType === 'file'
+        ? (decodedId.split(/[\\/]/).pop() || decodedId)
+        : referenceType === 'session'
+          ? `会话 ${id.slice(0, 8)}`
+          : referenceType === 'todo'
+            ? `Todo ${id.slice(0, 8)}`
+            : referenceType === 'calendar_event'
+              ? `日程 ${id.slice(0, 8)}`
+              : decodedId
+
+    parts.push({ type: 'reference', referenceType, id, label })
+    lastIndex = match.index + match[0].length
+  }
+
+  if (lastIndex < text.length) {
+    parts.push({ type: 'text', value: text.slice(lastIndex) })
+  }
+
+  return parts.length > 0 ? parts : [{ type: 'text', value: text }]
+}
 
 export function parseQueuedMessageMentions(text: string): ParsedQueuedMessageMentions {
   const mentionedSkills: string[] = []
   const mentionedMcpServers: string[] = []
   const mentionedSessionIds: string[] = []
+  const mentionedTodoIds: string[] = []
+  const mentionedCalendarEventIds: string[] = []
 
   for (const match of text.matchAll(REF_PATTERN)) {
-    const { skill, mcp, session } = match.groups ?? {}
+    const { skill, mcp, session, todo, calendarEvent } = match.groups ?? {}
     if (skill) mentionedSkills.push(skill)
     else if (mcp) mentionedMcpServers.push(mcp)
     else if (session) mentionedSessionIds.push(session)
+    else if (todo) mentionedTodoIds.push(todo)
+    else if (calendarEvent) mentionedCalendarEventIds.push(calendarEvent)
   }
 
   return {
@@ -134,6 +228,8 @@ export function parseQueuedMessageMentions(text: string): ParsedQueuedMessageMen
     mentionedSkills,
     mentionedMcpServers,
     mentionedSessionIds,
+    mentionedTodoIds,
+    mentionedCalendarEventIds,
   }
 }
 

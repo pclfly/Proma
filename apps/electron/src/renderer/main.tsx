@@ -45,6 +45,7 @@ import {
 } from './atoms/agent-atoms'
 import { updateStatusAtom, initializeUpdater } from './atoms/updater'
 import { automationsAtom } from './atoms/automation-atoms'
+import { calendarEventsAtom, calendarPlanningGroupsAtom, planningTagsAtom, todoPlanningGroupsAtom, todosAtom } from './atoms/planning-atoms'
 import {
   notificationsEnabledAtom,
   notificationSoundEnabledAtom,
@@ -55,6 +56,7 @@ import {
   stickyUserMessageEnabledAtom,
   longTextPasteAsAttachmentEnabledAtom,
   richTextRenderingEnabledAtom,
+  sessionHoverPreviewEnabledAtom,
   initializeUiPreferences,
 } from './atoms/ui-preferences'
 import {
@@ -73,6 +75,7 @@ import { appModeAtom } from './atoms/app-mode'
 import type { FeishuBotBridgeState, FeishuBridgeState, DingTalkBotBridgeState, DingTalkBridgeState } from '@proma/shared'
 import { Toaster } from './components/ui/sonner'
 import { toast } from 'sonner'
+import { ArrowUpRight } from 'lucide-react'
 import { diffCapabilities } from '@proma/shared'
 import type { WorkspaceCapabilities } from '@proma/shared'
 import { showCapabilityChangeToasts } from './lib/capabilities-toast'
@@ -80,6 +83,8 @@ import { GlobalShortcuts } from './components/shortcuts/GlobalShortcuts'
 import { TabSwitcher } from './components/tabs/TabSwitcher'
 import { htmlToMarkdown, markdownToHtml } from './lib/markdown-rich-text'
 import { getEnabledClaudeAgentChannelIds } from './lib/agent-channel-selection'
+import { PromaLogo } from './lib/model-logo'
+import { initShortcutRegistry, updateShortcutOverrides } from './lib/shortcut-registry'
 import './styles/globals.css'
 import 'katex/dist/katex.min.css'
 
@@ -87,10 +92,12 @@ import 'katex/dist/katex.min.css'
 const isQuickTaskWindow = new URLSearchParams(window.location.search).get('window') === 'quick-task'
 const isVoiceDictationWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation'
 const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get('window') === 'detached-preview'
-const isMainWindow = !isQuickTaskWindow && !isVoiceDictationWindow && !isDetachedPreviewWindow
+const isPlanningWindow = new URLSearchParams(window.location.search).get('window') === 'planning'
+const isAgentIslandWindow = new URLSearchParams(window.location.search).get('window') === 'agent-island'
+const isMainWindow = !isQuickTaskWindow && !isVoiceDictationWindow && !isDetachedPreviewWindow && !isPlanningWindow && !isAgentIslandWindow
 
-// 仅主窗口禁用页面级滚动；独立浮窗各自管理自己的内容高度和滚动。
-if (isMainWindow) {
+// 主窗口和独立规划窗口均由内部面板管理滚动，避免页面本身出现第二层滚动。
+if (isMainWindow || isPlanningWindow) {
   document.documentElement.classList.add('proma-main-window')
 }
 
@@ -324,13 +331,16 @@ function AgentSettingsInitializer(): null {
     })
     const unsubFiles = window.electronAPI.onWorkspaceFilesChanged(() => {
       bumpFiles((v) => v + 1)
+      // 外部本地项目目录变动时，主进程在 LIST_WORKSPACES 中重新计算根目录状态。
+      // 这里仅响应 watcher 事件刷新一次，避免在侧栏每次渲染时同步访问文件系统。
+      window.electronAPI.listAgentWorkspaces().then(setAgentWorkspaces).catch(console.error)
     })
 
     return () => {
       unsubCapabilities()
       unsubFiles()
     }
-  }, [bumpCapabilities, bumpFiles, currentWorkspaceId, workspaces])
+  }, [bumpCapabilities, bumpFiles, currentWorkspaceId, setAgentWorkspaces, workspaces])
 
   return null
 }
@@ -342,11 +352,107 @@ function AgentSettingsInitializer(): null {
  */
 function UpdaterInitializer(): null {
   const setUpdateStatus = useSetAtom(updateStatusAtom)
+  const updateStatus = useAtomValue(updateStatusAtom)
+  const notifiedDownloadVersionRef = useRef<string | null>(null)
 
   useEffect(() => {
     const cleanup = initializeUpdater(setUpdateStatus)
     return cleanup
   }, [setUpdateStatus])
+
+  useEffect(() => {
+    if (updateStatus.status !== 'downloaded') return
+
+    const version = updateStatus.version || '新版本'
+    if (notifiedDownloadVersionRef.current === version) return
+    notifiedDownloadVersionRef.current = version
+    const versionLabel = version.startsWith('v') ? version : `v${version}`
+
+    toast.custom((toastId) => (
+      <div className="w-[344px] max-w-[calc(100vw-32px)] rounded-xl bg-background/95 p-3 text-foreground shadow-[0_12px_32px_rgba(0,0,0,0.14)] ring-1 ring-black/5 backdrop-blur-xl dark:ring-white/10">
+        <div className="flex items-center gap-2.5">
+          <img src={PromaLogo} alt="Proma" className="size-8 rounded-lg" />
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 text-sm leading-5">
+              <span className="font-semibold tracking-tight">Proma 更新已下载</span>
+              <span className="text-xs text-primary">{versionLabel}</span>
+            </div>
+            <p className="text-xs leading-4 text-muted-foreground">所有 Agent 完成后即可自动安装。</p>
+          </div>
+        </div>
+        <div className="mt-2.5 flex items-center justify-between">
+          <button
+            type="button"
+            className="h-7 rounded-md px-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-[0.96]"
+            onClick={() => toast.dismiss(toastId)}
+          >
+            取消
+          </button>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              className="flex h-7 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-[0.96]"
+              onClick={() => { void window.electronAPI.openExternal('https://proma.cool/changelog') }}
+            >
+              查看更新
+              <ArrowUpRight size={13} />
+            </button>
+            <button
+              type="button"
+              className="h-7 rounded-md bg-primary px-2.5 text-xs font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 active:scale-[0.96]"
+              onClick={() => {
+                toast.dismiss(toastId)
+                void window.electronAPI.updater?.installWhenIdle()
+                  .then((scheduled) => {
+                    if (!scheduled) {
+                      toast.error('更新尚未准备好，请稍后重试')
+                      return
+                    }
+
+                    toast.custom((scheduledToastId) => (
+                      <div className="w-[312px] max-w-[calc(100vw-32px)] rounded-xl bg-background/95 p-3 text-foreground shadow-[0_12px_32px_rgba(0,0,0,0.14)] ring-1 ring-black/5 backdrop-blur-xl dark:ring-white/10">
+                        <div className="flex items-center gap-2.5">
+                          <img src={PromaLogo} alt="Proma" className="size-7 rounded-md" />
+                          <div className="min-w-0 flex-1">
+                            <p className="text-sm font-semibold tracking-tight">已安排空闲时更新</p>
+                            <p className="text-xs leading-4 text-muted-foreground">当前任务结束后会自动重启安装。</p>
+                          </div>
+                        </div>
+                        <div className="mt-2 flex justify-end">
+                          <button
+                            type="button"
+                            className="h-7 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground active:scale-[0.96]"
+                            onClick={() => {
+                              void window.electronAPI.updater?.cancelIdleInstall()
+                              toast.dismiss(scheduledToastId)
+                            }}
+                          >
+                            取消安排
+                          </button>
+                        </div>
+                      </div>
+                    ), {
+                      duration: Infinity,
+                      dismissible: false,
+                      unstyled: true,
+                    })
+                  })
+                  .catch(() => {
+                    toast.error('无法安排空闲更新，请稍后重试')
+                  })
+              }}
+            >
+              空闲时更新
+            </button>
+          </div>
+        </div>
+      </div>
+    ), {
+      duration: Infinity,
+      dismissible: false,
+      unstyled: true,
+    })
+  }, [updateStatus])
 
   return null
 }
@@ -356,6 +462,74 @@ function UpdaterInitializer(): null {
  *
  * 加载全部定时任务，并订阅主进程的变更事件（运行完成/状态变化）刷新列表。
  */
+function PlanningShortcutInitializer(): null {
+  useEffect(() => {
+    initShortcutRegistry()
+    void window.electronAPI.getSettings().then((settings) => {
+      updateShortcutOverrides(settings.shortcutOverrides ?? {})
+    }).catch((error) => {
+      console.error('[任务/日程] 加载快捷键设置失败:', error)
+    })
+  }, [])
+  return null
+}
+
+function PlanningInitializer(): null {
+  const setTodos = useSetAtom(todosAtom)
+  const setCalendarEvents = useSetAtom(calendarEventsAtom)
+  const setTodoGroups = useSetAtom(todoPlanningGroupsAtom)
+  const setCalendarGroups = useSetAtom(calendarPlanningGroupsAtom)
+  const setTags = useSetAtom(planningTagsAtom)
+
+  useEffect(() => {
+    let disposed = false
+    const latestRequest = { todos: 0, calendarEvents: 0, todoGroups: 0, calendarGroups: 0, tags: 0 }
+    const loadTodos = (): void => {
+      const requestId = ++latestRequest.todos
+      void window.electronAPI.listTodos().then((todos) => {
+        if (!disposed && requestId === latestRequest.todos) setTodos(todos)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载 Todo 失败:', error))
+    }
+    const loadCalendarEvents = (): void => {
+      const requestId = ++latestRequest.calendarEvents
+      void window.electronAPI.listCalendarEvents().then((events) => {
+        if (!disposed && requestId === latestRequest.calendarEvents) setCalendarEvents(events)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载日程失败:', error))
+    }
+    const loadTodoGroups = (): void => {
+      const requestId = ++latestRequest.todoGroups
+      void window.electronAPI.listPlanningGroups('todo').then((groups) => {
+        if (!disposed && requestId === latestRequest.todoGroups) setTodoGroups(groups)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载 Todo 分组失败:', error))
+    }
+    const loadCalendarGroups = (): void => {
+      const requestId = ++latestRequest.calendarGroups
+      void window.electronAPI.listPlanningGroups('calendar').then((groups) => {
+        if (!disposed && requestId === latestRequest.calendarGroups) setCalendarGroups(groups)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载日程分组失败:', error))
+    }
+    const loadTags = (): void => {
+      const requestId = ++latestRequest.tags
+      void window.electronAPI.listPlanningTags().then((tags) => {
+        if (!disposed && requestId === latestRequest.tags) setTags(tags)
+      }).catch((error: unknown) => console.error('[任务/日程] 加载标签失败:', error))
+    }
+    const load = (resources?: string[]): void => {
+      const includes = (resource: string): boolean => resources === undefined || resources.includes(resource)
+      if (includes('todos')) loadTodos()
+      if (includes('calendar_events')) loadCalendarEvents()
+      if (includes('todo_groups')) loadTodoGroups()
+      if (includes('calendar_groups')) loadCalendarGroups()
+      if (includes('tags')) loadTags()
+    }
+    load()
+    const unsubscribe = window.electronAPI.onPlanningChanged((change) => load(change.resources))
+    return () => { disposed = true; unsubscribe() }
+  }, [setCalendarEvents, setCalendarGroups, setTags, setTodoGroups, setTodos])
+
+  return null
+}
+
 function AutomationInitializer(): null {
   const setAutomations = useSetAtom(automationsAtom)
   const setAgentSessions = useSetAtom(agentSessionsAtom)
@@ -440,14 +614,16 @@ function UiPreferencesInitializer(): null {
   const setStickyUserMessageEnabled = useSetAtom(stickyUserMessageEnabledAtom)
   const setLongTextPasteAsAttachmentEnabled = useSetAtom(longTextPasteAsAttachmentEnabledAtom)
   const setRichTextRenderingEnabled = useSetAtom(richTextRenderingEnabledAtom)
+  const setSessionHoverPreviewEnabled = useSetAtom(sessionHoverPreviewEnabledAtom)
 
   useEffect(() => {
     initializeUiPreferences(
       setStickyUserMessageEnabled,
       setLongTextPasteAsAttachmentEnabled,
-      setRichTextRenderingEnabled
+      setRichTextRenderingEnabled,
+      setSessionHoverPreviewEnabled
     )
-  }, [setStickyUserMessageEnabled, setLongTextPasteAsAttachmentEnabled, setRichTextRenderingEnabled])
+  }, [setStickyUserMessageEnabled, setLongTextPasteAsAttachmentEnabled, setRichTextRenderingEnabled, setSessionHoverPreviewEnabled])
 
   return null
 }
@@ -915,6 +1091,29 @@ if (isQuickTaskWindow) {
       </React.StrictMode>
     )
   })
+} else if (isPlanningWindow) {
+  import('./components/planning/PlanningWindowApp').then(({ PlanningWindowApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <AgentSettingsInitializer />
+        <PlanningShortcutInitializer />
+        <AutomationInitializer />
+        <PlanningInitializer />
+        <PlanningWindowApp />
+        <Toaster position="bottom-right" />
+      </React.StrictMode>
+    )
+  })
+} else if (isAgentIslandWindow) {
+  import('./components/agent-island/AgentIslandApp').then(({ AgentIslandApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <AgentIslandApp />
+      </React.StrictMode>
+    )
+  })
 } else {
   // ===== 主窗口：完整渲染 =====
   ReactDOM.createRoot(document.getElementById('root')!).render(
@@ -930,6 +1129,7 @@ if (isQuickTaskWindow) {
       <ChatToolInitializer />
       <UpdaterInitializer />
       <AutomationInitializer />
+      <PlanningInitializer />
       <FeishuInitializer />
       <DingTalkInitializer />
       <TabStatePersistenceInitializer />

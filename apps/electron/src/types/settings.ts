@@ -7,7 +7,7 @@
 import type { AgentRuntime, EnvironmentCheckResult, ThinkingConfig, AgentEffort, AgentThinkingLevel, FeishuSessionMirrorSettings, WindowsShellPreference } from '@proma/shared'
 
 /** 通知音场景类型 */
-export type NotificationSoundType = 'taskComplete' | 'permissionRequest' | 'exitPlanMode'
+export type NotificationSoundType = 'taskComplete' | 'permissionRequest' | 'exitPlanMode' | 'planningReminder'
 
 /** 可选通知音 ID */
 export type NotificationSoundId = 'ding' | 'ding-dong' | 'discord' | 'done' | 'down-power' | 'food' | 'lite' | 'quiet' | 'none'
@@ -20,6 +20,8 @@ export interface NotificationSoundSettings {
   permissionRequest?: NotificationSoundId
   /** 计划审批 */
   exitPlanMode?: NotificationSoundId
+  /** Todo / 日程到期提醒 */
+  planningReminder?: NotificationSoundId
 }
 
 /** 语音输入供应商 */
@@ -189,6 +191,12 @@ export type MarkdownFontSize = 'small' | 'medium' | 'large'
 /** 默认 Markdown 字号档位 */
 export const DEFAULT_MARKDOWN_FONT_SIZE: MarkdownFontSize = 'medium'
 
+/** Agent 灵动岛偏好。外接/无刘海屏默认不绘制顶部覆盖层。 */
+export interface AgentIslandSettings {
+  /** 是否启用 Agent / 近期 Todo 日程的灵动岛提醒，默认 true。 */
+  enabled?: boolean
+}
+
 /** 应用设置 */
 export interface AppSettings {
   /** 主题模式 */
@@ -245,6 +253,8 @@ export interface AppSettings {
   shortcutOverrides?: ShortcutOverrides
   /** 是否显示用户消息悬浮置顶条（默认 true） */
   stickyUserMessageEnabled?: boolean
+  /** 左侧会话列表悬浮预览迷你地图（默认 false，需手动开启） */
+  sessionHoverPreviewEnabled?: boolean
   /** 粘贴超过阈值的长文本时是否自动转为附件（默认 false） */
   longTextPasteAsAttachmentEnabled?: boolean
   /** 输入框是否渲染 Markdown 富文本格式（默认 false，关闭后为纯文本模式，仍保留 Mention 引用） */
@@ -273,8 +283,12 @@ export interface AppSettings {
    * 关闭后不注入任何 Proma 归因，并覆盖 Claude SDK 默认 Co-Authored-By。
    */
   gitAttributionEnabled?: boolean
+  /** Agent 灵动岛偏好（macOS 刘海屏优先，其他平台使用 Electron 降级体验）。 */
+  agentIsland?: AgentIslandSettings
   /** 主窗口状态（大小、位置、是否最大化） */
   mainWindowState?: MainWindowState
+  /** 独立任务/日程窗口状态（大小、位置、是否最大化） */
+  planningWindowState?: MainWindowState
 }
 
 /** 主窗口大小、位置和最大化状态 */
@@ -341,6 +355,8 @@ export const QUICK_TASK_IPC_CHANNELS = {
   FOCUS: 'quick-task:focus',
   /** 重新注册全局快捷键（设置变更后） */
   REREGISTER_GLOBAL_SHORTCUTS: 'quick-task:reregister-global-shortcuts',
+  /** 查询当前已成功注册的全局快捷键 */
+  GET_GLOBAL_SHORTCUT_REGISTRATION_STATUS: 'quick-task:get-global-shortcut-registration-status',
 } as const
 
 /** 语音输入 IPC 通道 */

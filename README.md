@@ -19,7 +19,7 @@ Proma 是一个本地优先的 AI 桌面应用，把多模型 Chat、通用 Agen
 - **Chat 模式**：多模型对话、附件解析、图片输入、Markdown / Mermaid / KaTeX / 代码高亮、并排对话、系统提示词、上下文管理。
 - **Agent 模式**：内置 Claude Agent SDK 与 Pi Agent SDK 两套运行时；支持工作区隔离、权限模式、文件操作、长任务流式输出、计划确认和用户追问。Claude 是默认内核，Pi 可在实验性设置中开启。
 - **协作与任务**：复杂任务可拆分为可追踪的协作子 Agent / Task，并在消息流中展示调用过程和结果。
-- **Skills & MCP**：每个工作区可以独立配置 Skills、MCP Server 和工作区文件，适合沉淀可复用能力。
+- **Skills、MCP 与项目根目录**：每个 Proma 项目独立配置 Skills 与 MCP Server。项目文件可使用用户选择的本地项目根目录，也可使用 Proma 托管的空白项目目录；本地项目配置不会被自动导入。
 - **远程机器人**：支持飞书 / Lark 机器人桥接，并已提供钉钉、微信桥接入口，用手机或群聊触发本机 Agent 工作流。
 - **记忆与工具**：Chat 和 Agent 可共享记忆能力，并支持联网搜索、内置 Chat 工具、Agent 推荐等辅助能力。
 - **本地优先**：会话、工作区、附件、配置、Skills 等默认存储在 `~/.proma/`，使用 JSON / JSONL 文件组织，不依赖本地数据库。
@@ -31,7 +31,25 @@ Proma 是一个本地优先的 AI 桌面应用，把多模型 Chat、通用 Agen
 
 从 [GitHub Releases](https://github.com/ErlichLiu/Proma/releases) 下载开源版本，提供 macOS Apple Silicon、macOS Intel 和 Windows 安装包。
 
-如果你希望开箱即用、减少 API 配置成本，也可以使用 [Proma 商业版](https://proma.cool/download)。商业版和开源版并行运行，主要区别是商业版提供内置渠道和订阅方案。
+开源版可独立使用，并支持自行配置 AI 供应商渠道。如果你更希望使用 Proma 提供的内置模型渠道和订阅方案，也可以按需了解 [Proma 商业版](https://proma.cool/download)。两个版本面向不同的使用偏好，你可以自由选择适合自己的版本。
+
+| 对比项 | 开源版 | 商业版 |
+| --- | --- | --- |
+| 核心桌面能力 | 完整的 Proma 桌面体验，可自由配置工作流 | 保留同样的核心桌面体验 |
+| 模型渠道 | 自行添加和管理 AI 供应商渠道与 API Key | 登录后可使用 Proma 官方内置模型渠道，也仍可自行配置第三方渠道 |
+| 模型价格 | 按所选供应商的规则和价格使用 | 精选模型提供 Proma Cloud 专属优惠，部分模型最高可低至官方参考价 2 折 |
+| Agent 安全与稳定 | 需自行评估供应商的安全、协议兼容与稳定性；使用第三方中转站时也需自行判断额外的信任与数据处理风险 | 使用 Proma Cloud 官方托管链路，提供统一的安全与稳定性保障、Agent 协议兼容和模型健康监控，减少不透明第三方中转带来的不确定性 |
+| 联网与内嵌 AI 能力 | 按需自行配置搜索、生图等服务及对应 API Key | 提供更完整的 Proma Cloud 联网与内嵌能力，包括 WebSearch，以及 GPT Image 2 生图和编辑 |
+| 对外 API 与服务 | 主要使用你自行配置的供应商 API | 可创建独立、可设额度上限的 Proma Cloud API Key，将 LLM、工具和多模态能力接入自己的应用或服务 |
+| 团队额度管理 | 需自行搭建成员、额度分配与用量管理机制 | 团队管理员可向成员分配或回收共享团队额度，支持按月自动分配，并查看成员用量与额度流水 |
+| 订阅与用量 | 自行管理供应商账号、余额与用量 | 在应用内管理订阅与余额，并查看模型、Agent 和工具的用量明细 |
+| 从开源版切换 | — | 直接覆盖安装即可，继续使用已有的本地 Proma 数据 |
+
+> 可用模型、价格和权益会随时间调整，以应用内当期展示为准。
+
+### 企业版与商业授权
+
+如果你的组织计划面向数百至数千名员工规模部署 Proma，可以采购企业版授权；我们也可围绕实际部署需求提供范围明确的轻量定制服务。欢迎通过微信联系：`geekthings`。
 
 ### 首次配置
 
@@ -71,7 +89,7 @@ Proma 是一个本地优先的 AI 桌面应用，把多模型 Chat、通用 Agen
 
 ### Agent 工作台
 
-Agent 在工作区里读取文件、推进任务、输出表格化结论，并把可复用文件保留在右侧工作区面板中。
+Agent 在项目根目录与会话工作台中读取文件、推进任务、输出表格化结论，并把可复用文件保留在右侧文件面板中。
 
 ![Proma Agent 工作台](./docs/assets/screenshots/proma-agent-demo.png)
 
@@ -128,7 +146,7 @@ Proma 采用本地文件存储，方便备份、迁移和排查问题。
 │   └── {session-id}.jsonl
 ├── agent-workspaces/
 │   └── {workspace-slug}/
-│       ├── workspace-files/
+│       ├── workspace-files/ # 仅空白项目使用的 Proma 托管项目根
 │       ├── mcp.json
 │       └── skills/
 ├── attachments/
@@ -229,7 +247,7 @@ shared 类型和 IPC 常量
 - `agent-orchestrator.ts`：Agent 编排、运行时路由、环境变量、SDK 调用、事件流、错误处理。
 - `adapters/claude-agent-adapter.ts` / `adapters/pi-agent-adapter.ts`：Claude 与 Pi 运行时适配；`runtime-routing-agent-adapter.ts` 依据会话内核路由。
 - `agent-session-manager.ts`：Agent 会话索引和 JSONL 消息持久化。
-- `agent-workspace-manager.ts`：工作区、MCP、Skills 和工作区文件管理。
+- `agent-workspace-manager.ts`：Proma 工作区、项目根目录、MCP 与 Skills 管理。
 - `chat-service.ts`：Chat 流式调用、Provider Adapter、工具活动。
 - `conversation-manager.ts`：Chat 会话索引和消息存储。
 - `channel-manager.ts`：渠道 CRUD、API Key 加密、连接测试、模型获取。
