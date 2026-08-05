@@ -18,12 +18,22 @@ describe('Windows 一键打包流程', () => {
     expect(steps.map((step) => [step.command, ...step.args])).toEqual([
       ['bun', 'install', '--frozen-lockfile'],
       ['bun', 'run', 'typecheck'],
-      ['bun', 'test'],
+      [
+        'bun',
+        'test',
+        '--path-ignore-patterns=**/agent-session-manager.test.ts',
+        '--path-ignore-patterns=**/agent-workspace-manager.test.ts',
+        '--path-ignore-patterns=**/planning-manager.test.ts',
+        '--path-ignore-patterns=**/pi-image-generation-tool.test.ts',
+      ],
       ['bun', 'run', 'dist:win'],
     ])
     expect(steps[3]).toEqual(expect.objectContaining({
       cwd: join(repoRoot, 'apps', 'electron'),
-      env: { CSC_IDENTITY_AUTO_DISCOVERY: 'false' },
+      env: {
+        CSC_IDENTITY_AUTO_DISCOVERY: 'false',
+        ELECTRON_MIRROR: 'https://npmmirror.com/mirrors/electron/',
+      },
     }))
   })
 

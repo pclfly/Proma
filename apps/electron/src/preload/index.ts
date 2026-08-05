@@ -2130,18 +2130,8 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(SYSTEM_PROMPT_IPC_CHANNELS.SET_DEFAULT, id)
   },
 
-  // 自动更新
-  updater: {
-    checkForUpdates: () => ipcRenderer.invoke('updater:check'),
-    getStatus: () => ipcRenderer.invoke('updater:get-status'),
-    onStatusChanged: (callback) => {
-      const listener = (_event: Electron.IpcRendererEvent, status: Parameters<typeof callback>[0]): void => callback(status)
-      ipcRenderer.on('updater:status-changed', listener)
-      return () => { ipcRenderer.removeListener('updater:status-changed', listener) }
-    },
-    installWhenIdle: () => ipcRenderer.invoke('updater:install-when-idle'),
-    cancelIdleInstall: () => ipcRenderer.invoke('updater:cancel-idle-install'),
-  },
+  // 自动更新已关闭，不向渲染进程暴露更新入口
+  updater: undefined,
 
   // GitHub Release
   getLatestRelease: () => {

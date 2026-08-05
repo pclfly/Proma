@@ -10,6 +10,7 @@ import { BrowserWindow, app } from 'electron'
 import type { UpdateStatus } from './updater-types'
 import { UPDATER_IPC_CHANNELS } from './updater-types'
 import { createIdleInstallScheduler } from './idle-install-scheduler'
+import { AUTO_UPDATE_ENABLED } from './updater-config'
 
 /** 当前更新状态 */
 let currentStatus: UpdateStatus = { status: 'idle' }
@@ -63,6 +64,11 @@ export function getUpdateStatus(): UpdateStatus {
 
 /** 手动触发检查更新 */
 export async function checkForUpdates(): Promise<void> {
+  if (!AUTO_UPDATE_ENABLED) {
+    console.log('[更新] 自动更新已关闭，跳过版本检查')
+    return
+  }
+
   // 已在下载中或已下载完成，不重复检查
   if (currentStatus.status === 'downloading' || currentStatus.status === 'downloaded') {
     console.log('[更新] 跳过检查：已在下载中或已下载完成')
@@ -87,6 +93,11 @@ export async function checkForUpdates(): Promise<void> {
  * @returns 是否已接受请求；仅 downloaded 状态可排队。
  */
 export function installWhenIdle(): boolean {
+  if (!AUTO_UPDATE_ENABLED) {
+    console.log('[更新] 自动更新已关闭，跳过安装')
+    return false
+  }
+
   if (currentStatus.status !== 'downloaded') {
     console.warn('[更新] 跳过空闲安装：当前没有已下载的更新')
     return false
@@ -153,6 +164,13 @@ export function cleanupUpdater(): void {
  */
 export function initAutoUpdater(mainWindow: BrowserWindow): void {
   configureUpdater(mainWindow)
+
+  if (!AUTO_UPDATE_ENABLED) {
+    autoUpdater.autoDownload = false
+    autoUpdater.autoInstallOnAppQuit = false
+    console.log('[更新] 自动更新已关闭')
+    return
+  }
 
   autoUpdater.logger = {
     info: (...args: unknown[]) => console.log('[更新-updater]', ...args),

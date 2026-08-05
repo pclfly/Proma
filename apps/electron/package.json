@@ -32,7 +32,7 @@
     "pack": "bun run build && bun run sync:runtime-deps && electron-builder --dir",
     "dist": "bun run build && bun run sync:runtime-deps && electron-builder",
     "dist:mac": "bun run build && bun run sync:runtime-deps && electron-builder --mac",
-    "dist:win": "bun run build && bun run sync:runtime-deps && node ../../node_modules/electron-builder/cli.js --win",
+    "dist:win": "bun run build && bun run sync:runtime-deps && bun node_modules/electron/install.js && node ../../node_modules/electron-builder/cli.js --win",
     "package:win:checked": "bun run scripts/package-windows.ts",
     "dist:linux": "bun run build && bun run sync:runtime-deps && electron-builder --linux",
     "dist:visual": "bun run scripts/dist.ts",
