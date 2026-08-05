@@ -51,6 +51,7 @@ export const EXTERNAL_RUNTIME_PACKAGES: readonly string[] = [
   '@earendil-works/pi-agent-core',
   '@earendil-works/pi-ai',
   'pdfjs-dist',
+  'sharp',
 ]
 
 const appDir = resolve(import.meta.dir, '..')

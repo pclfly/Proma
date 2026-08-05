@@ -929,6 +929,36 @@ export interface OtherWorkspaceSkillsGroup {
   skills: SkillMeta[]
 }
 
+// ===== Skill 批量导入 =====
+
+/** 批量导入单个 Skill 的结果状态 */
+export type BulkImportSkillStatus = 'imported' | 'skipped' | 'failed'
+
+/** 批量导入单个 Skill 的条目结果 */
+export interface BulkImportSkillItemResult {
+  /** Skill 目录名 / slug（与源目录名保持一致） */
+  slug: string
+  /** SKILL.md 中的名称；解析失败时回退为 slug */
+  name: string
+  status: BulkImportSkillStatus
+  /** skipped / failed 时的原因说明 */
+  reason?: string
+}
+
+/** 批量导入 Skill 汇总结果（供 UI 展示 成功/跳过/失败 汇总） */
+export interface BulkImportSkillsResult {
+  imported: number
+  skipped: number
+  failed: number
+  items: BulkImportSkillItemResult[]
+}
+
+/** 从其他工作区批量导入的选中项 */
+export interface BulkImportWorkspaceSelection {
+  sourceSlug: string
+  skillSlug: string
+}
+
 /** Skill 目录下的文件/子目录节点（递归树） */
 export interface SkillFileNode {
   /** 相对于 Skill 根目录的相对路径，使用 POSIX 分隔符 */
@@ -1003,8 +1033,10 @@ export interface WorkspaceCapabilities {
 export interface AgentSendInput {
   /** 会话 ID */
   sessionId: string
-  /** 用户消息内容 */
+  /** 用户消息内容（传给 Agent 的 SDK 文本；@file 引用路径已解码为真实路径） */
   userMessage: string
+  /** 仅用于持久化/展示的原始用户输入（保留 @file 编码原文，省略时回退到 userMessage） */
+  rawUserMessage?: string
   /** 渠道 ID（用于获取 API Key） */
   channelId: string
   /** 模型 ID */
@@ -1181,6 +1213,8 @@ export interface AgentStreamCompletePayload {
   resultErrors?: string[]
   /** 本轮主体结束但仍有后台任务/定时任务在飞行：UI 进入"空闲可输入"态，等待任务完成自动唤醒 */
   backgroundTasksPending?: boolean
+  /** 完成时的最新会话元数据，供 renderer 增量更新列表，避免重新传输全量会话索引。 */
+  session?: AgentSessionMeta
 }
 
 // ===== 文件浏览器 =====
@@ -1568,6 +1602,8 @@ export const AGENT_IPC_CHANNELS = {
   GET_DEFAULT_SKILL_SLUGS: 'agent:get-default-skill-slugs',
   /** 从其他工作区导入 Skill 到当前工作区 */
   IMPORT_SKILL_FROM_WORKSPACE: 'agent:import-skill-from-workspace',
+  /** 从其他工作区批量导入多个 Skill 到当前工作区 */
+  BATCH_IMPORT_SKILLS_FROM_WORKSPACES: 'agent:batch-import-skills-from-workspaces',
   /** 从源工作区同步更新已导入的 Skill */
   UPDATE_SKILL_FROM_SOURCE: 'agent:update-skill-from-source',
   /** 读取 SKILL.md 全文内容 */

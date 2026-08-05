@@ -50,6 +50,11 @@ import {
   updateShortcutOverrides,
 } from '@/lib/shortcut-registry'
 import { getFileParentPath } from '@/lib/file-utils'
+import {
+  shouldFallbackVoiceDictationToActiveTab,
+  VOICE_DICTATION_CLEAR_PREVIEW_EVENT,
+  VOICE_DICTATION_PREVIEW_EVENT,
+} from '@/lib/voice-input-focus'
 
 /**
  * 快捷键初始化 + 全局 Handler 注册
@@ -358,16 +363,39 @@ export function GlobalShortcuts(): null {
   // ===== 语音输入 → 写入当前 Proma 输入框 =====
 
   useEffect(() => {
-    const cleanup = window.electronAPI.onVoiceDictationInsertText(({ text }) => {
-      const trimmed = text.trim()
-      if (!trimmed) return
+    const cleanupPreview = window.electronAPI.onVoiceDictationPreviewText((data) => {
+      if (!data.text.trim()) return
+      window.dispatchEvent(new CustomEvent(VOICE_DICTATION_PREVIEW_EVENT, { detail: data }))
+    })
+    const cleanupClearPreview = window.electronAPI.onVoiceDictationClearPreviewText((data) => {
+      window.dispatchEvent(new CustomEvent(VOICE_DICTATION_CLEAR_PREVIEW_EVENT, { detail: data }))
+    })
+    const cleanup = window.electronAPI.onVoiceDictationInsertText((data) => {
+      const acknowledgeDelivery = (delivered: boolean): void => {
+        window.electronAPI.acknowledgeVoiceDictationTextDelivery({
+          sessionId: data.sessionId,
+          delivered,
+        })
+      }
+      const trimmed = data.text.trim()
+      if (!trimmed) {
+        acknowledgeDelivery(false)
+        return
+      }
 
       const insertedAtCursor = !window.dispatchEvent(new CustomEvent('proma:insert-voice-dictation-text', {
         cancelable: true,
-        detail: { text: trimmed },
+        detail: { ...data, text: trimmed },
       }))
       if (insertedAtCursor) {
+        acknowledgeDelivery(true)
         window.dispatchEvent(new CustomEvent('proma:focus-input'))
+        return
+      }
+
+      if (!shouldFallbackVoiceDictationToActiveTab(data.targetInputId)) {
+        console.warn('[语音输入] 冻结的输入目标已不可用，已丢弃听写结果:', data.targetInputId)
+        acknowledgeDelivery(false)
         return
       }
 
@@ -381,7 +409,10 @@ export function GlobalShortcuts(): null {
           : { type: 'chat' as const, sessionId: store.get(currentConversationIdAtom) }
       const target = activeTab ?? fallbackTarget
 
-      if (!target.sessionId) return
+      if (!target.sessionId) {
+        acknowledgeDelivery(false)
+        return
+      }
 
       store.set(activeViewAtom, 'conversations')
 
@@ -401,6 +432,7 @@ export function GlobalShortcuts(): null {
           return map
         })
         window.dispatchEvent(new CustomEvent('proma:focus-input'))
+        acknowledgeDelivery(true)
         return
       }
 
@@ -415,9 +447,17 @@ export function GlobalShortcuts(): null {
           return map
         })
         window.dispatchEvent(new CustomEvent('proma:focus-input'))
+        acknowledgeDelivery(true)
+        return
       }
+
+      acknowledgeDelivery(false)
     })
-    return cleanup
+    return () => {
+      cleanupPreview()
+      cleanupClearPreview()
+      cleanup()
+    }
   }, [store])
 
   // ===== 菜单栏 → 打开 / 创建会话 =====

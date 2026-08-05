@@ -16,12 +16,15 @@ import type {
   VoiceDictationAudioChunkInput,
   VoiceDictationCommitInput,
   VoiceDictationCommitResult,
+  VoiceDictationPreviewInput,
   VoiceDictationResizeInput,
   VoiceDictationSettings,
   VoiceDictationSettingsUpdate,
   VoiceDictationStartInput,
   VoiceDictationStopInput,
   VoiceDictationTestResult,
+  VoiceDictationTextDeliveryInput,
+  VoiceDictationToggleInput,
   MicPermissionResult,
 } from '../types'
 import type {
@@ -61,6 +64,9 @@ import type {
   StopTaskInput,
   WorkspaceMcpConfig,
   SkillMeta,
+  BulkImportSkillItemResult,
+  BulkImportSkillsResult,
+  BulkImportWorkspaceSelection,
   SkillFileContent,
   WorkspaceCapabilities,
   WorkspaceMemorySummary,
@@ -134,6 +140,12 @@ import type {
   CreatePlanningGroupInput,
   UpdatePlanningGroupInput,
   SnoozePlanningReminderInput,
+  PlanningNativeSyncEntity,
+  PlanningNativeSyncStatus,
+  PlanningNativeSyncPermissionResult,
+  PlanningNativeSyncTarget,
+  PlanningSyncProfile,
+  SavePlanningSyncProfileInput,
 } from '@proma/shared'
 import type { UserProfile, AppSettings } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
@@ -153,8 +165,10 @@ import {
   getChannelPlanQuota,
 } from './lib/channel-manager'
 import { loginCodexOAuth, cancelCodexOAuthLogin } from './lib/codex-oauth-service'
+import { loginXaiOAuth, cancelXaiOAuthLogin } from './lib/xai-oauth-service'
 import { resolvePiReasoningCapability } from './lib/adapters/pi-model-registry'
-import { serializeCodexCredentials } from '@proma/shared'
+import { serializeCodexCredentials, serializeXaiCredentials } from '@proma/shared'
+import type { CodexOAuthDeviceCode, CodexOAuthLoginMethod, XaiOAuthDeviceCode } from '@proma/shared'
 import {
   listConversations,
   createConversation,
@@ -219,8 +233,16 @@ import {
   listActivePlanningReminders,
   acknowledgePlanningReminder,
   snoozePlanningReminder,
+  listPlanningSyncProfiles,
+  savePlanningSyncProfile,
 } from './lib/planning-manager'
 import { broadcastPlanningChanged } from './lib/planning-events'
+import {
+  getPlanningNativeSyncStatus,
+  listPlanningNativeSyncTargets,
+  requestPlanningNativeSyncAccess,
+} from './lib/planning-native-sync-service'
+import { runPlanningNativeSync } from './lib/planning-native-sync-coordinator'
 import {
   listAgentSessions,
   createAgentSession,
@@ -263,6 +285,7 @@ import {
   getProjectFilesPath,
   deleteWorkspaceSkill,
   importSkillFromWorkspace,
+  batchImportSkillsFromWorkspaces,
   updateSkillFromSource,
   readWorkspaceSkillContent,
   writeWorkspaceSkillContent,
@@ -901,6 +924,16 @@ function releaseDirectoryWatcherIfUnreferenced(dirPath: string): void {
   if (!isStillReferenced) unwatchAttachedDirectory(dirPath)
 }
 
+async function withOAuthDeviceCodeQr<T extends CodexOAuthDeviceCode | XaiOAuthDeviceCode>(deviceCode: T): Promise<T> {
+  try {
+    const QRCode = (await import('qrcode')).default
+    return { ...deviceCode, qrCodeData: await QRCode.toDataURL(deviceCode.verificationUri, { width: 240, margin: 1 }) }
+  } catch (error) {
+    console.warn('[OAuth] 生成设备码二维码失败:', error)
+    return deviceCode
+  }
+}
+
 export function registerIpcHandlers(): void {
   console.log('[IPC] 正在注册 IPC 处理器...')
 
@@ -1088,6 +1121,17 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // 在系统剪贴板中写入纯文本
+  ipcMain.handle(
+    IPC_CHANNELS.WRITE_CLIPBOARD_TEXT,
+    async (_, text: string): Promise<void> => {
+      if (typeof text !== 'string') {
+        throw new TypeError('剪贴板文本必须是字符串')
+      }
+      clipboard.writeText(text)
+    }
+  )
+
   // 用系统默认应用打开任意文件（appName 需在 KNOWN_EDITORS 白名单内）
   ipcMain.handle(
     IPC_CHANNELS.SYSTEM_OPEN_FILE,
@@ -1239,9 +1283,19 @@ export function registerIpcHandlers(): void {
   // apiKey 传给 create/update，channel-manager 加密后存储——与现有 apiKey 明文回传模式一致。
   ipcMain.handle(
     CHANNEL_IPC_CHANNELS.CODEX_OAUTH_LOGIN,
-    async (): Promise<import('@proma/shared').CodexOAuthLoginResult> => {
+    async (event, requestedMethod?: CodexOAuthLoginMethod): Promise<import('@proma/shared').CodexOAuthLoginResult> => {
+      const method: CodexOAuthLoginMethod = requestedMethod === 'device_code' ? 'device_code' : 'browser'
       try {
-        const credentials = await loginCodexOAuth()
+        const credentials = await loginCodexOAuth({
+          method,
+          onDeviceCode: (deviceCode) => {
+            void withOAuthDeviceCodeQr(deviceCode).then((payload) => {
+              if (!event.sender.isDestroyed()) {
+                event.sender.send(CHANNEL_IPC_CHANNELS.CODEX_OAUTH_DEVICE_CODE, payload)
+              }
+            }).catch((error) => console.warn('[OAuth] 发送 Codex device code 失败:', error))
+          },
+        })
         return {
           success: true,
           credentials: serializeCodexCredentials(credentials),
@@ -1261,6 +1315,35 @@ export function registerIpcHandlers(): void {
     CHANNEL_IPC_CHANNELS.CODEX_OAUTH_CANCEL,
     async (): Promise<void> => {
       cancelCodexOAuthLogin()
+    }
+  )
+
+  // 发起 xAI（Grok/X 订阅）OAuth device-code 登录。Pi 会通过 device-code 事件给出
+  // 预填的浏览器授权链接；成功后的凭据沿用 Channel.apiKey 加密存储。
+  ipcMain.handle(
+    CHANNEL_IPC_CHANNELS.XAI_OAUTH_LOGIN,
+    async (event): Promise<import('@proma/shared').XaiOAuthLoginResult> => {
+      try {
+        const credentials = await loginXaiOAuth({
+          onDeviceCode: (deviceCode) => {
+            void withOAuthDeviceCodeQr(deviceCode).then((payload) => {
+              if (!event.sender.isDestroyed()) {
+                event.sender.send(CHANNEL_IPC_CHANNELS.XAI_OAUTH_DEVICE_CODE, payload)
+              }
+            }).catch((error) => console.warn('[OAuth] 发送 xAI device code 失败:', error))
+          },
+        })
+        return { success: true, credentials: serializeXaiCredentials(credentials) }
+      } catch (error) {
+        return { success: false, message: error instanceof Error ? error.message : String(error) }
+      }
+    }
+  )
+
+  ipcMain.handle(
+    CHANNEL_IPC_CHANNELS.XAI_OAUTH_CANCEL,
+    async (): Promise<void> => {
+      cancelXaiOAuthLogin()
     }
   )
 
@@ -1878,18 +1961,7 @@ export function registerIpcHandlers(): void {
   // 获取 Agent 会话列表
   ipcMain.handle(
     AGENT_IPC_CHANNELS.LIST_SESSIONS,
-    async (): Promise<AgentSessionMeta[]> => {
-      const sessions = listAgentSessions()
-      // 启动所有已有附加目录的文件监听
-      for (const session of sessions) {
-        if (session.attachedDirectories) {
-          for (const dir of session.attachedDirectories) {
-            watchAttachedDirectory(dir)
-          }
-        }
-      }
-      return sessions
-    }
+    async (): Promise<AgentSessionMeta[]> => listAgentSessions()
   )
 
   // 创建 Agent 会话
@@ -2326,6 +2398,14 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.IMPORT_SKILL_FROM_WORKSPACE,
     async (_, targetSlug: string, sourceSlug: string, skillSlug: string): Promise<SkillMeta> => {
       return importSkillFromWorkspace(targetSlug, sourceSlug, skillSlug)
+    }
+  )
+
+  // 从其他工作区批量导入多个 Skill
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.BATCH_IMPORT_SKILLS_FROM_WORKSPACES,
+    async (_, targetSlug: string, selections: BulkImportWorkspaceSelection[]): Promise<BulkImportSkillsResult> => {
+      return batchImportSkillsFromWorkspaces(targetSlug, selections)
     }
   )
 
@@ -4418,10 +4498,13 @@ export function registerIpcHandlers(): void {
 
   ipcMain.handle(
     VOICE_DICTATION_IPC_CHANNELS.TOGGLE,
-    async (event): Promise<void> => {
+    async (event, input?: VoiceDictationToggleInput): Promise<void> => {
       const { toggleVoiceDictationWindow } = await import('./lib/voice-dictation-window')
       const sourceWindow = BrowserWindow.fromWebContents(event.sender)
-      toggleVoiceDictationWindow({ targetIsProma: !!sourceWindow })
+      const sourceInputId = typeof input?.sourceInputId === 'string' && input.sourceInputId.length > 0 && input.sourceInputId.length <= 512
+        ? input.sourceInputId
+        : undefined
+      toggleVoiceDictationWindow({ targetIsProma: !!sourceWindow, sourceInputId })
     }
   )
 
@@ -4444,6 +4527,28 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  ipcMain.on(VOICE_DICTATION_IPC_CHANNELS.REPORT_VOLUME, (event, volume: unknown) => {
+    void Promise.all([
+      import('./index'),
+      import('./lib/voice-dictation-window'),
+    ]).then(([{ getMainWindow }, { updateVoiceDictationIndicatorVolume }]) => {
+      const mainWindow = getMainWindow()
+      if (!mainWindow || mainWindow.isDestroyed() || event.sender.id !== mainWindow.webContents.id) return
+      updateVoiceDictationIndicatorVolume(typeof volume === 'number' ? volume : 0)
+    }).catch(console.error)
+  })
+
+  ipcMain.on(VOICE_DICTATION_IPC_CHANNELS.REPORT_TRANSCRIPT, (event, text: unknown) => {
+    void Promise.all([
+      import('./index'),
+      import('./lib/voice-dictation-window'),
+    ]).then(([{ getMainWindow }, { updateVoiceDictationIndicatorTranscript }]) => {
+      const mainWindow = getMainWindow()
+      if (!mainWindow || mainWindow.isDestroyed() || event.sender.id !== mainWindow.webContents.id) return
+      updateVoiceDictationIndicatorTranscript(typeof text === 'string' ? text.slice(-4_000) : '')
+    }).catch(console.error)
+  })
+
   ipcMain.handle(
     VOICE_DICTATION_IPC_CHANNELS.STOP,
     async (_, input: VoiceDictationStopInput): Promise<void> => {
@@ -4456,16 +4561,43 @@ export function registerIpcHandlers(): void {
     VOICE_DICTATION_IPC_CHANNELS.CANCEL,
     async (_, input: VoiceDictationStopInput): Promise<void> => {
       const { cancelDoubaoAsrSession } = await import('./lib/doubao-asr-service')
+      const { clearVoiceDictationPreview } = await import('./lib/text-output-service')
+      clearVoiceDictationPreview(
+        input.previewSessionId ?? input.sessionId,
+        input.targetInputId,
+        input.outputContextId,
+      )
       cancelDoubaoAsrSession(input.sessionId)
     }
   )
+
+  ipcMain.handle(
+    VOICE_DICTATION_IPC_CHANNELS.PREVIEW,
+    async (_, input: VoiceDictationPreviewInput): Promise<void> => {
+      const { getVoiceDictationSettings } = await import('./lib/voice-dictation-settings-service')
+      const { previewVoiceDictationText } = await import('./lib/text-output-service')
+      previewVoiceDictationText(input, getVoiceDictationSettings())
+    }
+  )
+
+  ipcMain.on(VOICE_DICTATION_IPC_CHANNELS.ACK_INSERT_TEXT, (event, input: VoiceDictationTextDeliveryInput) => {
+    void Promise.all([
+      import('./index'),
+      import('./lib/text-output-service'),
+    ]).then(([{ getMainWindow }, { acknowledgeVoiceDictationTextDelivery }]) => {
+      const mainWindow = getMainWindow()
+      if (!mainWindow || mainWindow.isDestroyed() || event.sender.id !== mainWindow.webContents.id) return
+      if (!input || typeof input.sessionId !== 'string' || typeof input.delivered !== 'boolean') return
+      acknowledgeVoiceDictationTextDelivery(input.sessionId, input.delivered)
+    }).catch(console.error)
+  })
 
   ipcMain.handle(
     VOICE_DICTATION_IPC_CHANNELS.COMMIT,
     async (_, input: VoiceDictationCommitInput): Promise<VoiceDictationCommitResult> => {
       const { getVoiceDictationSettings } = await import('./lib/voice-dictation-settings-service')
       const { commitVoiceDictationText } = await import('./lib/text-output-service')
-      return commitVoiceDictationText(input.text, getVoiceDictationSettings())
+      return commitVoiceDictationText(input, getVoiceDictationSettings())
     }
   )
 
@@ -4775,6 +4907,35 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(PLANNING_IPC_CHANNELS.SNOOZE_REMINDER, async (_, input: SnoozePlanningReminderInput): Promise<PlanningReminder | undefined> => {
     if (!input || typeof input.id !== 'string' || !Number.isInteger(input.minutes) || input.minutes < 1 || input.minutes > 10080) throw new Error('推迟分钟数非法')
     const reminder = snoozePlanningReminder(input.id, input.minutes); if (reminder) broadcastPlanningChanged(['todos', 'calendar_events', 'reminders']); return reminder
+  })
+
+  // ===== macOS Calendar / Reminders 同步（授权、受管目标与单向发布） =====
+  const isPlanningNativeSyncEntity = (value: unknown): value is PlanningNativeSyncEntity => value === 'calendar' || value === 'reminder'
+  ipcMain.handle(PLANNING_IPC_CHANNELS.GET_NATIVE_SYNC_STATUS, async (): Promise<PlanningNativeSyncStatus> => getPlanningNativeSyncStatus())
+  ipcMain.handle(PLANNING_IPC_CHANNELS.REQUEST_NATIVE_SYNC_ACCESS, async (_, entity: unknown): Promise<PlanningNativeSyncPermissionResult> => {
+    if (!isPlanningNativeSyncEntity(entity)) throw new Error('同步实体类型非法')
+    return requestPlanningNativeSyncAccess(entity)
+  })
+  ipcMain.handle(PLANNING_IPC_CHANNELS.OPEN_NATIVE_SYNC_PRIVACY_SETTINGS, async (_, entity: unknown): Promise<void> => {
+    if (!isPlanningNativeSyncEntity(entity)) throw new Error('同步实体类型非法')
+    if (process.platform !== 'darwin') return
+    await shell.openExternal(entity === 'calendar'
+      ? 'x-apple.systempreferences:com.apple.preference.security?Privacy_Calendars'
+      : 'x-apple.systempreferences:com.apple.preference.security?Privacy_Reminders')
+  })
+  ipcMain.handle(PLANNING_IPC_CHANNELS.LIST_NATIVE_SYNC_TARGETS, async (_, entity: unknown): Promise<PlanningNativeSyncTarget[]> => {
+    if (!isPlanningNativeSyncEntity(entity)) throw new Error('同步实体类型非法')
+    return listPlanningNativeSyncTargets(entity)
+  })
+  ipcMain.handle(PLANNING_IPC_CHANNELS.LIST_SYNC_PROFILES, async (): Promise<PlanningSyncProfile[]> => listPlanningSyncProfiles())
+  ipcMain.handle(PLANNING_IPC_CHANNELS.SAVE_SYNC_PROFILE, async (_, input: SavePlanningSyncProfileInput): Promise<PlanningSyncProfile> => {
+    if (!input || !isPlanningNativeSyncEntity(input.entity) || !input.target || typeof input.target.id !== 'string' || typeof input.target.title !== 'string' || typeof input.target.sourceTitle !== 'string' || (input.enabled !== undefined && typeof input.enabled !== 'boolean')) throw new Error('同步目标参数非法')
+    // renderer 不可信：必须由主进程重新确认目标仍存在且可写，不能接受伪造的 Calendar/List 标识。
+    const target = (await listPlanningNativeSyncTargets(input.entity)).find((item) => item.id === input.target.id)
+    if (!target) throw new Error('同步目标不存在、不可写或尚未授权')
+    const profile = savePlanningSyncProfile({ ...input, target })
+    void runPlanningNativeSync()
+    return profile
   })
 
   // ===== 定时任务（Automation）=====

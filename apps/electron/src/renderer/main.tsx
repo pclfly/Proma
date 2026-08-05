@@ -80,6 +80,7 @@ import { diffCapabilities } from '@proma/shared'
 import type { WorkspaceCapabilities } from '@proma/shared'
 import { showCapabilityChangeToasts } from './lib/capabilities-toast'
 import { GlobalShortcuts } from './components/shortcuts/GlobalShortcuts'
+import { VoiceDictationApp } from './components/voice-dictation/VoiceDictationApp'
 import { TabSwitcher } from './components/tabs/TabSwitcher'
 import { htmlToMarkdown, markdownToHtml } from './lib/markdown-rich-text'
 import { getEnabledClaudeAgentChannelIds } from './lib/agent-channel-selection'
@@ -90,11 +91,11 @@ import 'katex/dist/katex.min.css'
 
 // ===== 窗口类型检测 =====
 const isQuickTaskWindow = new URLSearchParams(window.location.search).get('window') === 'quick-task'
-const isVoiceDictationWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation'
+const isVoiceDictationIndicatorWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation-indicator'
 const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get('window') === 'detached-preview'
 const isPlanningWindow = new URLSearchParams(window.location.search).get('window') === 'planning'
 const isAgentIslandWindow = new URLSearchParams(window.location.search).get('window') === 'agent-island'
-const isMainWindow = !isQuickTaskWindow && !isVoiceDictationWindow && !isDetachedPreviewWindow && !isPlanningWindow && !isAgentIslandWindow
+const isMainWindow = !isQuickTaskWindow && !isVoiceDictationIndicatorWindow && !isDetachedPreviewWindow && !isPlanningWindow && !isAgentIslandWindow
 
 // 主窗口和独立规划窗口均由内部面板管理滚动，避免页面本身出现第二层滚动。
 if (isMainWindow || isPlanningWindow) {
@@ -572,9 +573,16 @@ function NotificationsInitializer(): null {
 function DockBadgeInitializer(): null {
   const count = useAtomValue(dockBadgeCountAtom)
   const notificationsEnabled = useAtomValue(notificationsEnabledAtom)
-  const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
+  const tabs = useAtomValue(tabsAtom)
+  const activeTabId = useAtomValue(activeTabIdAtom)
   const setUnviewedCompleted = useSetAtom(unviewedCompletedSessionIdsAtom)
   const badgeCount = notificationsEnabled ? count : 0
+  const activeAgentSessionId = useMemo(() => {
+    const activeTab = activeTabId ? tabs.find((tab) => tab.id === activeTabId) : null
+    return activeTab?.type === 'agent' || activeTab?.type === 'preview'
+      ? activeTab.sessionId
+      : null
+  }, [activeTabId, tabs])
 
   useEffect(() => {
     window.electronAPI.setDockBadgeCount(badgeCount).catch((error) => {
@@ -583,24 +591,27 @@ function DockBadgeInitializer(): null {
   }, [badgeCount])
 
   useEffect(() => {
-    const clearCurrentSessionBadge = (): void => {
-      if (!document.hasFocus() || !currentSessionId) return
+    const clearActiveSessionBadge = (): void => {
+      if (!document.hasFocus() || !activeAgentSessionId) return
+      // 以实际激活的 Agent/预览 Tab 为准。Scratch Pad 会保留 currentAgentSessionId，
+      // 不能仅据此把后台会话误判为已查看。
+      void window.electronAPI.agentIsland.markSessionViewed(activeAgentSessionId).catch(console.error)
       setUnviewedCompleted((prev) => {
-        if (!prev.has(currentSessionId)) return prev
+        if (!prev.has(activeAgentSessionId)) return prev
         const next = new Set(prev)
-        next.delete(currentSessionId)
+        next.delete(activeAgentSessionId)
         return next
       })
     }
 
-    clearCurrentSessionBadge()
-    window.addEventListener('focus', clearCurrentSessionBadge)
-    document.addEventListener('visibilitychange', clearCurrentSessionBadge)
+    clearActiveSessionBadge()
+    window.addEventListener('focus', clearActiveSessionBadge)
+    document.addEventListener('visibilitychange', clearActiveSessionBadge)
     return () => {
-      window.removeEventListener('focus', clearCurrentSessionBadge)
-      document.removeEventListener('visibilitychange', clearCurrentSessionBadge)
+      window.removeEventListener('focus', clearActiveSessionBadge)
+      document.removeEventListener('visibilitychange', clearActiveSessionBadge)
     }
-  }, [currentSessionId, setUnviewedCompleted])
+  }, [activeAgentSessionId, setUnviewedCompleted])
 
   return null
 }
@@ -1070,13 +1081,12 @@ if (isQuickTaskWindow) {
       </React.StrictMode>
     )
   })
-} else if (isVoiceDictationWindow) {
-  import('./components/voice-dictation/VoiceDictationApp').then(({ VoiceDictationApp }) => {
+} else if (isVoiceDictationIndicatorWindow) {
+  import('./components/voice-dictation/VoiceDictationIndicatorApp').then(({ VoiceDictationIndicatorApp }) => {
     ReactDOM.createRoot(document.getElementById('root')!).render(
       <React.StrictMode>
         <ThemeInitializer />
-        <VoiceDictationApp />
-        <Toaster position="bottom-right" />
+        <VoiceDictationIndicatorApp />
       </React.StrictMode>
     )
   })
@@ -1134,6 +1144,7 @@ if (isQuickTaskWindow) {
       <DingTalkInitializer />
       <TabStatePersistenceInitializer />
       <ScratchPadPersistence />
+      <VoiceDictationApp embedded />
       <GlobalShortcuts />
       <TabSwitcher />
       <App />
