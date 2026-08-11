@@ -1,10 +1,10 @@
 import { beforeAll, describe, expect, mock, test } from 'bun:test'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 
-type PiBuiltinToolsModule = typeof import('./pi-builtin-tools')
+type PiNanoBananaToolsModule = typeof import('../chat-tools/nano-banana-mcp')
 type BuiltinMcpSettingsModule = typeof import('../builtin-mcp/settings')
 
-let buildPiImageGenerationTools: PiBuiltinToolsModule['buildPiImageGenerationTools']
+let buildPiNanoBananaTools: PiNanoBananaToolsModule['buildPiNanoBananaTools']
 let isBuiltinMcpDefaultDisabled: BuiltinMcpSettingsModule['isBuiltinMcpDefaultDisabled']
 
 mock.module('electron', () => ({
@@ -31,12 +31,17 @@ mock.module('electron', () => ({
   },
 }))
 
+mock.module('../chat-tool-config', () => ({
+  getToolState: () => ({ enabled: true }),
+  getToolCredentials: () => ({ apiKey: 'test-key', provider: 'gemini' }),
+}))
+
 beforeAll(async () => {
   const [toolsModule, settingsModule] = await Promise.all([
-    import('./pi-builtin-tools'),
+    import('../chat-tools/nano-banana-mcp'),
     import('../builtin-mcp/settings'),
   ])
-  buildPiImageGenerationTools = toolsModule.buildPiImageGenerationTools
+  buildPiNanoBananaTools = toolsModule.buildPiNanoBananaTools
   isBuiltinMcpDefaultDisabled = settingsModule.isBuiltinMcpDefaultDisabled
 })
 
@@ -50,11 +55,10 @@ describe('Pi AI 生图工具桥接', () => {
       defineTool<T>(definition: T): T {
         return definition
       },
-    } as unknown as Parameters<typeof buildPiImageGenerationTools>[0]
+    } as unknown as Parameters<typeof buildPiNanoBananaTools>[0]
 
-    const tools: ToolDefinition[] = buildPiImageGenerationTools(sdk, {
+    const tools: ToolDefinition[] = buildPiNanoBananaTools(sdk, {
       sessionId: 'SESSION_ID',
-      channelId: 'CHANNEL_ID',
       agentCwd: 'C:/workspace/session',
     })
 

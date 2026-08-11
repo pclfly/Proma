@@ -2,7 +2,7 @@
  * ToolSettings - 工具设置页
  *
  * Chat 模式工具统一管理 tab。
- * 内嵌 MemorySettings（记忆工具）+ 联网搜索工具配置。
+ * 管理联网搜索与可选工具配置。
  */
 
 import * as React from 'react'
@@ -19,7 +19,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { MemorySettings } from './MemorySettings'
 import { SettingsSection, SettingsCard } from './primitives'
 import { chatToolsAtom } from '@/atoms/chat-tool-atoms'
 import { toolSettingsFocusAtom, type ToolSettingsFocus } from '@/atoms/settings-tab'
@@ -385,7 +384,7 @@ function ImageGenerationSettings(): React.ReactElement {
           {/* 引导说明 */}
           <div className="rounded-lg bg-muted/50 p-3 space-y-2 text-sm text-muted-foreground">
             <p>AI 生图支持 <span className="font-medium text-foreground">Gemini Image Generation</span> 和兼容 OpenAI Images generations 协议的服务。</p>
-            <p className="text-xs">Gemini 支持参考图编辑；OpenAI Images 提供方用于文生图。开启后，AI 会在生图任务中自动调用。</p>
+            <p className="text-xs">Gemini 与 OpenAI Images 提供方都支持参考图编辑；开启后，AI 会在生图任务中自动调用。</p>
           </div>
 
           <div className="space-y-1.5">
@@ -572,7 +571,6 @@ function CustomToolsSection(): React.ReactElement | null {
 
 export function ToolSettings(): React.ReactElement {
   const [focusedTool, setFocusedTool] = useAtom(toolSettingsFocusAtom)
-  const memoryRef = React.useRef<HTMLDivElement>(null)
   const webSearchRef = React.useRef<HTMLDivElement>(null)
   const nanoBananaRef = React.useRef<HTMLDivElement>(null)
   const customToolsRef = React.useRef<HTMLDivElement>(null)
@@ -580,7 +578,6 @@ export function ToolSettings(): React.ReactElement {
   React.useEffect(() => {
     if (!focusedTool) return
     const refs: Record<ToolSettingsFocus, React.RefObject<HTMLDivElement>> = {
-      memory: memoryRef,
       'web-search': webSearchRef,
       'nano-banana': nanoBananaRef,
       'custom-tools': customToolsRef,
@@ -606,11 +603,6 @@ export function ToolSettings(): React.ReactElement {
       {/* 自定义工具 */}
       <div ref={customToolsRef}>
         <CustomToolsSection />
-      </div>
-
-      {/* 记忆工具（复用现有 MemorySettings 组件，置于列表末尾） */}
-      <div ref={memoryRef}>
-        <MemorySettings />
       </div>
     </div>
   )

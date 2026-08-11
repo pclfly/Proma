@@ -2,15 +2,17 @@
  * Nano Banana MCP Server（Agent 模式）
  *
  * 基于 Gemini Image Generation API 的内置 MCP 服务器。
- * 通过 sdk.createSdkMcpServer() 创建，注入到每个 Agent 会话。
+ * 通过 Pi custom tool 注入到启用 Nano Banana 的 Agent 会话。
  * 支持文生图、多轮连续修改。凭据复用 chat-tools.json 配置。
  */
 
 import { randomUUID } from 'node:crypto'
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs'
-import { basename, extname, resolve, isAbsolute, join } from 'node:path'
+import { readFileSync, existsSync, writeFileSync, mkdirSync, realpathSync } from 'node:fs'
+import { basename, extname, resolve, isAbsolute, join, relative } from 'node:path'
 import { getToolState, getToolCredentials } from '../chat-tool-config'
-import { getBuiltinMcpName } from '../builtin-mcp/baseline'
+import { Type } from 'typebox'
+import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
+import type { AgentToolResult } from '@earendil-works/pi-agent-core'
 import { saveAttachment, isImageAttachment } from '../attachment-service'
 import {
   generateOpenAICompatibleImages,
@@ -85,16 +87,17 @@ interface McpToolResult {
   [key: string]: unknown
 }
 
-export interface AgentImageGenerationOptions {
+// ===== Gemini API 调用 =====
+
+interface AgentImageGenerationOptions {
   size?: string
   aspectRatio?: string
   imageSize?: string
   referenceImagePaths?: string[]
   cwd?: string
+  allowedRoots?: string[]
   numberOfImages?: number
 }
-
-// ===== Gemini API 调用 =====
 
 /** 已知图片扩展名 → MIME 类型映射 */
 const EXT_TO_MIME: Record<string, string> = {
@@ -112,15 +115,34 @@ const EXT_TO_MIME: Record<string, string> = {
  * 支持绝对路径和相对路径（相对于 cwd 解析）。
  * 跳过不存在、非图片、读取失败的文件。
  */
-function readReferenceImages(paths: string[], cwd?: string): GeminiPart[] {
+function resolveAuthorizedReferenceImagePath(
+  rawPath: string,
+  cwd?: string,
+  allowedRoots: string[] = [],
+): string | null {
+  const roots = [cwd, ...allowedRoots]
+    .filter((root): root is string => typeof root === 'string' && root.length > 0)
+    .map((root) => {
+      const resolved = resolve(root)
+      try { return realpathSync(resolved) } catch { return resolved }
+    })
+  const requestedPath = isAbsolute(rawPath) ? rawPath : resolve(cwd ?? process.cwd(), rawPath)
+  if (!existsSync(requestedPath)) return null
+  const filePath = realpathSync(requestedPath)
+  const authorized = roots.some((root) => {
+    const rel = relative(root, filePath)
+    return rel === '' || (!rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) && rel !== '..' && !isAbsolute(rel))
+  })
+  return authorized ? filePath : null
+}
+
+function readReferenceImages(paths: string[], cwd?: string, allowedRoots: string[] = []): GeminiPart[] {
   const parts: GeminiPart[] = []
   for (const rawPath of paths) {
     try {
-      // 相对路径 → 基于 cwd 解析为绝对路径
-      const filePath = isAbsolute(rawPath) ? rawPath : resolve(cwd ?? process.cwd(), rawPath)
-
-      if (!existsSync(filePath)) {
-        console.warn(`[Nano Banana MCP] 参考图不存在: ${filePath}`)
+      const filePath = resolveAuthorizedReferenceImagePath(rawPath, cwd, allowedRoots)
+      if (!filePath) {
+        console.warn(`[Nano Banana MCP] 拒绝读取不存在或授权目录外的参考图: ${rawPath}`)
         continue
       }
       const ext = extname(filePath).toLowerCase()
@@ -214,7 +236,7 @@ async function callGeminiAndBuildResult(
 
   // 读取参考图
   const referenceImageParts = options.referenceImagePaths?.length
-    ? readReferenceImages(options.referenceImagePaths, options.cwd)
+    ? readReferenceImages(options.referenceImagePaths, options.cwd, options.allowedRoots)
     : []
   if (referenceImageParts.length > 0) {
     console.log(`[Nano Banana MCP] 加载了 ${referenceImageParts.length} 张参考图`)
@@ -333,13 +355,17 @@ async function callGeminiAndBuildResult(
   return { content: mcpContent }
 }
 
-function readOpenAIReferenceImages(paths: string[], cwd?: string): OpenAIReferenceImage[] {
+function readOpenAIReferenceImages(
+  paths: string[],
+  cwd?: string,
+  allowedRoots: string[] = [],
+): OpenAIReferenceImage[] {
   const images: OpenAIReferenceImage[] = []
   for (const rawPath of paths.slice(0, 4)) {
     try {
-      const filePath = isAbsolute(rawPath) ? rawPath : resolve(cwd ?? process.cwd(), rawPath)
-      if (!existsSync(filePath)) {
-        console.warn(`[AI 生图] 参考图不存在: ${filePath}`)
+      const filePath = resolveAuthorizedReferenceImagePath(rawPath, cwd, allowedRoots)
+      if (!filePath) {
+        console.warn(`[AI 生图] 拒绝读取不存在或授权目录外的参考图: ${rawPath}`)
         continue
       }
       const mediaType = EXT_TO_MIME[extname(filePath).toLowerCase()]
@@ -347,11 +373,7 @@ function readOpenAIReferenceImages(paths: string[], cwd?: string): OpenAIReferen
         console.warn(`[AI 生图] 非图片参考文件，已跳过: ${filePath}`)
         continue
       }
-      images.push({
-        data: readFileSync(filePath),
-        mediaType,
-        filename: basename(filePath),
-      })
+      images.push({ data: readFileSync(filePath), mediaType, filename: basename(filePath) })
     } catch (error) {
       console.warn(`[AI 生图] 读取 OpenAI 参考图失败: ${rawPath}`, error)
     }
@@ -366,11 +388,8 @@ async function callOpenAIImagesAndBuildResult(
 ): Promise<McpToolResult> {
   const credentials = getToolCredentials('nano-banana')
   const referenceImages = options.referenceImagePaths?.length
-    ? readOpenAIReferenceImages(options.referenceImagePaths, options.cwd)
+    ? readOpenAIReferenceImages(options.referenceImagePaths, options.cwd, options.allowedRoots)
     : []
-  if (referenceImages.length > 0) {
-    console.log(`[AI 生图] 使用 ${referenceImages.length} 张参考图调用 Images edits 高保真模式`)
-  }
   const images = await generateOpenAICompatibleImages({
     apiKey: credentials.apiKey ?? '',
     endpoint: credentials.baseUrl,
@@ -383,9 +402,8 @@ async function callOpenAIImagesAndBuildResult(
     referenceImages,
   })
   const content: McpContent[] = []
-  const textParts: string[] = []
+  const attachmentMarkers: string[] = []
   const savedWorkspacePaths: string[] = []
-
   for (const image of images) {
     const filename = `generated-image-${randomUUID().slice(0, 8)}${getImageFileExtension(image.mediaType)}`
     const result = saveAttachment({
@@ -394,7 +412,6 @@ async function callOpenAIImagesAndBuildResult(
       mediaType: image.mediaType,
       data: image.base64,
     })
-
     if (options.cwd) {
       const imageDirectory = join(options.cwd, 'generated-images')
       mkdirSync(imageDirectory, { recursive: true })
@@ -402,100 +419,112 @@ async function callOpenAIImagesAndBuildResult(
       writeFileSync(workspacePath, Buffer.from(image.base64, 'base64'))
       savedWorkspacePaths.push(workspacePath)
     }
-
     content.push({ type: 'image', data: image.base64, mimeType: image.mediaType })
-    textParts.push(`[PROMA_IMAGE_ATTACHMENT:${JSON.stringify({
+    attachmentMarkers.push(`[PROMA_IMAGE_ATTACHMENT:${JSON.stringify({
       localPath: result.attachment.localPath,
       filename: result.attachment.filename,
       mediaType: result.attachment.mediaType,
     })}]`)
-    if (image.revisedPrompt) textParts.push(`优化后的提示词：${image.revisedPrompt}`)
+    if (image.revisedPrompt) attachmentMarkers.push(`优化后的提示词：${image.revisedPrompt}`)
   }
-
   const pathInfo = savedWorkspacePaths.length > 0
     ? `\n图片已保存到工作目录:\n${savedWorkspacePaths.map((path) => `- ${path}`).join('\n')}`
     : ''
   content.push({
     type: 'text',
-    text: `图片已生成（${images.length} 张）${pathInfo}\n${textParts.join('\n')}`,
+    text: `图片已生成（${images.length} 张）${pathInfo}\n${attachmentMarkers.join('\n')}`,
   })
   return { content }
 }
 
-/**
- * Agent 运行时共用的生图入口。
- * Claude MCP 与 Pi custom tool 必须复用此处，避免不同内核的能力漂移。
- */
 export async function executeAgentImageGeneration(
   prompt: string,
   sessionId: string,
   options: AgentImageGenerationOptions,
 ): Promise<McpToolResult> {
   const credentials = getToolCredentials('nano-banana')
-  if (resolveImageGenerationProvider(credentials) === 'openai-images') {
-    return callOpenAIImagesAndBuildResult(prompt, sessionId, options)
-  }
-  return callGeminiAndBuildResult(prompt, sessionId, options)
+  return resolveImageGenerationProvider(credentials) === 'openai-images'
+    ? callOpenAIImagesAndBuildResult(prompt, sessionId, options)
+    : callGeminiAndBuildResult(prompt, sessionId, options)
 }
 
-// ===== MCP Server 注入 =====
+// ===== Pi 工具注入 =====
+
+type PiSdk = typeof import('@earendil-works/pi-coding-agent')
+
+export interface PiNanoBananaToolsContext {
+  sessionId: string
+  agentCwd?: string
+  allowedRoots?: string[]
+}
+
+function toPiToolResult(result: McpToolResult): AgentToolResult<unknown> {
+  // 图片已在生成时保存为 Proma attachment，并在文本里携带渲染标记。Pi 的普通 tool
+  // result 保持文本形态即可：避免把 Gemini base64 图片重复写入 Pi transcript。
+  const text = result.content
+    .filter((item): item is McpTextContent => item.type === 'text')
+    .map((item) => item.text)
+    .join('\n')
+  return {
+    content: [{ type: 'text', text: text || '图片已生成。' }],
+    details: { generated: result.content.some((item) => item.type === 'image') },
+  } as AgentToolResult<unknown>
+}
 
 /**
- * 注入 Nano Banana MCP Server 到 Agent 会话
- *
- * 检查配置后创建 SDK MCP Server，由内置 MCP registry 统一注入。
+ * 构建 Pi custom tool。会话历史仍按 Proma sessionId 隔离，因此连续编辑与 Claude
+ * runtime 时代保持相同行为；参考图只从用户已授权的工作目录读取。
  */
-export async function injectNanoBananaMcpServer(
-  sdk: typeof import('@anthropic-ai/claude-agent-sdk'),
-  mcpServers: Record<string, Record<string, unknown>>,
-  sessionId: string,
-  agentCwd?: string,
-): Promise<void> {
-  // 检查工具是否启用且有凭据
+export function buildPiNanoBananaTools(
+  sdk: PiSdk,
+  ctx: PiNanoBananaToolsContext,
+): ToolDefinition[] {
   const toolState = getToolState('nano-banana')
   const credentials = getToolCredentials('nano-banana')
-  if (!toolState.enabled || !credentials.apiKey) return
+  if (!toolState.enabled || !credentials.apiKey) return []
 
-  const { z } = await import('zod')
-  const serverName = getBuiltinMcpName('nano-banana')
-
-  const server = sdk.createSdkMcpServer({
-    name: serverName,
-    version: '1.0.0',
-    tools: [
-      sdk.tool(
-        'generate_image',
-        'Generate finished raster images using the configured AI image provider. You MUST call this tool whenever the user asks to generate, draw, design, or create images; do not substitute Python, HTML, SVG, or a text-only prompt. Generate at most 4 images per call and call again for larger sets. When the user provides a product or style reference, always pass its file path through referenceImagePaths so the provider can use image editing with high input fidelity.',
-        {
-          prompt: z.string().describe('Detailed description of the image to generate or the edits to make. English descriptions work best.'),
-          referenceImagePaths: z.array(z.string()).optional().describe('File paths of reference images for editing. Can be absolute paths or relative paths (resolved from cwd). Extract from <attached_files> entries or @file:{path} mentions when the user wants to edit uploaded/referenced images.'),
-          aspectRatio: z.enum(['1:1', '16:9', '4:3', '9:16', '3:4']).optional().describe('Aspect ratio (default 1:1)'),
-          imageSize: z.enum(['auto', '1K', '2K', '4K']).optional().describe('Resolution (default auto)'),
-          size: z.enum(['auto', '1024x1024', '1536x1024', '1024x1536']).optional().describe('OpenAI Images compatible output size'),
-          numberOfImages: z.number().int().min(1).max(4).optional().describe('Number of images to generate (1-4, default 1)'),
-        },
-        async (args) => {
-          try {
-            return await executeAgentImageGeneration(args.prompt, sessionId, {
-              size: args.size,
-              aspectRatio: args.aspectRatio,
-              imageSize: args.imageSize,
-              referenceImagePaths: args.referenceImagePaths,
-              cwd: agentCwd,
-              numberOfImages: args.numberOfImages,
-            })
-          } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error)
-            console.error(`[Nano Banana MCP] 执行失败:`, error)
-            return { content: [{ type: 'text' as const, text: `图片生成失败: ${msg}` }] }
-          }
-        },
-      ),
-    ],
-  })
-
-  mcpServers[serverName] = server as unknown as Record<string, unknown>
-  console.log(`[Nano Banana MCP] 已注入内置生图工具 (${serverName})`)
+  return [sdk.defineTool({
+    name: 'generate_image',
+    label: 'AI 生图',
+    description: 'Generate finished raster images with Proma\'s configured image API. You MUST call this tool for image generation, product visuals, posters, illustrations, or image editing instead of substituting Python, HTML, SVG, or a text-only prompt. Generate at most 4 images per call. When visual consistency matters, pass the authoritative original image through referenceImagePaths.',
+    promptSnippet: 'generate_image: use this tool for finished visual assets; do not replace it with scripted graphics.',
+    parameters: Type.Object({
+      prompt: Type.String({ description: 'Detailed description of the image to generate or edit. English descriptions work best.' }),
+      referenceImagePaths: Type.Optional(Type.Array(Type.String({ description: 'Absolute or cwd-relative reference image path.' }))),
+      aspectRatio: Type.Optional(Type.Union([Type.Literal('1:1'), Type.Literal('16:9'), Type.Literal('4:3'), Type.Literal('9:16'), Type.Literal('3:4')])),
+      imageSize: Type.Optional(Type.Union([Type.Literal('auto'), Type.Literal('1K'), Type.Literal('2K'), Type.Literal('4K')])),
+      size: Type.Optional(Type.Union([
+        Type.Literal('auto'),
+        Type.Literal('1024x1024'),
+        Type.Literal('1536x1024'),
+        Type.Literal('1024x1536'),
+      ])),
+      numberOfImages: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
+    }),
+    async execute(_toolCallId, args) {
+      try {
+        const result = await executeAgentImageGeneration(String(args.prompt), ctx.sessionId, {
+          size: typeof args.size === 'string' ? args.size : undefined,
+          aspectRatio: typeof args.aspectRatio === 'string' ? args.aspectRatio : undefined,
+          imageSize: typeof args.imageSize === 'string' ? args.imageSize : undefined,
+          referenceImagePaths: Array.isArray(args.referenceImagePaths)
+            ? args.referenceImagePaths.filter((path): path is string => typeof path === 'string')
+            : undefined,
+          cwd: ctx.agentCwd,
+          allowedRoots: ctx.allowedRoots,
+          numberOfImages: typeof args.numberOfImages === 'number' ? args.numberOfImages : undefined,
+        })
+        return toPiToolResult(result)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        console.error('[Nano Banana Pi 工具] 执行失败:', error)
+        return {
+          content: [{ type: 'text', text: `图片生成失败: ${message}` }],
+          details: { generated: false },
+        } as AgentToolResult<unknown>
+      }
+    },
+  })]
 }
 
 // ===== 清理 =====
