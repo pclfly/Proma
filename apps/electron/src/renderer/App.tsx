@@ -4,7 +4,6 @@ import { AppShell } from './components/app-shell/AppShell'
 import { OnboardingView } from './components/onboarding/OnboardingView'
 import { TutorialBanner } from './components/tutorial/TutorialBanner'
 import { EnvironmentCheckDialog } from './components/environment/EnvironmentCheckDialog'
-import { MigrationImportDialog } from './components/migration/MigrationImportDialog'
 import { TooltipProvider } from './components/ui/tooltip'
 import { ShortcutGuideDialog } from './components/shortcuts/ShortcutGuideDialog'
 import { FaqDialog } from './components/shortcuts/FaqDialog'
@@ -109,7 +108,7 @@ export default function App(): React.ReactElement {
   // 显示 onboarding 界面
   if (showOnboarding) {
     return (
-      <TooltipProvider delayDuration={200}>
+      <TooltipProvider delayDuration={200} disableHoverableContent>
         <div className="relative h-screen w-screen overflow-hidden">
           {/* Onboarding 绕过 AppShell 时仍需提供隐藏标题栏窗口的拖拽区，并避开 Windows 控制按钮。 */}
           <div
@@ -124,7 +123,6 @@ export default function App(): React.ReactElement {
             initialStep={isReplayingOnboarding ? 'guide' : 'welcome'}
             onComplete={handleOnboardingComplete}
           />
-          <MigrationImportDialog />
         </div>
       </TooltipProvider>
     )
@@ -135,14 +133,13 @@ export default function App(): React.ReactElement {
 
   // 显示主界面
   return (
-    <TooltipProvider delayDuration={200}>
+    <TooltipProvider delayDuration={200} disableHoverableContent>
       <AppShell contextValue={contextValue} />
       <PlanningReminderRail />
       <ShortcutGuideDialog />
       <FaqDialog />
       <TutorialBanner />
       <GlobalEnvironmentCheckDialog />
-      <MigrationImportDialog />
     </TooltipProvider>
   )
 }
