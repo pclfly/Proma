@@ -1,18 +1,25 @@
 import { expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 
 const managerModulePath = join(import.meta.dir, 'planning-manager.ts')
 const repoRoot = dirname(dirname(dirname(dirname(dirname(import.meta.dir)))))
-const electronBinary = createRequire(import.meta.url)('electron') as string
+const electronRequire = createRequire(join(repoRoot, 'apps', 'electron', 'package.json'))
+const electronPackagePath = electronRequire.resolve('electron/package.json')
+const electronPackageDir = dirname(electronPackagePath)
+const electronExecutableName = readFileSync(join(electronPackageDir, 'path.txt'), 'utf8').trim()
+const electronBinary = join(electronPackageDir, 'dist', electronExecutableName)
+
+if (!existsSync(electronBinary)) throw new Error(`未找到 Electron 测试运行时：${electronBinary}`)
 
 /**
  * planning-manager 的数据库连接是模块级单例，而 node:sqlite 仅由 Electron 的 Node 22 提供。
  * 因此用 Bun 打包 TypeScript 验证脚本，再用独立 Electron Node 进程执行真实 SQLite 回归。
  */
+// 首次启动独立 Electron Node 进程会加载原生 SQLite；CI 或磁盘繁忙时可能超过默认 5 秒。
 test('Given a fresh planning database When planning data changes Then isolation, transactions, reminders and optimistic versions stay correct', async () => {
   const home = mkdtempSync(join(tmpdir(), 'proma-planning-'))
   const sourcePath = join(home, 'verify-planning-manager.ts')
@@ -126,4 +133,4 @@ test('Given a fresh planning database When planning data changes Then isolation,
   } finally {
     rmSync(home, { recursive: true, force: true })
   }
-})
+}, 20_000)
