@@ -30,6 +30,15 @@ function normalizeLineEndings(content: string): string {
   return content.replace(/\r\n/g, '\n')
 }
 
+/**
+ * 改动面板默认不展示隐藏目录内的文件，避免 .github/.vscode 等元数据淹没业务改动。
+ * 根目录的 dotfile（如 .gitignore、.env.example）仍然展示；只判断父目录。
+ */
+function shouldDisplayChangedFile(filePath: string): boolean {
+  const pathParts = filePath.split(/[\\/]/)
+  return pathParts.slice(0, -1).every((part) => !part.startsWith('.'))
+}
+
 function normalizeComparablePath(filePath: string): string {
   return normalizePathForCompare(resolve(filePath))
 }
@@ -549,6 +558,7 @@ async function scanGitRoot(gitRoot: string): Promise<CachedRepoScan | null> {
         continue
       }
 
+      if (!shouldDisplayChangedFile(filePath)) continue
       const stats = numStatMap.get(filePath) ?? { additions: 0, deletions: 0 }
       files.push({ filePath, status, additions: stats.additions, deletions: stats.deletions, gitRoot, baseline: 'git' })
     }
@@ -556,7 +566,7 @@ async function scanGitRoot(gitRoot: string): Promise<CachedRepoScan | null> {
 
   const untrackedFiles = await buildUntrackedFileEntries(
     gitRoot,
-    untrackedOutput ? untrackedOutput.split('\n').filter(Boolean) : [],
+    untrackedOutput ? untrackedOutput.split('\n').filter(Boolean).filter(shouldDisplayChangedFile) : [],
   )
 
   return { files, untrackedFiles }
@@ -1013,6 +1023,7 @@ export async function getWorktreeChanges(
         continue
       }
 
+      if (!shouldDisplayChangedFile(filePath)) continue
       const stats = committedStats.get(filePath) ?? { additions: 0, deletions: 0 }
       const entry: import('@proma/shared').ChangedFileEntry = {
         filePath,
@@ -1051,6 +1062,7 @@ export async function getWorktreeChanges(
         continue
       }
 
+      if (!shouldDisplayChangedFile(filePath)) continue
       const stats = uncommittedStats.get(filePath) ?? { additions: 0, deletions: 0 }
       const existing = fileMap.get(filePath)
       if (existing) {
@@ -1076,7 +1088,9 @@ export async function getWorktreeChanges(
   const untrackedOutput = await runGitCommand(['ls-files', '--others', '--exclude-standard'], gitRoot)
   const untrackedFiles = await buildUntrackedFileEntries(
     gitRoot,
-    untrackedOutput ? untrackedOutput.split('\n').filter((filePath) => !fileMap.has(filePath)) : [],
+    untrackedOutput
+      ? untrackedOutput.split('\n').filter((filePath) => !fileMap.has(filePath) && shouldDisplayChangedFile(filePath))
+      : [],
   )
 
   return {

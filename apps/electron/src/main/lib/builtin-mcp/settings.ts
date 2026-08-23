@@ -12,7 +12,8 @@ import { getSettings, updateSettings } from '../settings-service'
  * 默认关闭的内置 MCP ID。
  * 这些 MCP 默认不向 Agent 注入，需用户在能力列表中手动开启。
  */
-const DEFAULT_DISABLED_IDS = new Set<string>(['chrome-devtools'])
+// AI 生图 MCP 是 Proma 的内置能力，默认随 Agent 启用；用户仍可在能力列表中手动关闭。
+const DEFAULT_DISABLED_IDS = new Set<string>()
 
 /** 判断某个内置 MCP 是否默认关闭（需用户手动开启） */
 export function isBuiltinMcpDefaultDisabled(id: string): boolean {
