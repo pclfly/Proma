@@ -218,9 +218,13 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
   // 新模型输入
   const [newModelId, setNewModelId] = React.useState('')
   const [newModelName, setNewModelName] = React.useState('')
+  const [newModelContextWindow, setNewModelContextWindow] = React.useState('')
 
   // 模型搜索过滤
   const [modelFilter, setModelFilter] = React.useState('')
+
+  // 批量设置上下文（作用于已启用模型）
+  const [batchContextWindow, setBatchContextWindow] = React.useState('')
 
   // UI 状态
   const [saving, setSaving] = React.useState(false)
@@ -485,21 +489,77 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
   const handleAddModel = (): void => {
     if (!newModelId.trim()) return
 
+    const parsedContextWindow = parseContextWindowInput(newModelContextWindow)
     const model: ChannelModel = {
       id: newModelId.trim(),
       name: newModelName.trim() || newModelId.trim(),
       enabled: true,
       source: 'manual',
+      ...(parsedContextWindow != null && { contextWindow: parsedContextWindow }),
     }
 
     setModels((prev) => [...prev, model])
     setNewModelId('')
     setNewModelName('')
+    setNewModelContextWindow('')
   }
 
   /** 删除模型 */
   const handleRemoveModel = (modelId: string): void => {
     setModels((prev) => prev.filter((m) => m.id !== modelId))
+  }
+
+  /**
+   * 解析上下文大小输入：正整数有效；空/非数字返回 undefined（不设置）。
+   * 负数、0、非整数视为无效输入返回 undefined。
+   */
+  const parseContextWindowInput = (value: string): number | undefined => {
+    const trimmed = value.trim()
+    if (!trimmed) return undefined
+    const n = Number(trimmed)
+    if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return undefined
+    return n
+  }
+
+  /** 更新已启用模型的 contextWindow（输入框失焦/回车时写回，避免每次按键触发 auto-save） */
+  const handleContextWindowBlur = (modelId: string, value: string): void => {
+    const parsed = parseContextWindowInput(value)
+    setModels((prev) =>
+      prev.map((m) => {
+        if (m.id !== modelId) return m
+        const next = { ...m }
+        if (parsed != null) next.contextWindow = parsed
+        else delete next.contextWindow
+        return next
+      })
+    )
+  }
+
+  /** 批量将已启用模型全部设为同一上下文窗口（清空输入则恢复自动判断） */
+  const handleBatchApplyContextWindow = (): void => {
+    const parsed = parseContextWindowInput(batchContextWindow)
+    setModels((prev) =>
+      prev.map((m) => {
+        if (!m.enabled) return m
+        const next = { ...m }
+        if (parsed != null) next.contextWindow = parsed
+        else delete next.contextWindow
+        return next
+      })
+    )
+    setBatchContextWindow('')
+  }
+
+  /** 清除所有已启用模型的手动上下文设置，恢复 Pi 自动推断 */
+  const handleBatchClearContextWindow = (): void => {
+    setModels((prev) =>
+      prev.map((m) => {
+        if (!m.enabled || m.contextWindow == null) return m
+        const next = { ...m }
+        delete next.contextWindow
+        return next
+      })
+    )
   }
 
   /** 切换模型启用状态（点击可用模型 → 启用，点击已启用模型 → 禁用） */
@@ -676,7 +736,9 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
           // 与登录自动拉取路径（handleCodexLogin）保持一致，避免新模型（如 gpt-5.6 系列）
           // 默认未启用而沉到「可用模型」折叠区，被误认为"拉不到"。
           if (isSubscriptionProvider) return { ...m, enabled: true }
-          return old ? { ...m, enabled: old.enabled } : { ...m, enabled: false }
+          return old
+            ? { ...m, enabled: old.enabled, ...(old.contextWindow != null ? { contextWindow: old.contextWindow } : {}) }
+            : { ...m, enabled: false }
         })
         return [...manualKept, ...merged]
       })
@@ -1137,6 +1199,51 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         description={enabledModels.length > 0 ? `${enabledModels.length} 个模型` : undefined}
       >
         <SettingsCard divided={false}>
+          {/* 批量设置上下文工具条：作用于全部已启用模型，留空输入会恢复 Pi 自动判断 */}
+          {enabledModels.length > 0 && (
+            <div className="flex items-center gap-2 px-4 py-2.5 border-b border-border/50">
+              <span className="text-xs text-muted-foreground flex-shrink-0">
+                批量上下文
+              </span>
+              <Input
+                type="number"
+                min={1}
+                step={1000}
+                value={batchContextWindow}
+                onChange={(e) => setBatchContextWindow(e.target.value)}
+                placeholder="token 数，留空则自动判断"
+                title="为全部已启用模型统一设置上下文窗口；留空并点「应用」将清除设置并恢复 Pi 自动推断"
+                className="h-8 w-44 text-sm flex-shrink-0"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    handleBatchApplyContextWindow()
+                  }
+                }}
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                type="button"
+                onClick={handleBatchApplyContextWindow}
+                className="h-8 flex-shrink-0"
+                title="应用到全部已启用模型"
+              >
+                应用
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                type="button"
+                onClick={handleBatchClearContextWindow}
+                disabled={!enabledModels.some((m) => m.contextWindow != null)}
+                className="h-8 flex-shrink-0 text-muted-foreground hover:text-destructive"
+                title="清除全部已启用模型的手动上下文设置，恢复 Pi 自动推断"
+              >
+                清除全部
+              </Button>
+            </div>
+          )}
           {enabledModels.length === 0 ? (
             <div className="px-4 py-8 text-center text-sm text-muted-foreground">
               还没有启用任何模型，从下方可用模型中选择
@@ -1149,12 +1256,28 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
                   className="flex items-center gap-2 px-4 py-2.5 group"
                 >
                   <CheckCircle2 size={14} className="text-emerald-500 flex-shrink-0" />
-                  <span className="text-sm text-foreground flex-1">
+                  <span className="text-sm text-foreground flex-1 min-w-0">
                     {model.name}
                     {model.name !== model.id && (
                       <span className="text-muted-foreground ml-1">({model.id})</span>
                     )}
                   </span>
+                  <Input
+                    type="number"
+                    min={1}
+                    step={1000}
+                    defaultValue={model.contextWindow ?? ''}
+                    placeholder="上下文(tok)"
+                    title="上下文窗口大小（token），留空则自动推断"
+                    className="h-8 w-32 text-sm flex-shrink-0"
+                    onBlur={(e) => handleContextWindowBlur(model.id, e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault()
+                        ;(e.target as HTMLInputElement).blur()
+                      }
+                    }}
+                  />
                   <button
                     type="button"
                     onClick={() => handleToggleModel(model.id)}
@@ -1288,6 +1411,22 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
               onChange={(e) => setNewModelName(e.target.value)}
               placeholder="显示名称（可选）"
               className="flex-1 h-8 text-sm"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  handleAddModel()
+                }
+              }}
+            />
+            <Input
+              type="number"
+              min={1}
+              step={1000}
+              value={newModelContextWindow}
+              onChange={(e) => setNewModelContextWindow(e.target.value)}
+              placeholder="上下文(tok)"
+              title="上下文窗口大小（token，可选）；留空则自动推断"
+              className="w-28 h-8 text-sm flex-shrink-0"
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
                   e.preventDefault()

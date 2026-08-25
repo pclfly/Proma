@@ -609,8 +609,11 @@ async function resolvePiModelDefaults(input: PiAgentQueryOptions): Promise<PiMod
       : providerSpecificCapabilities?.compat,
     input: catalogModel ? [...catalogModel.input] : ['text', 'image'],
     cost: catalogModel ? { ...catalogModel.cost } : { ...ZERO_MODEL_COST },
-    // Codex 对齐策略优先；其他模型仍保留 catalog 与 shared inference 中更大的已验证能力。
-    contextWindow: codexAlignedCapabilities?.contextWindow ?? Math.max(catalogContextWindow, inferredContextWindow),
+    // 用户为单模型配置的上下文窗口优先；Codex 对齐策略次之；
+    // 其他模型仍保留 catalog 与 shared inference 中更大的已验证能力。
+    contextWindow: input.channelModelContextWindow
+      ?? codexAlignedCapabilities?.contextWindow
+      ?? Math.max(catalogContextWindow, inferredContextWindow),
     // Pi 的智谱目录将 GLM-5.2 标为 131072，但火山方舟兼容端点上限为 128000；GLM-5.3 同理。
     maxTokens: isVolcengineGlm5x
       ? VOLCENGINE_GLM_MAX_TOKENS

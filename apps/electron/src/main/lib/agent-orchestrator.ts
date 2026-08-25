@@ -1454,6 +1454,10 @@ export class AgentOrchestrator {
 
         startAutoTitleGeneration()
       }
+      /** 用户为当前模型配置的上下文窗口覆盖（token 数）；未配置时为 undefined，保持既有推断逻辑。 */
+      const channelModelContextWindow = channel.models.find((m) => m.id === selectedModelId)?.contextWindow
+      /** 按模型名推断的窗口，供展示层回退；用户显式配置时不参与覆盖。 */
+      const inferredWindow = inferContextWindow(modelId)
       const handleModelResolved = (model: string): void => {
         // `[1m]` 是 SDK 内部上下文变体，不应泄漏到标题生成或用户可见的模型名。
         resolvedModel = model.replace(/\[1m\]$/i, '')
@@ -1461,8 +1465,10 @@ export class AgentOrchestrator {
         this.eventBus.emit(sessionId, { kind: 'proma_event', event: { type: 'model_resolved', model: resolvedModel } })
       }
       const handleContextWindow = (cw: number): void => {
-        const inferredWindow = inferContextWindow(modelId)
-        const contextWindow = Math.max(cw, inferredWindow ?? 0) || cw
+        // 用户为当前模型配置了上下文窗口时，直接采用配置值（覆盖模型名推断），
+        // 否则保留「真实值与推断值取较大」的既有回退逻辑。
+        const contextWindow = channelModelContextWindow
+          ?? (Math.max(cw, inferredWindow ?? 0) || cw)
         console.log(`[Agent 编排] 缓存 contextWindow: ${contextWindow}`)
         // result 消息里的真实 contextWindow 透传到 renderer，
         // 覆盖流式过程中按模型名推断的 fallback 值（智谱等端点会把 [1m] 等后缀剥掉，导致 fallback 不准）
@@ -1485,6 +1491,7 @@ export class AgentOrchestrator {
         provider: channel.provider,
         channelId,
         channelName: channel.name,
+        ...(channelModelContextWindow != null && { channelModelContextWindow }),
         proxyUrl,
         runtimeEnv,
         ...(maxTurns != null && { maxTurns }),

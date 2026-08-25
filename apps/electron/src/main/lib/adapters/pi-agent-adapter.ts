@@ -164,6 +164,8 @@ export interface PiAgentQueryOptions extends AgentQueryInput {
   runtimeEnv?: AgentRuntimeEnv
   /** 手动压缩请求：走 pi 原生 session.compact()，而非把 /compact 当普通 prompt 发给模型 */
   compactRequest?: boolean
+  /** 渠道配置中用户为当前模型指定的上下文窗口覆盖（token 数）；缺失时按模型名/目录推断。 */
+  channelModelContextWindow?: number
   /** ChatGPT Codex Fast Mode；仅 openai-codex 的受支持模型实际注入 priority service tier。 */
   codexFastMode?: boolean
   /** Pi 的 OAuth credential store 使用真实 expires 和 refresh，不读取 ~/.pi。 */
