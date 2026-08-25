@@ -252,8 +252,10 @@ function payloadToLegacyEvents(payload: AgentStreamPayload): AgentEvent[] {
       case 'model_resolved':
         return [{ type: 'model_resolved', model: evt.model }]
       case 'context_window':
-        // main 进程从 SDK result 拿到的真实 contextWindow，转成 usage_update 让 atom 合并到 streamState
-        return [{ type: 'usage_update', usage: { contextWindow: evt.contextWindow } }]
+        // main 进程从 SDK result 拿到的真实 contextWindow（含用户配置覆盖）：
+        // 直接作为权威事件下发，让 reducer 覆盖流式按模型名推断的 fallback 值，
+        // 避免推断的偏大值（deepseek-v4 → 1M）顶掉用户设置的小窗口。
+        return [{ type: 'context_window', contextWindow: evt.contextWindow }]
       case 'permission_mode_changed':
         return [{ type: 'permission_mode_changed', mode: evt.mode }]
       case 'run_resumed':

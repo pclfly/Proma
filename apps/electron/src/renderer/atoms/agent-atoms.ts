@@ -916,7 +916,7 @@ export function applyAgentEvent(
           ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
           ...(event.usage.contextWindow != null && {
             contextWindow: prev.contextWindow != null
-              ? Math.max(prev.contextWindow, event.usage.contextWindow)
+              ? prev.contextWindow
               : event.usage.contextWindow,
           }),
           ...(shouldUseResultUsage && {
@@ -946,6 +946,11 @@ export function applyAgentEvent(
       // 同上：保留运行锁和 retry 状态，等待专用 retry 终态或 STREAM_COMPLETE 收束。
       return prev
 
+    case 'context_window':
+      // 后端从 SDK 透传的真实窗口/用户配置值：权威来源，直接覆盖流式 fallback，
+      // 避免按模型名推断的偏大值（如 deepseek-v4 → 1M）顶掉用户设置的较小窗口。
+      return { ...prev, contextWindow: event.contextWindow }
+
     case 'usage_update': {
       const resumed = clearFinishedCompactionForResumedWork(prev)
       return {
@@ -958,12 +963,12 @@ export function applyAgentEvent(
         ...(event.usage.cacheReadTokens != null && { cacheReadTokens: event.usage.cacheReadTokens }),
         ...(event.usage.cacheCreationTokens != null && { cacheCreationTokens: event.usage.cacheCreationTokens }),
         ...(event.usage.costUsd != null && { costUsd: event.usage.costUsd }),
-        // contextWindow 取 max：本分支同时承载「流式 assistant 消息按模型名推断的窗口」
-        // 与「后端从 SDK result 透传的真实窗口（context_window 事件）」两个来源。
-        // 模型窗口在同一会话内不会缩小，取更大值可兼顾两类端点——既不会让推断偏小的
-        // 端点（如 GLM 剥掉 [1m] 后缀）挡住真实的 1M，也不会让回报偏小的端点覆盖正确的 1M。
-        ...(event.usage.contextWindow && {
-          contextWindow: Math.max(resumed.contextWindow ?? 0, event.usage.contextWindow),
+        // contextWindow：已有值时保留（含用户配置或权威值），仅在从未有时才用流式 fallback 兜底。
+        // 之前用 Math.max 会把按模型名推断的偏大值（deepseek-v4 → 1M）顶掉用户配置的小窗口。
+        ...(event.usage.contextWindow != null && {
+          contextWindow: resumed.contextWindow != null
+            ? resumed.contextWindow
+            : event.usage.contextWindow,
         }),
       }
     }

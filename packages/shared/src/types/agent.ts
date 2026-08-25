@@ -609,6 +609,8 @@ export type AgentEvent =
   | { type: 'prompt_suggestion'; suggestion: string }
   // 模型确认（SDK 确认实际使用的模型）
   | { type: 'model_resolved'; model: string }
+  // 上下文窗口（SDK result 透传的真实窗口，含用户配置覆盖）
+  | { type: 'context_window'; contextWindow: number }
   // 权限模式变更（Plan → bypassPermissions 等）
   | { type: 'permission_mode_changed'; mode: PromaPermissionMode }
 

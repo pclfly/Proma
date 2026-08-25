@@ -385,3 +385,39 @@ describe('Agent 输入流状态订阅隔离', () => {
     unsubscribe()
   })
 })
+
+describe('Agent 上下文窗口稳定性', () => {
+  test('given 用户配置小窗口 when 流式 usage_update 注入按模型名推断的更大窗口 then 保留已有窗口不被顶大', () => {
+    const initial = createStreamState({ contextWindow: 120_000 })
+    const result = applyAgentEvent(initial, {
+      type: 'usage_update',
+      usage: {
+        inputTokens: 54_000,
+        outputTokens: 807,
+        contextWindow: 1_000_000,
+      },
+    })
+
+    expect(result.contextWindow).toBe(120_000)
+  })
+
+  test('given 后端 context_window 权威事件 when 已有推断窗口 then 直接覆盖为用户配置值', () => {
+    const initial = createStreamState({ contextWindow: 1_000_000 })
+    const result = applyAgentEvent(initial, {
+      type: 'context_window',
+      contextWindow: 120_000,
+    })
+
+    expect(result.contextWindow).toBe(120_000)
+  })
+
+  test('given 从未有窗口 when 流式 usage_update 带 contextWindow then 用它兜底写入', () => {
+    const initial = createStreamState({ contextWindow: undefined })
+    const result = applyAgentEvent(initial, {
+      type: 'usage_update',
+      usage: { inputTokens: 54_000, contextWindow: 200_000 },
+    })
+
+    expect(result.contextWindow).toBe(200_000)
+  })
+})
