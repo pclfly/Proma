@@ -231,8 +231,12 @@ function createUserSDKMessage(text: string, uuid?: string, createdAt = Date.now(
 function resolveRunContextWindow(
   modelId: string | undefined,
   previous: number | undefined,
+  channel?: import('@proma/shared').Channel,
 ): number | undefined {
-  return inferContextWindow(modelId) ?? previous
+  // 用户为当前模型手动配置了上下文窗口时，优先采用；
+  // 否则回退到按模型名推断，最后才是历史值。
+  const channelContextWindow = channel?.models.find((m) => m.id === modelId)?.contextWindow
+  return channelContextWindow ?? inferContextWindow(modelId) ?? previous
 }
 
 interface SDKMessageRecord {
@@ -1210,7 +1214,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
           model: snapshot.modelId,
           startedAt: streamStartedAt,
           inputTokens: existing?.inputTokens,
-          contextWindow: resolveRunContextWindow(snapshot.modelId, existing?.contextWindow),
+          contextWindow: resolveRunContextWindow(snapshot.modelId, existing?.contextWindow, stableChannel),
         })
         return map
       })
@@ -2199,7 +2203,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         model: agentModelId || undefined,
         startedAt: streamStartedAt,
         inputTokens: existing?.inputTokens,
-        contextWindow: resolveRunContextWindow(agentModelId || undefined, existing?.contextWindow),
+        contextWindow: resolveRunContextWindow(agentModelId || undefined, existing?.contextWindow, stableChannel),
       })
       return map
     })
@@ -2431,7 +2435,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
         model: agentModelId || undefined,
         startedAt: streamStartedAt,
         inputTokens: existing?.inputTokens,
-        contextWindow: resolveRunContextWindow(agentModelId || undefined, existing?.contextWindow),
+        contextWindow: resolveRunContextWindow(agentModelId || undefined, existing?.contextWindow, stableChannel),
       })
       return map
     })
