@@ -1266,6 +1266,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
                     type="number"
                     min={1}
                     step={1000}
+                    key={`${model.id}:${model.contextWindow ?? ''}`}
                     defaultValue={model.contextWindow ?? ''}
                     placeholder="上下文(tok)"
                     title="上下文窗口大小（token），留空则自动推断"
