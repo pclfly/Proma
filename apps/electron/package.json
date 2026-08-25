@@ -1,6 +1,6 @@
 {
   "name": "@proma/electron",
-  "version": "0.17.60",
+  "version": "0.17.64",
   "description": "Proma next gen ai software with general agents - Electron App",
   "main": "dist/main.cjs",
   "author": {
@@ -14,7 +14,7 @@
     "dev:split": "bash scripts/dev-split.sh",
     "dev:vite": "vite dev",
     "dev:kill": "bun run scripts/dev-kill.ts",
-    "dev:electron": "bun run dev:kill && bun run build:main && bun run build:agent-runtime && bun run build:preload && bun run build:native-helpers && bun run build:resources && bun run scripts/sleep.ts 2 && concurrently -k -n main,utility,preload,app -c yellow,red,magenta,cyan \"bun run watch:main\" \"bun run watch:agent-runtime\" \"bun run watch:preload\" \"bunx electronmon .\"",
+    "dev:electron": "bun run dev:kill && bun run build:native-helpers && bun run build:resources && bun run scripts/dev-bundle-readiness.ts --prepare && concurrently -k -n main,utility,preload,app -c yellow,red,magenta,cyan \"bun run watch:main\" \"bun run watch:agent-runtime\" \"bun run watch:preload\" \"bun run scripts/dev-bundle-readiness.ts --wait && bunx electronmon .\"",
     "build:main": "esbuild src/main/index.ts --bundle --platform=node --format=cjs --outfile=dist/main.cjs --external:electron --external:@earendil-works/pi-coding-agent --external:@earendil-works/pi-agent-core --external:@earendil-works/pi-ai --external:sharp",
     "build:agent-runtime": "esbuild src/utility/agent-runtime.ts --bundle --platform=node --format=cjs --outfile=dist/agent-runtime.cjs --external:electron --external:@earendil-works/pi-coding-agent --external:@earendil-works/pi-agent-core --external:@earendil-works/pi-ai --external:sharp",
     "build:preload": "esbuild src/preload/index.ts --bundle --platform=node --format=cjs --outfile=dist/preload.cjs --external:electron",
@@ -37,11 +37,11 @@
     "dist": "bun run build && bun run sync:runtime-deps && electron-builder",
     "dist:mac": "bun run build && bun run sync:runtime-deps && electron-builder --mac",
     "dist:win": "bun run build && bun run sync:runtime-deps && bun node_modules/electron/install.js && node ../../node_modules/electron-builder/cli.js --win",
-    "package:win:checked": "bun run scripts/package-windows.ts",
     "dist:linux": "bun run build && bun run sync:runtime-deps && electron-builder --linux",
     "dist:visual": "bun run scripts/dist.ts",
     "dist:fast": "bun run scripts/dist.ts --current-arch --dmg",
-    "dist:debug": "bun run scripts/dist.ts --current-arch --verbose"
+    "dist:debug": "bun run scripts/dist.ts --current-arch --verbose",
+    "package:win:checked": "bun run scripts/package-windows.ts"
   },
   "dependencies": {
     "@earendil-works/pi-agent-core": "0.84.2",
@@ -52,13 +52,13 @@
     "@pierre/diffs": "^1.1.20",
     "@xmldom/xmldom": "^0.8.11",
     "adm-zip": "^0.5.17",
-    "diff": "8.0.4",
     "dompurify": "^3.4.5",
     "iconv-lite": "^0.6.3",
     "mammoth": "^1.12.0",
     "pdfjs-dist": "^4.10.38",
     "sharp": "^0.35.3",
-    "typebox": "1.1.38"
+    "typebox": "1.1.38",
+    "diff": "8.0.4"
   },
   "devDependencies": {
     "@emoji-mart/data": "^1.2.1",
@@ -159,6 +159,7 @@
   },
   "electronmon": {
     "patterns": [
+      "!**/*",
       "dist/main.cjs",
       "dist/preload.cjs"
     ],
