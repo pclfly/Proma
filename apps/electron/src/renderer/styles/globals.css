@@ -581,7 +581,9 @@
   -webkit-app-region: no-drag;
   app-region: no-drag;
   height: 28px;
-  gap: 1px;
+  /* 按钮之间留出明确间距，避免视觉上挤在一起像重叠。
+     之前 gap: 1px 太近，用户反馈「侧边栏收缩后三个按钮看起来重叠」。 */
+  gap: 4px;
 }
 
 .window-control-btn {

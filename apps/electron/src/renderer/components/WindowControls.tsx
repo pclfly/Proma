@@ -34,8 +34,10 @@ export function WindowControls(): React.ReactElement | null {
 
   return (
     <div className={cn(
-      "window-controls fixed z-[100] flex select-none",
-      isClassic ? "right-[16px] top-[12px]" : "right-[8px] top-[5px]"
+      // z-[120] 高于 TabBar 顶栏 z-10/20 与全局 drag-region z-50，
+      // 并高于 RightSidePanel/LeftSidebar 容器的 z-[60]，确保关闭按钮永远在最上层。
+      "window-controls fixed z-[120] flex select-none",
+      isClassic ? "right-[16px] top-[12px]" : "right-[10px] top-[6px]"
     )}>
       {/* 最小化 */}
       <button

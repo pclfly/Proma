@@ -195,13 +195,15 @@ export function AppShell(): React.ReactElement {
   return (
     <>
       {/* 可拖动标题栏区域，用于窗口拖动。
-          Windows 上必须避开右上角的 WindowControls 区域（buttons ~118px + 8px buffer = 126px），
-          否则 drag-region 与按钮区的 hitmask 重叠会让 OS 把单击当成标题栏点击，
-          表现为"按钮要双击才响应"。 */}
+          Windows 上必须避开右上角的 WindowControls 区域（buttons ~116px + 10px right + 8px buffer = 134px），
+          以及 TabBar/ChatHeader/AgentHeader 右侧的快捷键按钮（FAQ + Globe）与打开右面板的 PanelRight 按钮。
+          之前只避让 126px，会让 PanelRight 等「ml-auto」类按钮在侧边栏收缩后被推到最右，
+          透出在 WindowControls 关闭按钮下面或与之像素重叠，表现为「侧边栏收缩后与关闭按钮重叠」。
+          现在扩展为 right-[244px] 以同时避开右侧全部操作区。 */}
       <div
         className={cn(
           'titlebar-drag-region fixed top-0 left-0 h-[50px] z-50',
-          isWindows ? WINDOW_CONTROLS_INSET_RIGHT : 'right-0'
+          isWindows ? 'right-[244px]' : 'right-0'
         )}
       />
 

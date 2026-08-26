@@ -5,7 +5,13 @@ export interface TabBarActionLayout {
 }
 
 /**
- * 保持 Tab 栏右侧操作区与窗口控制按钮分离，同时为标签滚动区留出空间。
+ * Tab 栏右侧所有 absolute 定位元素需与 WindowControls 保持明确间距，
+ * 并提供 scroll padding 让 Tab 滚动区知道右侧预留宽度。
+ *
+ * Windows 上 WindowControls 总宽 = 36×3 + 4×2(gap) = 116px，
+ * 容器位于 right-[10px]，所以最左按钮位于 right ≈ 10 + 116 = 126px。
+ * panel button 位于 right-[140px]（与关闭按钮之间留 14px buffer）。
+ * shortcut 按钮位于 right-[180px]（panel button 28px + 12px gap）。
  */
 export function getTabBarActionLayout(isWindows: boolean, hasPanelButton: boolean, hasBrowserButton = false): TabBarActionLayout {
   if (!isWindows) {
@@ -21,13 +27,14 @@ export function getTabBarActionLayout(isWindows: boolean, hasPanelButton: boolea
   }
 
   return {
-    // 126px WindowControls + 60px 快捷操作区；文件面板按钮额外占用 28px 与 4px 间隔。
+    // WindowControls 116px (right-[10px] 起) + 24px buffer + 28px panel button + 12px gap = 180px。
+    // 加上快捷操作区 2×28 + 4px gap = 60px。
     scrollPaddingClassName: hasPanelButton
-      ? (hasBrowserButton ? 'pr-[246px]' : 'pr-[218px]')
-      : (hasBrowserButton ? 'pr-[218px]' : 'pr-[190px]'),
+      ? (hasBrowserButton ? 'pr-[268px]' : 'pr-[240px]')
+      : (hasBrowserButton ? 'pr-[240px]' : 'pr-[212px]'),
     shortcutPositionClassName: hasPanelButton
-      ? 'inset-y-0 items-end pb-[3px] z-10 right-[158px]'
-      : 'inset-y-0 items-end pb-[3px] z-10 right-[130px]',
-    panelPositionClassName: 'inset-y-0 right-[126px] items-end pb-[3px] z-10',
+      ? 'inset-y-0 items-end pb-[3px] z-10 right-[180px]'
+      : 'inset-y-0 items-end pb-[3px] z-10 right-[152px]',
+    panelPositionClassName: 'inset-y-0 right-[140px] items-end pb-[3px] z-10',
   }
 }

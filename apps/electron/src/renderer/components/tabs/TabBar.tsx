@@ -414,9 +414,15 @@ function TabBarInner({
     <div ref={barRef} className="main-tabbar flex items-end h-[34px] tabbar-bg relative">
       {/* 顶部 TabBar 的空白区域必须保持可拖拽，尤其是 macOS/Windows 自定义标题栏。
           注意：不要把 titlebar-no-drag 加到下面的整条 flex 容器上，否则标签右侧空白会再次失去拖拽能力。
-          Windows 上背景拖拽层避开右上角 WindowControls 区域（126px），防止 hitmask 重叠。
+          Windows 上背景拖拽层需同时避开 WindowControls 区域与 TabBar 右侧的操作按钮
+          （打开右面板 PanelRight + 快捷键 FAQ/Globe 按钮），防止 hitmask 重叠导致按钮无响应。
           需要交互的单个 Tab 会在 TabBarItem 内部自己声明 titlebar-no-drag。 */}
-      <div className={cn("absolute inset-0 titlebar-drag-region", isWindows && WINDOW_CONTROLS_INSET_RIGHT)} />
+      <div
+        className={cn(
+          "absolute inset-0 titlebar-drag-region",
+          isWindows && (showOpenPanelButton ? 'right-[244px]' : WINDOW_CONTROLS_INSET_RIGHT),
+        )}
+      />
 
       {/* Tear-off 提示遮罩：拖出 TabBar 区域时，让 TabBar 下方出现一条高亮分割线 */}
       {tearingOff && (

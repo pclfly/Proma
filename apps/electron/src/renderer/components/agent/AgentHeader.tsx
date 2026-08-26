@@ -130,7 +130,12 @@ export function AgentHeader({ sessionId }: AgentHeaderProps): React.ReactElement
         <button
           type="button"
           onClick={() => setRightPanelOpen(true)}
-          className="titlebar-no-drag ml-auto inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-[background-color,color,transform] hover:bg-muted hover:text-foreground active:scale-[0.96]"
+          className={cn(
+            "titlebar-no-drag ml-auto inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-[background-color,color,transform] hover:bg-muted hover:text-foreground active:scale-[0.96]",
+            // Windows 上避开右上角 WindowControls（126px + 8px buffer = 134px），
+            // 避免侧边栏收缩后 ml-auto 把按钮推到最右与关闭按钮重叠。
+            isWindows && 'mr-[134px]',
+          )}
           aria-label="展开右侧工作区"
         >
           <PanelRight className="size-4" />
