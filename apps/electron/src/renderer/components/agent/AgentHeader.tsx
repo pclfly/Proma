@@ -17,6 +17,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 
 /** AgentHeader 属性接口 */
 interface AgentHeaderProps {
@@ -178,14 +179,19 @@ export function AgentHeader({ sessionId }: AgentHeaderProps): React.ReactElement
         </DropdownMenu>
       )}
       {!isRightPanelOpen && (
-        <button
-          type="button"
-          onClick={() => setRightPanelOpen(true)}
-          className="titlebar-no-drag ml-auto inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-[background-color,color,transform] hover:bg-muted hover:text-foreground active:scale-[0.96]"
-          aria-label="展开右侧工作区"
-        >
-          <PanelRight className="size-4" />
-        </button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              onClick={() => setRightPanelOpen(true)}
+              className="titlebar-no-drag ml-auto inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-[background-color,color,transform] hover:bg-muted hover:text-foreground active:scale-[0.96]"
+              aria-label="展开右侧工作区"
+            >
+              <PanelRight className="size-4" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom">展开右侧工作区 ({navigator.platform.includes('Mac') ? '⌘⇧B' : 'Ctrl+Shift+B'})</TooltipContent>
+        </Tooltip>
       )}
     </div>
   )
