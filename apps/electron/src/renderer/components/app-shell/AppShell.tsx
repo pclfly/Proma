@@ -23,8 +23,6 @@ import { interfaceVariantAtom } from '@/atoms/theme'
 import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { WindowControls } from '@/components/WindowControls'
 import { SettingsPanel } from '@/components/settings/SettingsPanel'
-import { PanelRight } from 'lucide-react'
-import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { detectIsWindows } from '@/lib/platform'
 import { getWindowTitlebarContentInsetClass } from '@/lib/window-titlebar-layout'
 import { cn } from '@/lib/utils'
@@ -100,7 +98,6 @@ export function AppShell(): React.ReactElement {
   const currentSessionId = useAtomValue(currentAgentSessionIdAtom)
   const activeRightPanelTab = useAtomValue(agentDiffPanelTabAtom).get(currentSessionId ?? '')
   const isPanelOpen = useAtomValue(currentSessionSidePanelOpenAtom)
-  const setSidePanelOpen = useSetAtom(currentSessionSidePanelOpenAtom)
   const automationForm = useAtomValue(automationFormAtom)
   const interfaceVariant = useAtomValue(interfaceVariantAtom)
   const settingsOpen = useAtomValue(settingsOpenAtom)
@@ -288,7 +285,6 @@ export function AppShell(): React.ReactElement {
 
   return (
     <>
-
       <WindowControls />
 
       <div className="shell-bg relative h-screen w-screen overflow-hidden bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-950 dark:to-zinc-900">
@@ -331,24 +327,6 @@ export function AppShell(): React.ReactElement {
               >
                 {!isClassic && (
                   <div aria-hidden="true" className="pointer-events-none absolute left-0 top-0 bottom-0 z-10 w-px bg-border/80 dark:bg-border/70" />
-                )}
-                {/* 收起态：在右面板顶栏同一位置保留「展开右侧工作区」按钮，
-                    与展开态 DiffPanelTabBar 顶栏的「折叠右侧工作区」按钮同坐标，
-                    避免收起后按钮跳到主内容区顶部（AgentHeader）而位置跳变。 */}
-                {!isPanelOpen && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        onClick={() => setSidePanelOpen(true)}
-                        className="absolute right-[8px] top-[40px] z-[65] inline-flex size-7 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-[background-color,color,transform] hover:bg-muted hover:text-foreground active:scale-[0.96] titlebar-no-drag"
-                        aria-label="展开右侧工作区"
-                      >
-                        <PanelRight className="size-4" />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent side="bottom">展开右侧工作区 ({navigator.platform.includes('Mac') ? '⌘⇧B' : 'Ctrl+Shift+B'})</TooltipContent>
-                  </Tooltip>
                 )}
                 {/* 拖拽手柄 */}
                 {isPanelOpen && (
