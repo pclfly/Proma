@@ -563,6 +563,12 @@ export interface ElectronAPI {
   /** 查询 Pi catalog 或专属 profile 支持的会话级推理档位 */
   getPiReasoningCapability: (channelId: string, modelId: string) => Promise<import('@proma/shared').ReasoningCapability | undefined>
 
+  /** 获取推理能力配置（内置默认 + 用户覆盖合并后的完整 profile 列表） */
+  getReasoningProfiles: () => Promise<import('@proma/shared').ReasoningProfileConfigData[]>
+
+  /** 更新推理能力配置（保存用户 profile 到磁盘并重新注入） */
+  updateReasoningProfiles: (profiles: import('@proma/shared').ReasoningProfileConfigData[]) => Promise<import('@proma/shared').ReasoningProfileConfigData[]>
+
   /** 更新当前会话的推理深度 */
   updateSessionReasoningLevel: (sessionId: string, thinkingLevel: AgentThinkingLevel) => Promise<AgentSessionMeta>
 
@@ -1802,6 +1808,14 @@ const electronAPI: ElectronAPI = {
 
   getPiReasoningCapability: (channelId: string, modelId: string) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.GET_PI_REASONING_CAPABILITY, channelId, modelId)
+  },
+
+  getReasoningProfiles: () => {
+    return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.GET_REASONING_PROFILES)
+  },
+
+  updateReasoningProfiles: (profiles) => {
+    return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.UPDATE_REASONING_PROFILES, profiles)
   },
 
   updateSessionReasoningLevel: (sessionId: string, thinkingLevel: AgentThinkingLevel) => {

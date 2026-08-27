@@ -18,6 +18,7 @@ import { onboardingReplayRequestedAtom } from './atoms/onboarding'
 import { settingsOpenAtom, settingsTabAtom } from './atoms/settings-tab'
 import { tabsAtom, activeTabIdAtom, openTab, TUTORIAL_TAB_ID } from './atoms/tab-atoms'
 import { hasCompletedCurrentOnboarding } from '../types'
+import { setReasoningProfileConfig } from '@proma/shared'
 import hopperSeasideWhiteHouse from './assets/onboarding/hopper-seaside-white-house.png'
 import promaMarkWhite from './assets/onboarding/proma-mark-white.svg'
 
@@ -40,6 +41,13 @@ export default function App(): React.ReactElement {
         const settings = await window.electronAPI.getSettings()
         if (!hasCompletedCurrentOnboarding(settings)) {
           setShowOnboarding(true)
+        }
+        // 注入用户自定义推理能力配置（供渲染进程 resolveReasoningProfile 使用）
+        try {
+          const rp = await window.electronAPI.getReasoningProfiles()
+          setReasoningProfileConfig(rp)
+        } catch (e) {
+          console.warn('[App] 加载推理能力配置失败:', e)
         }
       } catch (error) {
         console.error('[App] 初始化失败:', error)

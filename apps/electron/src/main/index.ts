@@ -52,6 +52,7 @@ function registerProtocolsAndHandlers(): void {
 
 
 import { getSettings, updateSettings } from './lib/settings-service'
+import { syncReasoningProfileConfig } from './lib/reasoning-profiles-config'
 import { handlePromaFileRequest } from './lib/local-file-protocol'
 
 // 处理 EPIPE 错误：当 stdout/stderr 管道被关闭时（如 electronmon 重启），忽略写入错误
@@ -705,6 +706,9 @@ async function bootstrap(): Promise<void> {
 
   // Register IPC handlers
   registerIpcHandlers()
+
+  // 注入用户自定义推理能力配置（供主进程 resolveReasoningProfile 使用）
+  safeRun('syncReasoningProfileConfig', syncReasoningProfileConfig)
 
   // 收敛上次退出时遗留的运行中委派子会话（内存态丢失，无法续跑）
   safeRun('markRunningDelegationsAsInterrupted', markRunningDelegationsAsInterrupted)

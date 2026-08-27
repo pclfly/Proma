@@ -488,6 +488,10 @@ export const CHANNEL_IPC_CHANNELS = {
   TEST_DIRECT: 'channel:test-direct',
   /** 查询订阅 Plan 额度 */
   GET_PLAN_QUOTA: 'channel:get-plan-quota',
+  /** 获取推理能力配置（levels/thinkingLevelMap/reasoning/匹配规则） */
+  GET_REASONING_PROFILES: 'channel:get-reasoning-profiles',
+  /** 更新推理能力配置 */
+  UPDATE_REASONING_PROFILES: 'channel:update-reasoning-profiles',
   /** 发起 ChatGPT (Codex) OAuth 登录，返回加密凭据与账号信息 */
   CODEX_OAUTH_LOGIN: 'channel:codex-oauth-login',
   /** 取消进行中的 ChatGPT OAuth 登录流程 */

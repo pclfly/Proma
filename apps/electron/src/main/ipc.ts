@@ -204,6 +204,7 @@ import { extractTextFromAttachment } from './lib/document-parser'
 import { getTutorialContent, createWelcomeConversation } from './lib/tutorial-service'
 import { getUserProfile, updateUserProfile } from './lib/user-profile-service'
 import { getSettings, updateSettings } from './lib/settings-service'
+import { getMergedReasoningProfiles, updateReasoningProfiles } from './lib/reasoning-profiles-config'
 import { refreshAgentIslandConfiguration, markAgentIslandSessionViewed } from './lib/agent-island-service'
 import { getAgentStatusHoverWindow } from './agent-status-hover-window'
 import { setBuiltinMcpUserEnabled } from './lib/builtin-mcp/settings'
@@ -1404,6 +1405,25 @@ export function registerIpcHandlers(): void {
     CHANNEL_IPC_CHANNELS.GET_PLAN_QUOTA,
     async (_, channelId: string): Promise<import('@proma/shared').ChannelPlanQuotaResult> => {
       return getChannelPlanQuota(channelId)
+    }
+  )
+
+  // 获取推理能力配置（合并内置默认 + 用户覆盖后的完整 profile 列表）
+  ipcMain.handle(
+    CHANNEL_IPC_CHANNELS.GET_REASONING_PROFILES,
+    async (): Promise<import('@proma/shared').ReasoningProfileConfigData[]> => {
+      return getMergedReasoningProfiles()
+    }
+  )
+
+  // 更新推理能力配置（保存用户 profile 并重新注入 shared）
+  ipcMain.handle(
+    CHANNEL_IPC_CHANNELS.UPDATE_REASONING_PROFILES,
+    async (
+      _,
+      profiles: import('@proma/shared').ReasoningProfileConfigData[],
+    ): Promise<import('@proma/shared').ReasoningProfileConfigData[]> => {
+      return updateReasoningProfiles(profiles)
     }
   )
 

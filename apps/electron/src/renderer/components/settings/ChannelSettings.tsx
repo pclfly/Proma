@@ -26,6 +26,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { ChannelForm } from './ChannelForm'
+import { ReasoningProfileSettings } from './ReasoningProfileSettings'
 
 /** 组件视图模式 */
 type ViewMode = 'list' | 'create' | 'edit'
@@ -169,6 +170,9 @@ export function ChannelSettings(): React.ReactElement {
           </SettingsCard>
         )}
       </SettingsSection>
+
+      {/* 区块二：推理能力配置（levels / thinkingLevelMap / reasoning / 匹配规则） */}
+      <ReasoningProfileSettings />
 
       {/* 删除确认弹窗 */}
       <AlertDialog open={deleteTarget !== null} onOpenChange={(open) => { if (!open) setDeleteTarget(null) }}>

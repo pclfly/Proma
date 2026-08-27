@@ -159,6 +159,15 @@ export function getSettingsPath(): string {
 }
 
 /**
+ * 获取推理能力配置文件路径
+ *
+ * @returns ~/.proma/reasoning-profiles.json
+ */
+export function getReasoningProfilesPath(): string {
+  return join(getConfigDir(), 'reasoning-profiles.json')
+}
+
+/**
  * 获取系统默认 App 探测缓存路径
  *
  * @returns ~/.proma/default-apps.json
