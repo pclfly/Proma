@@ -1416,6 +1416,7 @@ export class AgentOrchestrator {
         projectKnowledgeMaintenanceApproved,
         memoryGuidance,
         memoryRefreshOpportunity,
+        personalDirective: appSettings.personalDirective,
       }) + (automationContext ? `\n\n## 定时任务执行上下文\n\n${automationContext}` : '')
       const startAutoTitleGeneration = (): void => {
         if (titleGenerationStarted) return

@@ -153,6 +153,7 @@ import type {
 import type {
   UserProfile,
   AppSettings,
+  PersonalDirectiveFileCheck,
   QuickTaskSubmitInput,
   QuickTaskOpenSessionData,
   VoiceDictationAudioChunkInput,
@@ -413,6 +414,9 @@ export interface ElectronAPI {
 
   /** 同步更新应用设置（用于 beforeunload 场景） */
   updateSettingsSync: (updates: Partial<AppSettings>) => boolean
+
+  /** 检查破甲 markdownPath 指向的 .md 文件是否存在 */
+  checkPersonalDirectiveFile: () => Promise<PersonalDirectiveFileCheck>
 
   /** 获取系统主题（是否深色模式） */
   getSystemTheme: () => Promise<boolean>
@@ -1582,6 +1586,10 @@ const electronAPI: ElectronAPI = {
 
   updateSettingsSync: (updates: Partial<AppSettings>) => {
     return ipcRenderer.sendSync(SETTINGS_IPC_CHANNELS.UPDATE_SYNC, updates)
+  },
+
+  checkPersonalDirectiveFile: () => {
+    return ipcRenderer.invoke(SETTINGS_IPC_CHANNELS.CHECK_PERSONAL_DIRECTIVE_FILE)
   },
 
   getSystemTheme: () => {

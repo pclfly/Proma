@@ -7,7 +7,7 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { getSettingsPath } from './config-paths'
-import { DEFAULT_INTERFACE_VARIANT, DEFAULT_THEME_MODE } from '../../types'
+import { DEFAULT_INTERFACE_VARIANT, DEFAULT_THEME_MODE, PERSONAL_DIRECTIVE_DEFAULT_CONTENT } from '../../types'
 import type { AgentIslandSettings, AppSettings } from '../../types'
 
 function sanitizeAgentIslandSettings(input: unknown): AgentIslandSettings | undefined {
@@ -39,6 +39,7 @@ export function getSettings(): AppSettings {
       windowsShellPreference: 'auto',
       agentThinking: { type: 'adaptive' },
       gitAttributionEnabled: true,
+      personalDirective: { enabled: false, content: PERSONAL_DIRECTIVE_DEFAULT_CONTENT },
     }
   }
 
@@ -72,6 +73,8 @@ export function getSettings(): AppSettings {
       agentThinking: settings.agentThinking ?? { type: 'adaptive' },
       // 缺省 true：老配置文件未写该字段时保持推广默认开启
       gitAttributionEnabled: settings.gitAttributionEnabled ?? true,
+      // 缺省关闭：老配置文件未写该字段时保持不注入
+      personalDirective: settings.personalDirective ?? { enabled: false, content: PERSONAL_DIRECTIVE_DEFAULT_CONTENT },
       // 仅保留 macOS 原生 Island 开关；清理旧非原生 surface 的持久化残留字段。
       agentIsland: sanitizeAgentIslandSettings(data.agentIsland),
     }
@@ -91,6 +94,7 @@ export function getSettings(): AppSettings {
       windowsShellPreference: 'auto',
       agentThinking: { type: 'adaptive' },
       gitAttributionEnabled: true,
+      personalDirective: { enabled: false, content: PERSONAL_DIRECTIVE_DEFAULT_CONTENT },
     }
   }
 }

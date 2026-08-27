@@ -4,11 +4,13 @@
  */
 
 import type { PromaPermissionMode, SessionWorkbenchLayout } from '@proma/shared'
+import type { AgentPersonalDirective } from '../../types'
 import { homedir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { existsSync, readFileSync } from 'node:fs'
 import { getUserProfile } from './user-profile-service'
 import { getAgentWorkspaceBySlug, getProjectFilesPath, getWorkspaceMcpConfig, type WorkspaceMemoryGuidance } from './agent-workspace-manager'
-import { getConfigDirName } from './config-paths'
+import { getConfigDirName, getSettingsPath } from './config-paths'
 import { buildGitAttributionPromptSection, isGitAttributionEnabled } from './agent-git-attribution'
 import { getSettings } from './settings-service'
 import type { ProjectInstructionSource } from './project-instruction-resolver'
@@ -19,6 +21,31 @@ const WORKFLOW_PROMPT = `## 工作流
 - 需要多个步骤、多个文件或并行/委派时，先用 TaskCreate 建立 3–7 个可见进度项；仅用 TaskUpdate 追加更新，完成后收束状态。
 - 进度必须可感知且及时：TaskCreate 的 \`subject\` 写稳定的任务目标，\`description\` 写清范围或预期产出；开始任务时立即设为 \`in_progress\` 并用 \`activeForm\` 描述正在做的具体动作。每完成一个用户可感知的阶段（如完成调研、读取/检索结束、开始或完成实现、开始验证、进入等待/阻塞）立即 TaskUpdate；阻塞须写明原因，完成须收束状态。不要为每个 token、文件块或重复轮询刷新，避免制造无意义的高频更新。
 - 回复中的 fenced code block 必须声明语言；未知文本用 \`text\`。`
+
+/**
+ * 解析破甲指令的有效正文：若配置了 markdownPath 且文件存在，优先返回其文本；
+ * 否则回退到 settings.json 的 content。markdownPath 支持绝对路径或相对于
+ * settings.json 所在目录的相对路径，兼容 gen-2 的 prompts/*.md 工作流。
+ */
+function resolvePersonalDirectiveContent(pd: AgentPersonalDirective): string {
+  const fallback = pd.content?.trim() ?? ''
+  const mdPath = pd.markdownPath?.trim()
+  if (!mdPath) return fallback
+  const baseDir = dirname(getSettingsPath())
+  const filePath = isAbsolute(mdPath) ? mdPath : resolve(baseDir, mdPath)
+  try {
+    if (existsSync(filePath)) {
+      const fromFile = readFileSync(filePath, 'utf-8').trim()
+      if (fromFile) return fromFile
+      console.warn(`[破甲] markdownPath 指向的文件为空，回退到 content: ${filePath}`)
+    } else {
+      console.warn(`[破甲] markdownPath 文件不存在，回退到 content: ${filePath}`)
+    }
+  } catch (error) {
+    console.error('[破甲] 读取 markdownPath 失败，回退到 content:', error)
+  }
+  return fallback
+}
 
 interface SystemPromptContext {
   workspaceName?: string
@@ -37,6 +64,8 @@ interface SystemPromptContext {
   memoryGuidance?: WorkspaceMemoryGuidance
   /** 惰性周检命中时才提供；它只邀请用户复查，绝不自动读写历史。 */
   memoryRefreshOpportunity?: { memoryUpdatedAt?: number; newestSessionAt: number; newerSessionCount: number }
+  /** 用户可开关的「破甲」个人指令；enabled 时把 content 整段追加进系统提示词。 */
+  personalDirective?: AgentPersonalDirective
 }
 
 function buildWorkspacePaths(
@@ -78,6 +107,9 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
     : undefined
   const sessionContextDir = workspace?.sessionContextDir ?? '.context'
   const projectContextDir = workspace?.workspaceContextDir ?? '.context'
+  const personalDirectiveText = ctx.personalDirective?.enabled
+    ? resolvePersonalDirectiveContent(ctx.personalDirective).trim()
+    : ''
   const modelRule = ctx.currentModelId?.trim()
     ? `委派默认复用当前模型 \`${ctx.currentModelId.trim()}\`；用户指定其他模型时，先查询可用模型。`
     : '未提供当前模型时不自行选择其他模型。'
@@ -94,6 +126,11 @@ export function buildSystemPrompt(ctx: SystemPromptContext): string {
 你是由 Pi Agent SDK 驱动的 Proma Agent，协助用户 ${userName}。优先中文，直接解决明确目标；低风险、可验证操作直接执行。涉及不可逆删除、外部发送/发布、付费或安全边界变化时先确认。`,
     `## Pi 运行时
 使用 Proma 提供的工具；Write 必须同时传入完整 \`path\` 与 \`content\`。附加目录可用其绝对路径访问。${modelRule}`,
+    personalDirectiveText
+      ? `## 个人指令（破甲）
+
+${personalDirectiveText}`
+      : undefined,
     WORKFLOW_PROMPT,
     `## 任务、日程与自动化
 明确且用户认可的后续行动用 Todo；有明确开始时间的安排用日程；提醒必须有具体时点。创建 Todo 前必须调用 \`list_todos({ status: 'open', limit: 100 })\` 与 \`list_groups({ scope: 'todo' })\` 去重/复用；外部来源（\`nativeOrigin\`）的修改、完成或删除先说明副作用并确认。规划、承诺交付、询问近期安排或结束含行动项的对话时，按需读取 Todo/日程；已有事项只按事实更新或完成，取消不删除。持续或延迟的无人值守工作先读取 \`automation\` Skill；纯提醒不创建 Automation。具体参数和权限遵循工具说明。`,

@@ -24,6 +24,8 @@ import { AgentMessageQueue } from './AgentMessageQueue'
 import { ContextUsageBadge } from './ContextUsageBadge'
 import { PermissionBanner } from './PermissionBanner'
 import { PermissionModeSelector } from './PermissionModeSelector'
+import { PersonalDirectiveToggle } from './PersonalDirectiveToggle'
+import { ArmorRefusalBadge } from './ArmorRefusalBadge'
 import { AskUserBanner } from './AskUserBanner'
 import { ExitPlanModeBanner } from './ExitPlanModeBanner'
 import { PlanModeDashedBorder } from './PlanModeDashedBorder'
@@ -2794,6 +2796,7 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
       ),
     }] : []),
     { key: 'permission-mode', node: <PermissionModeSelector sessionId={sessionId} /> },
+    { key: 'personal-directive', node: <PersonalDirectiveToggle /> },
     {
       key: 'thinking',
       node: (
@@ -3110,6 +3113,9 @@ export function AgentView({ sessionId }: { sessionId: string }): React.ReactElem
               sendWithCmdEnter={sendWithCmdEnter}
               onAgentHistoryQuoteClick={handleAgentHistoryQuoteClick}
             />
+
+            {/* 破甲实时拒答检测状态条（诊断用，仅在破甲开启时显示；不被工具栏折叠隐藏） */}
+            <ArmorRefusalBadge sessionId={sessionId} />
 
             {/* Footer 工具栏 — 容器变窄时尾部按钮自动折叠进「更多」Popover */}
             <InputToolbarOverflow items={inputToolbarItems} trailing={inputTrailingNode} />

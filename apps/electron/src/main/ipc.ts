@@ -153,7 +153,7 @@ import type {
   BrowserTabInput,
   BrowserCreateTabInput,
 } from '@proma/shared'
-import type { UserProfile, AppSettings } from '../types'
+import type { UserProfile, AppSettings, PersonalDirectiveFileCheck } from '../types'
 import { getRuntimeStatus, getGitRepoStatus, reinitializeRuntime } from './lib/runtime-init'
 import { browserController } from './lib/browser-controller'
 import { resolveBrowserProfileKey } from './lib/browser-profile-policy'
@@ -283,7 +283,7 @@ import { runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveF
 import { permissionService } from './lib/agent-permission-service'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
-import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getWorkspaceSkillsDir, getScratchPadPath } from './lib/config-paths'
+import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getSettingsPath, getWorkspaceSkillsDir, getScratchPadPath } from './lib/config-paths'
 import { getCachedDefaultAppInfo, saveCachedDefaultAppInfo } from './lib/default-app-cache'
 import { calculateStorageStats, cleanupStorage, cleanupTempFiles } from './lib/storage-service'
 import type { CleanupOptions } from './lib/storage-service'
@@ -1800,6 +1800,25 @@ export function registerIpcHandlers(): void {
       } catch {
         event.returnValue = false
       }
+    }
+  )
+
+  // 检查破甲 markdownPath 指向的 .md 文件是否存在（开启破甲前由渲染端校验）
+  ipcMain.handle(
+    SETTINGS_IPC_CHANNELS.CHECK_PERSONAL_DIRECTIVE_FILE,
+    async (): Promise<PersonalDirectiveFileCheck> => {
+      const pd = getSettings().personalDirective
+      const md = (pd?.markdownPath ?? '').trim()
+      if (!md) return { markdownPath: '', resolvedPath: '', exists: false }
+      const baseDir = dirname(getSettingsPath())
+      const resolved = isAbsolute(md) ? md : resolve(baseDir, md)
+      let exists = false
+      try {
+        exists = existsSync(resolved)
+      } catch {
+        exists = false
+      }
+      return { markdownPath: md, resolvedPath: resolved, exists }
     }
   )
 

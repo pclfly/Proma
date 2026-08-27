@@ -73,7 +73,7 @@ release-notes/                    版本发布日志
 
 ## 版本、提交与文档
 
-- **每次改动都必须递增版本号**：代码、UI、默认 Skills、文档或工程配置的任何提交，至少将对应交付物的 patch 版本 +1；跨多个可发布包时逐个递增受影响包。
-- `apps/electron/package.json` 是桌面应用版本；`packages/*/package.json` 是各共享包版本；默认 Skill 改动还必须递增其 `SKILL.md` frontmatter 的 `version`。
+- **版本号仅按用户明确要求递增**（2026-08-25 约定）：默认不要因为代码/UI/默认 Skills/文档改动而自动递增版本号；Agent 不得主动修改版本号，确需发版/递增时先征得用户同意。
+- 各包版本映射不变：`apps/electron/package.json` 是桌面应用版本；`packages/*/package.json` 是各共享包版本；默认 Skill 改动若需升级，仍需用户确认后递增其 `SKILL.md` frontmatter 的 `version`。
 - 仅在功能行为、安装方式或用户流程发生变化时更新 README / tutorial / release notes；改文档前先取得用户授权。
 - 提交前检查 `git diff`，不要覆盖用户已有改动或提交无关文件。
