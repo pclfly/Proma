@@ -151,4 +151,20 @@ describe('setReasoningProfileConfig + resolveReasoningProfile', () => {
     expect(hit?.levels).toEqual(['off', 'low'])
     expect(hit?.encodings['anthropic-messages']?.kind).toBe('deepseek-output-effort')
   })
+
+  test('多个 profile 命中时选更具体的（gpt-5.6 命中 max，不因 standard 的 gpt-5 前缀被抢）', () => {
+    // 复现真实运行时：主进程/渲染进程都注入内置默认配置
+    setReasoningProfileConfig(getDefaultReasoningProfileConfigData())
+    const maxCap = resolveReasoningCapability({
+      profile: resolveReasoningProfile({ modelId: 'gpt-5.6-luna', transport: 'openai-completions' }),
+    })
+    expect(maxCap?.levels).toEqual(['off', 'low', 'medium', 'high', 'xhigh', 'max'])
+    // 对照组：gpt-5.4 无 gpt-5.6 专属 max，仍命中 standard（无 max）
+    const stdCap = resolveReasoningCapability({
+      profile: resolveReasoningProfile({ modelId: 'gpt-5.4', transport: 'openai-completions' }),
+    })
+    expect(stdCap?.levels).toEqual(['off', 'low', 'medium', 'high', 'xhigh'])
+    // 恢复干净态
+    setReasoningProfileConfig([])
+  })
 })

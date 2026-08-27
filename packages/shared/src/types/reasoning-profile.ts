@@ -636,14 +636,28 @@ function resolveConfiguredProfileForModel(
   modelId: string,
   transport: ReasoningTransport,
 ): ReasoningProfile | undefined {
+  // 多个 profile 均命中时，选“匹配规则更具体”的那个（value 最长），
+  // 避免宽的通用规则（如 standard 的 gpt-5 前缀）抢先捕获更专属的
+  // 子系列（如 gpt-5.6 应命中 openai-reasoning-max）。
+  let bestProfile: ReasoningProfile | undefined
+  let bestLength = -1
   for (const { data, profile } of _configuredProfiles) {
     // 仅当该 profile 声明了此 transport 的 encoding，才参与命中
     const encoding = data.encodings[transport]
     if (!encoding) continue
-    if (doesMatchReasoningProfile(data, modelId)) {
-      return profile
+    // 该 profile 内所有命中规则里最长的 value 长度，作为“具体度”评分
+    let profileLength = -1
+    for (const rule of data.matchRules) {
+      if (matchesRule(modelId, rule)) {
+        profileLength = Math.max(profileLength, rule.value.length)
+      }
+    }
+    // 并列时保留先出现者（维持配置顺序偏好），仅选取更具体的 profile
+    if (profileLength >= 0 && profileLength > bestLength) {
+      bestLength = profileLength
+      bestProfile = profile
     }
   }
-  return undefined
+  return bestProfile
 }
 
