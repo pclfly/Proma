@@ -15,20 +15,24 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { BROWSER_RISK_DISCLAIMER_VERSION } from '@/types/settings'
-import { detectIsWindows, getWindowControlsPaddingClass } from '@/lib/platform'
 import { cn } from '@/lib/utils'
 import { browserPendingNavigationMapAtom } from '@/atoms/browser-atoms'
 import { BrowserSlot } from './BrowserSlot'
 import { shouldReuseInitialBrowserTab } from './agent-browser-link-utils'
+
+/** 加号菜单最多 7 项；为原生 WebContentsView 预留完整菜单及安全间距。 */
+const ADD_TAB_MENU_CLEARANCE_PX = 256
 
 interface BrowserPanelProps {
   sessionId: string
   /** 由右侧统一顶栏选中的网页。 */
   tabId: string
   state: BrowserViewState | null
+  /** 右侧加号菜单展开时，原生浏览器必须避让其 renderer 区域。 */
+  isAddTabMenuOpen?: boolean
 }
 
-export function BrowserPanel({ sessionId, tabId, state }: BrowserPanelProps): React.ReactElement {
+export function BrowserPanel({ sessionId, tabId, state, isAddTabMenuOpen = false }: BrowserPanelProps): React.ReactElement {
   const [url, setUrl] = React.useState(state?.url ?? '')
   const [riskAcknowledged, setRiskAcknowledged] = React.useState<boolean | null>(null)
   const [savingRiskAcknowledgement, setSavingRiskAcknowledgement] = React.useState(false)
@@ -113,10 +117,9 @@ export function BrowserPanel({ sessionId, tabId, state }: BrowserPanelProps): Re
   // 依赖 controller.activeTabId 的历史操作，导航则始终显式携带当前 tabId。
   const isControllerTabActive = state?.activeTabId === tabId
   const isBackgroundRun = state?.executionSource === 'automation' || state?.executionSource === 'delegation'
-  const isWindows = React.useMemo(() => detectIsWindows(), [])
   return (
     <div className="flex h-full min-w-0 flex-col overflow-hidden border-l border-border/80 bg-content-area titlebar-no-drag">
-      <div className={cn('flex items-center h-[42px] gap-1 px-2 border-b border-border/40 bg-muted/20', getWindowControlsPaddingClass(isWindows))}>
+      <div className="flex items-center h-[42px] gap-1 px-2 border-b border-border/40 bg-muted/20">
         <Tooltip><TooltipTrigger asChild><Button variant="ghost" size="icon" className="size-8 rounded-lg text-muted-foreground/70 hover:bg-muted/60 hover:text-foreground" disabled={riskBlocked || !isControllerTabActive || !state?.canGoBack} onClick={() => void window.electronAPI.goBackAgentBrowser?.(sessionId)}><ChevronLeft className="size-5" /></Button></TooltipTrigger><TooltipContent>后退</TooltipContent></Tooltip>
         <Tooltip><TooltipTrigger asChild><Button variant="ghost" size="icon" className="size-8 rounded-lg text-muted-foreground/70 hover:bg-muted/60 hover:text-foreground" disabled={riskBlocked || !isControllerTabActive || !state?.canGoForward} onClick={() => void window.electronAPI.goForwardAgentBrowser?.(sessionId)}><ChevronRight className="size-5" /></Button></TooltipTrigger><TooltipContent>前进</TooltipContent></Tooltip>
         <Tooltip><TooltipTrigger asChild><Button variant="ghost" size="icon" className="size-8 rounded-lg text-muted-foreground/70 hover:bg-muted/60 hover:text-foreground" disabled={riskBlocked || !isControllerTabActive} onClick={() => void window.electronAPI.reloadAgentBrowser?.(sessionId)}><RotateCw className="size-[18px]" /></Button></TooltipTrigger><TooltipContent>刷新</TooltipContent></Tooltip>
@@ -129,7 +132,12 @@ export function BrowserPanel({ sessionId, tabId, state }: BrowserPanelProps): Re
         )}
       </div>
       {riskAcknowledged === true ? (
-        <BrowserSlot key={tabId} sessionId={sessionId} tabId={tabId} />
+        <div
+          className="flex flex-1 min-h-0 flex-col"
+          style={isAddTabMenuOpen ? { paddingTop: ADD_TAB_MENU_CLEARANCE_PX } : undefined}
+        >
+          <BrowserSlot key={tabId} sessionId={sessionId} tabId={tabId} />
+        </div>
       ) : (
         <div className="flex flex-1 min-h-0 items-center justify-center bg-muted/15 px-8 text-center">
           <div className="max-w-sm space-y-2 text-muted-foreground">
