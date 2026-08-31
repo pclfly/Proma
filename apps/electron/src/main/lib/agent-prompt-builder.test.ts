@@ -8,6 +8,7 @@ function buildMinimalSystemPrompt(personalDirective: { enabled: boolean; content
     permissionMode: 'plan',
     currentModelId: 'model-id',
     personalDirective,
+    productivityTools: { todosEnabled: true, calendarEnabled: true, obsidianEnabled: true },
   })
 }
 
