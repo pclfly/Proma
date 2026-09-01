@@ -1321,6 +1321,22 @@ export interface AgentQueuedMessageControlInput {
   messageId: string
 }
 
+/** 提升队列消息为立即发送的输入（主进程原子执行：出队 → 尽力注入 → 否则直接启动 run） */
+export interface AgentPromoteQueuedMessageInput extends AgentQueuedMessageControlInput {
+  /** 注入活跃通道时是否软中断当前 turn */
+  interrupt?: boolean
+}
+
+/** 提升队列消息为立即发送的结果 */
+export interface AgentPromoteQueuedMessageResult {
+  /**
+   * injected：已注入当前活跃 Agent；
+   * dispatched：已作为新一轮 run 启动（started 事件已推送）；
+   * not_found：消息已不在队列中（已开始发送或已被取消）。
+   */
+  disposition: 'injected' | 'dispatched' | 'not_found'
+}
+
 export interface AgentMoveQueuedMessageInput {
   sessionId: string
   sourceId: string

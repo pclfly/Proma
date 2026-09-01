@@ -30,6 +30,8 @@ import type {
   AgentSubmitOrEnqueueResult,
   AgentQueuedMessageControlInput,
   AgentMoveQueuedMessageInput,
+  AgentPromoteQueuedMessageInput,
+  AgentPromoteQueuedMessageResult,
   PromaPermissionMode,
   AgentExternalRunSource,
   AgentActiveSessionSnapshot,
@@ -163,6 +165,29 @@ const agentQueueCoordinator = new AgentQueueCoordinator({
   startRun: (input, webContents) => runAgent(input, webContents),
   sendStarted: (webContents, status) => {
     if (!webContents.isDestroyed()) webContents.send(AGENT_IPC_CHANNELS.QUEUED_MESSAGE_STATUS, status)
+  },
+  // 提升队列消息时，优先向活跃通道注入（可软中断）；通道刚拒绝（stale）则降级为直接启动 run。
+  inject: async (input, interrupt) => {
+    try {
+      // queueAgentMessage 的第二参数仅用于满足签名，路由目标仅供阅读时参考。
+      const target = streamRoutes.get(input.sessionId)?.target ?? getMainRendererWebContents()
+      await queueAgentMessage({
+        sessionId: input.sessionId,
+        userMessage: input.userMessage,
+        rawUserMessage: input.rawUserMessage,
+        uuid: input.queueMessageId,
+        interrupt,
+        mentionedSkills: input.mentionedSkills,
+        mentionedMcpServers: input.mentionedMcpServers,
+        mentionedSessionIds: input.mentionedSessionIds,
+        mentionedTodoIds: input.mentionedTodoIds,
+        mentionedCalendarEventIds: input.mentionedCalendarEventIds,
+      }, target!)
+      return true
+    } catch (error) {
+      if (isStaleActiveQueueError(error)) return false
+      throw error
+    }
   },
 })
 
@@ -628,6 +653,23 @@ export function enqueueAgentQueuedMessage(input: AgentDeferredQueueMessageInput,
 
 export function cancelAgentQueuedMessage(input: AgentQueuedMessageControlInput): boolean {
   return agentQueueCoordinator.cancel(input)
+}
+
+/**
+ * 原子提升队列消息为立即发送：出队 → 尽力注入（可软中断）→ 否则直接启动新一轮 run。
+ * 渲染进程据此在 injected/dispatched/not_found 之间选择投影处理，避免“先移除再恢复”的竞态。
+ */
+export async function promoteAgentQueuedMessage(
+  input: AgentPromoteQueuedMessageInput,
+  webContents: WebContents,
+): Promise<AgentPromoteQueuedMessageResult> {
+  rebindWebContents(input.sessionId, webContents)
+  const disposition = await agentQueueCoordinator.promote(
+    input.sessionId,
+    input.messageId,
+    input.interrupt === true,
+  )
+  return { disposition }
 }
 
 export function moveAgentQueuedMessage(input: AgentMoveQueuedMessageInput): boolean {

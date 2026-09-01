@@ -113,6 +113,8 @@ import type {
   AgentSubmitOrEnqueueResult,
   AgentQueuedMessageControlInput,
   AgentMoveQueuedMessageInput,
+  AgentPromoteQueuedMessageInput,
+  AgentPromoteQueuedMessageResult,
   AgentQueuedMessageStatus,
   PendingRequestsSnapshot,
   VaultCandidate,
@@ -660,6 +662,8 @@ export interface ElectronAPI {
   enqueueAgentQueuedMessage: (input: AgentDeferredQueueMessageInput) => Promise<void>
   cancelAgentQueuedMessage: (input: AgentQueuedMessageControlInput) => Promise<boolean>
   moveAgentQueuedMessage: (input: AgentMoveQueuedMessageInput) => Promise<boolean>
+  /** 原子提升队列消息为立即发送（出队 → 尽力注入 → 否则直接启动 run）。 */
+  promoteAgentQueuedMessage: (input: AgentPromoteQueuedMessageInput) => Promise<AgentPromoteQueuedMessageResult>
   onAgentQueuedMessageStatus: (callback: (status: AgentQueuedMessageStatus) => void) => () => void
 
   // ===== Agent 工作区管理相关 =====
@@ -1972,6 +1976,9 @@ const electronAPI: ElectronAPI = {
   },
   cancelAgentQueuedMessage: (input: AgentQueuedMessageControlInput) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.CANCEL_QUEUED_MESSAGE, input)
+  },
+  promoteAgentQueuedMessage: (input: AgentPromoteQueuedMessageInput) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.PROMOTE_QUEUED_MESSAGE, input)
   },
   moveAgentQueuedMessage: (input: AgentMoveQueuedMessageInput) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.MOVE_QUEUED_MESSAGE, input)

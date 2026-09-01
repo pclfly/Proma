@@ -141,7 +141,6 @@ import {
   parseQueuedMessageMentions,
   queuedTextToParagraphHtml,
   removeQueuedMessage,
-  restoreQueuedMessageToFront,
 } from '@/lib/agent-message-queue'
 import type { AgentQueuedAttachment, AgentQueuedMessage, QueueDropPlacement } from '@/lib/agent-message-queue'
 
@@ -2609,28 +2608,34 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
 
     queuedSendInFlightRef.current = true
     sendingQueuedMessageIdsRef.current.add(messageId)
-    void window.electronAPI.cancelAgentQueuedMessage({ sessionId, messageId })
-      .then((cancelled) => {
-        if (!cancelled) {
+    void window.electronAPI.promoteAgentQueuedMessage({ sessionId, messageId, interrupt: streaming })
+      .then((result) => {
+        if (result.disposition === 'injected') {
+          // 已注入当前活跃通道：插入乐观用户消息并移除投影。
+          const quotedSelectionBlock = message.quotedSelection
+            ? buildQuotedSelectionBlock(message.quotedSelection)
+            : ''
+          const payload = buildQueuedMessageSendPayload(message, quotedSelectionBlock)
+          appendLiveUserMessage(createUserSDKMessage(payload.rawText, message.id, Date.now()))
+          setQueuedMessages((prev) => removeQueuedMessage(prev, messageId))
+          return
+        }
+        if (result.disposition === 'not_found') {
           toast.info('消息已开始发送，无法再立即发送')
           return
         }
-        setQueuedMessages((prev) => removeQueuedMessage(prev, messageId))
-        return sendPlainTextAgentMessage(message).catch((error) => {
-          console.error('[AgentView] 队列消息发送失败:', error)
-          toast.error('队列消息发送失败', { description: String(error) })
-          setQueuedMessages((prev) => restoreQueuedMessageToFront(prev, message))
-        })
+        // dispatched：主进程已推送 started 事件，投影由 useGlobalAgentListeners 消费，保持不变。
       })
       .catch((error) => {
-        console.error('[AgentView] 取消主进程队列失败:', error)
+        console.error('[AgentView] 提升队列消息失败:', error)
         toast.error('队列消息操作失败', { description: String(error) })
+        // 主进程已把消息回滚到队列，投影保持原样即可。
       })
       .finally(() => {
         sendingQueuedMessageIdsRef.current.delete(messageId)
         queuedSendInFlightRef.current = false
       })
-  }, [canSendQueuedNow, queuedMessages, sendPlainTextAgentMessage, setQueuedMessages, streaming])
+  }, [appendLiveUserMessage, canSendQueuedNow, queuedMessages, sessionId, setQueuedMessages, streaming])
 
   const handleRecallQueuedMessage = React.useCallback((messageId: string): void => {
     const message = queuedMessages.find((item) => item.id === messageId)

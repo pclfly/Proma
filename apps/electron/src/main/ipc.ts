@@ -297,7 +297,7 @@ import {
   searchAgentSessionMessages,
   searchAgentSessionReferences,
 } from './lib/agent-session-manager'
-import { runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, reserveAgentSessionStart, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, reserveAgentSessionStart, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, promoteAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { permissionService } from './lib/agent-permission-service'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
@@ -3447,6 +3447,13 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.CANCEL_QUEUED_MESSAGE,
     async (_, input: import('@proma/shared').AgentQueuedMessageControlInput): Promise<boolean> => {
       return cancelAgentQueuedMessage(input)
+    },
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.PROMOTE_QUEUED_MESSAGE,
+    async (event, input: import('@proma/shared').AgentPromoteQueuedMessageInput): Promise<import('@proma/shared').AgentPromoteQueuedMessageResult> => {
+      return promoteAgentQueuedMessage(input, event.sender)
     },
   )
 
