@@ -11,6 +11,7 @@ interface Harness {
   sendStarted: ReturnType<typeof mock>
   inject: ReturnType<typeof mock>
   enqueue: (sessionId: string, queueMessageId: string, text?: string) => void
+  flushAsync: () => Promise<void>
   webContents: WebContents
   destroyWebContents: () => void
 }
