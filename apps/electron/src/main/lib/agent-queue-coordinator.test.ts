@@ -32,12 +32,14 @@ function createHarness(options?: { active?: boolean }): Harness {
   const startRun = mock(() => Promise.resolve())
   const sendStarted = mock(() => {})
   const inject = mock(() => Promise.resolve(true))
+  let runGeneration = 0
 
   const coordinator = new AgentQueueCoordinator({
     isActive: () => active,
     getWebContents: () => (destroyed ? null : webContents),
     startRun,
     sendStarted,
+    reserveRunGeneration: () => ++runGeneration,
     inject,
   })
 
@@ -51,6 +53,8 @@ function createHarness(options?: { active?: boolean }): Harness {
     enqueue: (sessionId, queueMessageId, text) => {
       coordinator.enqueue(createInput(sessionId, queueMessageId, text))
     },
+    /** 官方 dispatch 链路经 Promise.resolve().then() 异步执行；断言前需 flush 微任务。 */
+    flushAsync: () => new Promise<void>((resolve) => setTimeout(resolve, 0)),
     webContents,
     destroyWebContents: () => { destroyed = true },
   }
@@ -75,18 +79,23 @@ describe('AgentQueueCoordinator.promote', () => {
 
     const result = await h.coordinator.promote('session-1', 'msg-1', false)
     expect(result).toBe('dispatched')
+    await h.flushAsync()
 
-    // 只派发被提升的消息，其余留在队列
-    expect(h.startRun).toHaveBeenCalledTimes(1)
-    expect(h.sendStarted).toHaveBeenCalledTimes(1)
+    // 只派发被提升的消息；run 结束后官方语义会自动接续派发下一条，故 flush 后共 2 次。
+    expect(h.startRun).toHaveBeenCalledTimes(2)
+    expect(h.sendStarted).toHaveBeenCalledTimes(2)
     const status = h.sendStarted.mock.calls[0]?.[1] as AgentQueuedMessageStatus
     expect(status.messageId).toBe('msg-1')
     expect(status.sessionId).toBe('session-1')
     expect(typeof status.startedAt).toBe('number')
-    const runInput = h.startRun.mock.calls[0]?.[0] as AgentDeferredQueueMessageInput & { startedAt: number; userMessageUuid: string }
+    expect(status.runGeneration).toBe(1)
+    const runInput = h.startRun.mock.calls[0]?.[0] as AgentDeferredQueueMessageInput & { startedAt: number; userMessageUuid: string; runGeneration: number }
     expect(runInput.queueMessageId).toBe('msg-1')
     expect(runInput.userMessageUuid).toBe('msg-1')
     expect(runInput.userMessage).toBe('hello')
+    expect(runInput.runGeneration).toBe(1)
+    const autoNext = h.startRun.mock.calls[1]?.[0] as AgentDeferredQueueMessageInput & { runGeneration: number }
+    expect(autoNext.queueMessageId).toBe('msg-2')
 
     // run 结束后 dispatching 标记清除
     expect(await Promise.resolve()).toBeUndefined()
@@ -152,6 +161,7 @@ describe('AgentQueueCoordinator.promote', () => {
   test('Given an idle session with queued messages When a run completes Then the next message is auto-dispatched', async () => {
     const h = createHarness()
     h.enqueue('session-1', 'msg-1')
+    await h.flushAsync()
     expect(h.startRun).toHaveBeenCalledTimes(1)
 
     // 正在派发时不重复启动
@@ -161,6 +171,7 @@ describe('AgentQueueCoordinator.promote', () => {
 
     await h.startRun.mock.results[0]?.value
     h.coordinator.onRunComplete('session-1', 'msg-1', false, false)
+    await h.flushAsync()
     expect(h.startRun).toHaveBeenCalledTimes(2)
     const secondInput = h.startRun.mock.calls[1]?.[0] as AgentDeferredQueueMessageInput
     expect(secondInput.queueMessageId).toBe('msg-2')

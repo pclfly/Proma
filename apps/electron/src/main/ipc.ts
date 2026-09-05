@@ -7,10 +7,10 @@
 import { ipcMain, nativeTheme, shell, dialog, BrowserWindow, app, clipboard, nativeImage } from 'electron'
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { existsSync, realpathSync, readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs'
-import { writeFile } from 'node:fs/promises'
+import { realpath, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { createHash } from 'node:crypto'
-import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, isPromaPermissionMode, normalizePathForCompare, TERMINAL_IPC_CHANNELS } from '@proma/shared'
+import { IPC_CHANNELS, CHANNEL_IPC_CHANNELS, CHAT_IPC_CHANNELS, AGENT_IPC_CHANNELS, AGENT_ISLAND_IPC_CHANNELS, ENVIRONMENT_IPC_CHANNELS, INSTALLER_IPC_CHANNELS, PROXY_IPC_CHANNELS, GITHUB_RELEASE_IPC_CHANNELS, SYSTEM_PROMPT_IPC_CHANNELS, CHAT_TOOL_IPC_CHANNELS, FEISHU_IPC_CHANNELS, DINGTALK_IPC_CHANNELS, SLACK_IPC_CHANNELS, WECHAT_IPC_CHANNELS, AUTOMATION_IPC_CHANNELS, PLANNING_IPC_CHANNELS, VAULT_IPC_CHANNELS, PLANNING_CONFLICT_ERROR, MAX_ATTACHMENT_SIZE, isPromaPermissionMode, normalizePathForCompare, removeMcpServerFromConfig, TERMINAL_IPC_CHANNELS } from '@proma/shared'
 import { USER_PROFILE_IPC_CHANNELS, SETTINGS_IPC_CHANNELS, SCRATCH_PAD_IPC_CHANNELS, QUICK_TASK_IPC_CHANNELS, VOICE_DICTATION_IPC_CHANNELS, APP_ICON_IPC_CHANNELS, DOCK_BADGE_IPC_CHANNELS, STORAGE_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS, TRAY_IPC_CHANNELS } from '../types'
 import type {
   QuickTaskSubmitInput,
@@ -109,6 +109,7 @@ import type {
   DingTalkConfig,
   DingTalkBridgeState,
   DingTalkTestResult,
+  SlackTestResult,
   WeChatConfig,
   WeChatBridgeState,
   SDKMessage,
@@ -198,6 +199,7 @@ import {
   listConversations,
   createConversation,
   getConversationMessages,
+  getConversationMessagesAround,
   getRecentMessages,
   updateConversationMeta,
   deleteConversation,
@@ -206,6 +208,7 @@ import {
   updateContextDividers,
   autoArchiveConversations,
   searchConversationMessages,
+  searchConversationSessionMessages,
 } from './lib/conversation-manager'
 import { sendMessage, stopGeneration, generateTitle } from './lib/chat-service'
 import {
@@ -216,7 +219,6 @@ import {
   openFileOrFolderDialog,
 } from './lib/attachment-service'
 import { extractTextFromAttachment } from './lib/document-parser'
-import { getTutorialContent, createWelcomeConversation } from './lib/tutorial-service'
 import { getUserProfile, updateUserProfile } from './lib/user-profile-service'
 import { getSettings, updateSettings } from './lib/settings-service'
 import { getMergedReasoningProfiles, updateReasoningProfiles } from './lib/reasoning-profiles-config'
@@ -296,9 +298,11 @@ import {
   cleanupStaleAttachedPaths,
   searchAgentSessionMessages,
   searchAgentSessionReferences,
+  resolveAgentCwd,
 } from './lib/agent-session-manager'
-import { runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, reserveAgentSessionStart, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, promoteAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
+import { runAgent, stopAgent, generateAgentTitle, saveFilesToAgentSession, saveFilesToWorkspaceFiles, isAgentSessionActive, isAgentSessionBusy, listActiveAgentSessionSnapshots, listQueuedAgentMessages, reserveAgentSessionStart, queueAgentMessage, submitOrEnqueueAgentMessage, enqueueAgentQueuedMessage, cancelAgentQueuedMessage, promoteAgentQueuedMessage, moveAgentQueuedMessage, clearAgentQueuedMessages, updateAgentPermissionMode, rewindAgentSession, setVisibleAgentSession } from './lib/agent-service'
 import { permissionService } from './lib/agent-permission-service'
+import { resolvePathAgainstAgentCwd } from './lib/agent-file-path'
 import { askUserService } from './lib/agent-ask-user-service'
 import { exitPlanService } from './lib/agent-exit-plan-service'
 import { getAgentSessionWorkspacePath, getAgentWorkspacesDir, getConfigDir, getSettingsPath, getWorkspaceSkillsDir, getScratchPadPath } from './lib/config-paths'
@@ -307,6 +311,7 @@ import { calculateStorageStats, cleanupStorage, cleanupTempFiles } from './lib/s
 import type { CleanupOptions } from './lib/storage-service'
 import {
   listAgentWorkspaces,
+  listAgentWorkspacesWithProjectRootStatus,
   createAgentWorkspace,
   updateAgentWorkspace,
   relinkAgentWorkspaceProjectRoot,
@@ -328,6 +333,7 @@ import {
   importSkillFromWorkspace,
   batchImportSkillsFromWorkspaces,
   updateSkillFromSource,
+  getWorkspaceSkillFolder,
   readWorkspaceSkillContent,
   writeWorkspaceSkillContent,
   toggleWorkspaceSkill,
@@ -447,6 +453,15 @@ import { presenceService } from './lib/feishu-presence'
 import { getDingTalkConfig, saveDingTalkConfig, getDecryptedClientSecret, getDingTalkMultiBotConfig, saveDingTalkBotConfig, removeDingTalkBot, getDecryptedBotClientSecret } from './lib/dingtalk-config'
 import { listShallowDirectory } from './lib/directory-listing'
 import { dingtalkBridgeManager } from './lib/dingtalk-bridge-manager'
+import { redactSensitiveLogValue } from './lib/bridge-log-redaction'
+import {
+  getSlackSettingsConfig,
+  removeSlackBot,
+  saveSlackBotConfig,
+  toSlackBotSettingsConfig,
+} from './lib/slack-config'
+import { slackBridgeManager } from './lib/slack-bridge-manager'
+import { buildSlackManifest } from './lib/slack/manifest'
 import { getWeChatConfig } from './lib/wechat-config'
 import { wechatBridge } from './lib/wechat-bridge'
 
@@ -532,6 +547,28 @@ function isPathAllowed(filePath: string, options?: FileAccessOptions): boolean {
   return getAuthorizedRoots(options).some((root) => isUnderRoot(resolved, root))
 }
 
+async function getResolvedAuthorizedRoots(options?: FileAccessOptions): Promise<string[]> {
+  const roots = getAuthorizedRoots(options)
+  return Promise.all(roots.map(async (root) => {
+    try {
+      return await realpath(resolve(root))
+    } catch {
+      return resolve(root)
+    }
+  }))
+}
+
+function isResolvedPathAllowed(resolvedPath: string, resolvedRoots: readonly string[]): boolean {
+  return resolvedRoots.some((root) => {
+    const relativePath = relative(root, resolvedPath)
+    return relativePath === '' || (
+      relativePath !== '..'
+      && !relativePath.startsWith(`..${sep}`)
+      && !isAbsolute(relativePath)
+    )
+  })
+}
+
 function normalizeFileAccessOptions(value?: FileAccessOptions | string[]): FileAccessOptions | undefined {
   if (!value || Array.isArray(value) || typeof value !== 'object') return undefined
   return {
@@ -600,6 +637,15 @@ async function resolveFileAccessPath(filePath: string, options?: FileAccessOptio
     import('./lib/file-preview-service'),
   ])
   return resolveFilePath(filePath, getPreviewCandidateBasePaths(options)) ?? resolve(filePath)
+}
+
+/** 当前 Agent 的 Write/Edit 相对路径必须按实际运行 cwd 解析。 */
+function getAgentCwdForFileAccess(options?: FileAccessOptions): string | undefined {
+  if (!options?.sessionId) return undefined
+  const session = getAgentSessionMeta(options.sessionId)
+  if (!session?.workspaceId) return undefined
+  const workspace = getAgentWorkspace(session.workspaceId)
+  return resolveAgentCwd(workspace, session.id, session.agentCwdMode, session.activeWorktree)
 }
 
 async function getAccessRootMainRepo(root: string): Promise<string | null> {
@@ -1275,6 +1321,12 @@ export function registerIpcHandlers(): void {
       throw new Error('仅主窗口可以操作本地终端。')
     }
   }
+  const assertMainSettingsRenderer = (senderId: number): void => {
+    const mainWindow = getMainWindow()
+    if (!mainWindow || mainWindow.webContents.id !== senderId) {
+      throw new Error('仅主窗口可以访问 Slack Bot 设置。')
+    }
+  }
   ipcMain.handle(TERMINAL_IPC_CHANNELS.CREATE, async (event, input) => {
     assertMainTerminalRenderer(event.sender.id)
     if (!input.sessionId || !getAgentSessionMeta(input.sessionId)) {
@@ -1781,6 +1833,14 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // 获取搜索命中附近的有限消息窗口
+  ipcMain.handle(
+    CHAT_IPC_CHANNELS.GET_MESSAGES_AROUND,
+    async (_, id: string, messageId: string, radius?: number): Promise<ChatMessage[]> => {
+      return getConversationMessagesAround(id, messageId, radius)
+    }
+  )
+
   // 更新对话标题
   ipcMain.handle(
     CHAT_IPC_CHANNELS.UPDATE_TITLE,
@@ -1839,7 +1899,7 @@ export function registerIpcHandlers(): void {
     }
   )
 
-  // 搜索对话消息内容
+  // 搜索所有对话消息内容
   ipcMain.handle(
     CHAT_IPC_CHANNELS.SEARCH_MESSAGES,
     async (_, query: string) => {
@@ -1847,19 +1907,11 @@ export function registerIpcHandlers(): void {
     }
   )
 
-  // 获取教程内容
+  // 搜索当前对话的完整持久化历史（只返回命中元数据，避免传输整份 JSONL）
   ipcMain.handle(
-    CHAT_IPC_CHANNELS.GET_TUTORIAL_CONTENT,
-    async (): Promise<string | null> => {
-      return getTutorialContent()
-    }
-  )
-
-  // 创建欢迎对话（含教程附件）
-  ipcMain.handle(
-    CHAT_IPC_CHANNELS.CREATE_WELCOME_CONVERSATION,
-    async (): Promise<ConversationMeta | null> => {
-      return createWelcomeConversation()
+    CHAT_IPC_CHANNELS.SEARCH_SESSION_MESSAGES,
+    async (_, conversationId: string, query: string) => {
+      return searchConversationSessionMessages(conversationId, query)
     }
   )
 
@@ -2739,7 +2791,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.LIST_WORKSPACES,
     async (): Promise<AgentWorkspace[]> => {
-      const workspaces = listAgentWorkspaces()
+      const workspaces = await listAgentWorkspacesWithProjectRootStatus()
       for (const workspace of workspaces) {
         if (workspace.projectRootPath) watchAttachedDirectory(workspace.projectRootPath)
         for (const filePath of getWorkspaceAttachedFiles(workspace.slug)) {
@@ -2754,7 +2806,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.CREATE_WORKSPACE,
     async (_, input: import('@proma/shared').CreateAgentWorkspaceInput): Promise<AgentWorkspace> => {
-      const workspace = createAgentWorkspace(input)
+      const workspace = await createAgentWorkspace(input)
       if (workspace.projectRootPath) watchAttachedDirectory(workspace.projectRootPath)
       return workspace
     }
@@ -2764,7 +2816,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.CREATE_PROJECT,
     async (_, input: import('@proma/shared').CreateAgentWorkspaceInput, channelId?: string, modelId?: string): Promise<import('@proma/shared').CreateAgentProjectResult> => {
-      const workspace = createAgentWorkspace(input)
+      const workspace = await createAgentWorkspace(input)
       if (workspace.projectRootPath) watchAttachedDirectory(workspace.projectRootPath)
 
       try {
@@ -2797,7 +2849,7 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.RELINK_WORKSPACE_PROJECT_ROOT,
     async (_, id: string, projectRootPath: string): Promise<AgentWorkspace> => {
       const previousRoot = getAgentWorkspace(id)?.projectRootPath
-      const updated = relinkAgentWorkspaceProjectRoot(id, projectRootPath)
+      const updated = await relinkAgentWorkspaceProjectRoot(id, projectRootPath)
       if (previousRoot && previousRoot !== updated.projectRootPath) {
         releaseDirectoryWatcherIfUnreferenced(previousRoot)
       }
@@ -2810,7 +2862,7 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.RESTORE_WORKSPACE_PROJECT_ROOT,
     async (_, id: string): Promise<AgentWorkspace> => {
-      const updated = restoreAgentWorkspaceProjectRoot(id)
+      const updated = await restoreAgentWorkspaceProjectRoot(id)
       if (updated.projectRootPath) watchAttachedDirectory(updated.projectRootPath)
       return updated
     }
@@ -2958,6 +3010,21 @@ export function registerIpcHandlers(): void {
         )
       }
     }
+  )
+
+  // Remove a single MCP from the current main-process snapshot. This must not
+  // use the full-config save flow: that flow deliberately re-validates enabled
+  // entries, which would transiently disable unrelated MCPs during deletion.
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.DELETE_MCP,
+    async (_, workspaceSlug: string, name: string): Promise<WorkspaceMcpConfig> => {
+      const current = getWorkspaceMcpConfig(workspaceSlug)
+      const config = removeMcpServerFromConfig(current, name)
+      advanceWorkspaceMcpRefreshGeneration(workspaceSlug)
+      clearWorkspaceMcpPendingValidation(workspaceSlug, name)
+      saveWorkspaceMcpConfig(workspaceSlug, config)
+      return config
+    },
   )
 
   // Atomically toggle one MCP. Any later save advances the workspace refresh
@@ -3147,6 +3214,15 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.GET_SKILLS_DIR,
     async (_, workspaceSlug: string): Promise<string> => {
       return getWorkspaceSkillsDir(workspaceSlug)
+    }
+  )
+
+  // 由主进程按 workspace + slug 重新定位目录，避免 renderer 的异步 Skills 根路径过期。
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.OPEN_SKILL_FOLDER,
+    async (_, workspaceSlug: string, skillSlug: string): Promise<void> => {
+      const error = await shell.openPath(getWorkspaceSkillFolder(workspaceSlug, skillSlug))
+      if (error) throw new Error(`无法打开 Skill 目录: ${error}`)
     }
   )
 
@@ -3390,7 +3466,9 @@ export function registerIpcHandlers(): void {
             console.error('[飞书 Session 镜像] 流式卡片初始化失败:', error)
           })
         }
-        await runAgent(input, event.sender)
+        // runGeneration 是主进程内部运行身份；renderer IPC 绝不能指定或复用它。
+        const { runGeneration: _ignoredRunGeneration, ...publicInput } = input as AgentSendInput & { runGeneration?: unknown }
+        await runAgent(publicInput, event.sender)
       } finally {
         releaseStart()
       }
@@ -3432,6 +3510,14 @@ export function registerIpcHandlers(): void {
     AGENT_IPC_CHANNELS.SUBMIT_OR_ENQUEUE_MESSAGE,
     async (event, input: import('@proma/shared').AgentSubmitOrEnqueueInput): Promise<import('@proma/shared').AgentSubmitOrEnqueueResult> => {
       return submitOrEnqueueAgentMessage(input, event.sender)
+    },
+  )
+
+  ipcMain.handle(
+    AGENT_IPC_CHANNELS.GET_QUEUED_MESSAGES,
+    async (_, sessionId: string): Promise<import('@proma/shared').AgentQueuedMessageSnapshot[]> => {
+      if (!sessionId || typeof sessionId !== 'string') return []
+      return listQueuedAgentMessages(sessionId)
     },
   )
 
@@ -4054,10 +4140,12 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.SHOW_IN_FOLDER,
     async (_, filePath: string, access?: FileAccessOptions): Promise<void> => {
-      const { resolve } = await import('node:path')
-
-      const safePath = resolve(filePath)
-      if (!isPathAllowed(safePath, normalizeFileAccessOptions(access))) {
+      const options = normalizeFileAccessOptions(access)
+      const safePath = resolvePathAgainstAgentCwd(filePath, getAgentCwdForFileAccess(options))
+      if (!existsSync(safePath)) {
+        throw new Error('文件不存在或已被移动')
+      }
+      if (!isPathAllowed(safePath, options)) {
         throw new Error('访问路径超出当前会话的授权范围')
       }
 
@@ -4126,6 +4214,41 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // 批量检查文件是否仍存在（供渲染端清理已删除的会话文件变更记录）。
+  // 只接受绝对路径；以有限并发异步执行，避免慢盘或网络路径阻塞 Electron 主进程。
+  ipcMain.handle(
+    'file:exists-batch',
+    async (_, filePaths: unknown, access?: FileAccessOptions | string[]): Promise<string[]> => {
+      if (!Array.isArray(filePaths)) return []
+      const options = normalizeFileAccessOptions(access)
+      const candidates = filePaths.slice(0, 1000).filter(
+        (rawPath): rawPath is string => typeof rawPath === 'string' && rawPath.length > 0 && isAbsolute(rawPath),
+      )
+      const resolvedRoots = options?.unrestricted ? [] : await getResolvedAuthorizedRoots(options)
+      const existing = new Array<boolean>(candidates.length).fill(false)
+      let nextIndex = 0
+      const checkNext = async (): Promise<void> => {
+        while (nextIndex < candidates.length) {
+          const index = nextIndex++
+          const filePath = candidates[index]!
+          try {
+            if (!(await stat(filePath)).isFile()) continue
+            if (options?.unrestricted) {
+              existing[index] = true
+              continue
+            }
+            const resolvedPath = await realpath(filePath)
+            existing[index] = isResolvedPathAllowed(resolvedPath, resolvedRoots)
+          } catch {
+            // 不存在、不可读或不在授权路径内：视为已删除。
+          }
+        }
+      }
+      await Promise.all(Array.from({ length: Math.min(candidates.length, 32) }, checkNext))
+      return candidates.filter((_, index) => existing[index])
+    },
+  )
+
   // 写入文本文件（供 Markdown 内联编辑使用）
   ipcMain.handle(
     'file:write-text',
@@ -4145,10 +4268,28 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // 解析当前 Markdown 同目录内的相对图片。该接口不接受 unrestricted，避免
+  // Markdown 文本中的任意路径借通用预览接口换取本地文件 token。
+  ipcMain.handle(
+    'file:resolve-markdown-media',
+    async (_, markdownFilePath: string, src: string, access?: FileAccessOptions | string[]): Promise<ResolvedFileUrl | null> => {
+      const { resolveMarkdownRelativeMediaPath } = await import('./lib/markdown-media-service')
+      const options = normalizeFileAccessOptions(access)
+      const result = resolveMarkdownRelativeMediaPath(markdownFilePath, src, options)
+      if (!result) return null
+      try {
+        return { url: registerPromaFilePath(result) }
+      } catch (err) {
+        console.warn('[IPC] file:resolve-markdown-media 无法注册图片，跳过:', result, err instanceof Error ? err.message : err)
+        return null
+      }
+    },
+  )
+
   // 仅解析文件路径（供 PDF/图片等用 proma-file:// 加载）
   ipcMain.handle(
     'file:resolve-path',
-    async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<ResolvedFileUrl | null> => {
+    async (_, filePath: string, access?: FileAccessOptions | string[]): Promise<(ResolvedFileUrl & { resolvedPath: string }) | null> => {
       const { resolveFilePath } = await import('./lib/file-preview-service')
       const options = normalizeFileAccessOptions(access)
       const result = resolveFilePath(filePath, getPreviewCandidateBasePaths(options))
@@ -4156,7 +4297,7 @@ export function registerIpcHandlers(): void {
       // registerPromaFilePath 对目录路径会抛「不是文件」。渲染端（如悬浮预览解析 markdown
       // 链接）可能传入目录路径，此处优雅降级为 null，而不是让异常冒泡成未捕获的 handler 错误。
       try {
-        return { url: registerPromaFilePath(result) }
+        return { url: registerPromaFilePath(result), resolvedPath: result }
       } catch (err) {
         console.warn('[IPC] file:resolve-path 无法注册为文件，跳过:', result, err instanceof Error ? err.message : err)
         return null
@@ -5119,6 +5260,81 @@ export function registerIpcHandlers(): void {
     }
   )
 
+  // ===== Slack 集成 =====
+
+  ipcMain.handle(
+    SLACK_IPC_CHANNELS.GET_CONFIG,
+    async (event) => {
+      assertMainSettingsRenderer(event.sender.id)
+      return getSlackSettingsConfig()
+    },
+  )
+
+  ipcMain.handle(
+    SLACK_IPC_CHANNELS.SAVE_BOT_CONFIG,
+    async (event, input: import('@proma/shared').SlackBotConfigInput) => {
+      assertMainSettingsRenderer(event.sender.id)
+      const saved = saveSlackBotConfig(input)
+      if (saved.enabled && saved.botToken && saved.appToken) {
+        void slackBridgeManager.restartBot(saved.id).catch((error) => {
+          console.error(`[Slack IPC] Bot "${saved.name}" 重启失败:`, redactSensitiveLogValue(error))
+        })
+      } else {
+        void slackBridgeManager.stopBot(saved.id)
+      }
+      return toSlackBotSettingsConfig(saved)
+    },
+  )
+
+  ipcMain.handle(
+    SLACK_IPC_CHANNELS.REMOVE_BOT,
+    async (event, botId: string) => {
+      assertMainSettingsRenderer(event.sender.id)
+      await slackBridgeManager.stopBot(botId)
+      return removeSlackBot(botId)
+    },
+  )
+
+  ipcMain.handle(
+    SLACK_IPC_CHANNELS.GET_MANIFEST,
+    async (event, options?: { botName?: string }) => {
+      assertMainSettingsRenderer(event.sender.id)
+      return buildSlackManifest(options)
+    },
+  )
+
+  ipcMain.handle(
+    SLACK_IPC_CHANNELS.TEST_CONNECTION,
+    async (event, botToken: string): Promise<SlackTestResult> => {
+      assertMainSettingsRenderer(event.sender.id)
+      return slackBridgeManager.testConnection(botToken)
+    },
+  )
+
+  ipcMain.handle(
+    SLACK_IPC_CHANNELS.START_BOT,
+    async (event, botId: string): Promise<void> => {
+      assertMainSettingsRenderer(event.sender.id)
+      await slackBridgeManager.startBot(botId)
+    },
+  )
+
+  ipcMain.handle(
+    SLACK_IPC_CHANNELS.STOP_BOT,
+    async (event, botId: string): Promise<void> => {
+      assertMainSettingsRenderer(event.sender.id)
+      await slackBridgeManager.stopBot(botId)
+    },
+  )
+
+  ipcMain.handle(
+    SLACK_IPC_CHANNELS.GET_STATUS,
+    async (event) => {
+      assertMainSettingsRenderer(event.sender.id)
+      return slackBridgeManager.getStates()
+    },
+  )
+
   // ===== 微信集成 =====
 
   // 获取微信配置
@@ -5500,6 +5716,14 @@ export function registerIpcHandlers(): void {
     async (event) => {
       const win = BrowserWindow.fromWebContents(event.sender)
       return win && !win.isDestroyed() ? win.isMaximized() : false
+    }
+  )
+
+  ipcMain.handle(
+    IPC_CHANNELS.WINDOW_IS_FOCUSED,
+    async (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender)
+      return win && !win.isDestroyed() ? win.isFocused() : false
     }
   )
 

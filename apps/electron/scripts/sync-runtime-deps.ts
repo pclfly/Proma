@@ -47,6 +47,8 @@ export const EXTERNAL_RUNTIME_PACKAGES: readonly string[] = [
   // Windows 打包器从 appDir 的 Electron 包复制 electron.exe 构建 win-unpacked 与 NSIS。
   'electron',
   '@earendil-works/pi-coding-agent',
+  // pi-coding-agent 0.85.0 的根入口会加载 experimental server，但发布包漏声明了该依赖。
+  '@earendil-works/pi-server',
   '@earendil-works/pi-agent-core',
   '@earendil-works/pi-ai',
   'pdfjs-dist',

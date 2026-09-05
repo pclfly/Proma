@@ -368,6 +368,17 @@ const OPENAI_MAX_PROFILE: ReasoningProfile = {
   },
 }
 
+const OPENAI_ASTRA_PROFILE: ReasoningProfile = {
+  id: 'openai-reasoning-astra',
+  levels: ['low', 'medium', 'high', 'xhigh', 'max'],
+  defaultLevel: 'low',
+  normalize: (level) => level === 'off' || level === 'minimal' ? 'low' : level ?? 'low',
+  encodings: {
+    'openai-completions': { kind: 'openai-reasoning-effort', effortMap: { off: 'low', minimal: 'low', xhigh: 'xhigh', max: 'max' } },
+    'openai-responses': { kind: 'openai-reasoning-effort', effortMap: { off: 'low', minimal: 'low', xhigh: 'xhigh', max: 'max' } },
+  },
+}
+
 export const REASONING_PROFILES: readonly ReasoningProfile[] = [
   DEEPSEEK_V4_FLASH_PROFILE,
   DEEPSEEK_V4_PRO_PROFILE,
@@ -376,6 +387,7 @@ export const REASONING_PROFILES: readonly ReasoningProfile[] = [
   GLM_53_PROFILE,
   OPENAI_STANDARD_PROFILE,
   OPENAI_MAX_PROFILE,
+  OPENAI_ASTRA_PROFILE,
 ]
 
 /** 内置 profile 的缺省匹配规则（与 resolveReasoningProfile 的内置匹配逻辑一致）。 */
@@ -432,6 +444,9 @@ export function resolveReasoningProfile(input: ResolveReasoningProfileInput): Re
   const isOpenAITransport = input.transport === 'openai-completions' || input.transport === 'openai-responses'
   const isOpenAIReasoningModel = !modelId.endsWith('-chat-latest')
     && (modelId.startsWith('gpt-5') || /^(o1|o3|o4)(?:-|$)/.test(modelId))
+  if (modelId === 'gpt-6-astra') {
+    return OPENAI_ASTRA_PROFILE.encodings[input.transport] ? OPENAI_ASTRA_PROFILE : undefined
+  }
   const profile = /^deepseek-v4-flash(?:-|$)/.test(modelId)
     ? DEEPSEEK_V4_FLASH_PROFILE
     : /^deepseek-v4-pro(?:-|$)/.test(modelId)
@@ -500,6 +515,13 @@ export function normalizeReasoningCapabilityLevel(
   if (!capability) return level
   const requested = level ?? capability.defaultLevel
   if (capability.levels.includes(requested)) return requested
+
+  // Some models (for example Fable 5.1) always reason and do not expose an off
+  // mode. Preserve the product's "disabled" legacy setting as a safe, explicit
+  // high-effort request instead of silently downgrading it to minimal.
+  if (requested === 'off') {
+    return capability.levels.includes('high') ? 'high' : capability.defaultLevel
+  }
 
   const requestedIndex = PI_EXTENDED_THINKING_LEVELS.indexOf(requested)
   if (requestedIndex === -1) return capability.levels[0]
