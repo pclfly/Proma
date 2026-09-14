@@ -340,6 +340,15 @@ export interface ElectronAPI {
   /** 订阅登录期间，接收 Codex device code 与授权链接。返回取消订阅函数。 */
   onCodexOAuthDeviceCode: (callback: (deviceCode: import('@proma/shared').CodexOAuthDeviceCode) => void) => () => void
 
+  /** 发起 GitHub Copilot device-code OAuth 登录。enterpriseUrl 为空时登录 github.com。 */
+  githubCopilotOAuthLogin: (enterpriseUrl?: string) => Promise<import('@proma/shared').GithubCopilotOAuthLoginResult>
+
+  /** 取消进行中的 GitHub Copilot OAuth 登录 */
+  githubCopilotOAuthCancel: () => Promise<void>
+
+  /** 订阅登录期间，接收 GitHub Copilot device code 与授权链接。 */
+  onGithubCopilotOAuthDeviceCode: (callback: (deviceCode: import('@proma/shared').GithubCopilotOAuthDeviceCode) => void) => () => void
+
   /** 发起 xAI（Grok/X 订阅）OAuth 登录 */
   xaiOAuthLogin: () => Promise<XaiOAuthLoginResult>
 
@@ -720,6 +729,8 @@ export interface ElectronAPI {
   /** 原子新增 MCP，并在初始启用时条件持久化验证结果。 */
   installMcpAndValidate: (workspaceSlug: string, name: string, entry: import('@proma/shared').McpServerEntry) => Promise<import('@proma/shared').McpInstallMutationResult>
   startMcpOAuth: (input: import('@proma/shared').StartMcpOAuthInput) => Promise<import('@proma/shared').McpOAuthStartResult>
+  /** 将 OAuth client secret 加密保存到系统 Keychain；不会回传给渲染器或 Agent。 */
+  saveMcpOAuthClientSecret: (input: import('@proma/shared').SaveMcpOAuthClientSecretInput) => Promise<void>
 
   /** 将静态 MCP API Key / Token 加密保存到系统 Keychain。 */
   saveMcpApiKey: (input: import('@proma/shared').SaveMcpApiKeyInput) => Promise<void>
@@ -735,9 +746,6 @@ export interface ElectronAPI {
 
   /** 测试 MCP 服务器连接 */
   testMcpServer: (workspaceSlug: string, name: string, entry: import('@proma/shared').McpServerEntry) => Promise<{ success: boolean; message: string }>
-
-  /** 启用或关闭 Proma 内置 MCP */
-  setBuiltinMcpEnabled: (workspaceSlug: string, id: string, enabled: boolean) => Promise<WorkspaceCapabilities>
 
   /** 获取工作区 Skill 列表（含活跃和不活跃） */
   getWorkspaceSkills: (workspaceSlug: string) => Promise<SkillMeta[]>
@@ -863,14 +871,8 @@ export interface ElectronAPI {
   /** 获取所有工具信息 */
   getChatTools: () => Promise<ChatToolInfo[]>
 
-  /** 获取工具凭据 */
-  getChatToolCredentials: (toolId: string) => Promise<Record<string, string>>
-
   /** 更新工具开关状态 */
   updateChatToolState: (toolId: string, state: ChatToolState) => Promise<void>
-
-  /** 更新工具凭据 */
-  updateChatToolCredentials: (toolId: string, credentials: Record<string, string>) => Promise<void>
 
   /** 创建自定义工具 */
   createCustomChatTool: (meta: ChatToolMeta) => Promise<void>
@@ -880,9 +882,6 @@ export interface ElectronAPI {
 
   /** 监听自定义工具配置变更 */
   onCustomToolChanged: (callback: () => void) => () => void
-
-  /** 测试工具连接 */
-  testChatTool: (toolId: string) => Promise<{ success: boolean; message: string }>
 
   // ===== AskUserQuestion 交互式问答 =====
 
@@ -1588,6 +1587,20 @@ const electronAPI: ElectronAPI = {
     return () => ipcRenderer.removeListener(CHANNEL_IPC_CHANNELS.CODEX_OAUTH_DEVICE_CODE, listener)
   },
 
+  githubCopilotOAuthLogin: (enterpriseUrl?: string) => {
+    return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.GITHUB_COPILOT_OAUTH_LOGIN, enterpriseUrl)
+  },
+
+  githubCopilotOAuthCancel: () => {
+    return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.GITHUB_COPILOT_OAUTH_CANCEL)
+  },
+
+  onGithubCopilotOAuthDeviceCode: (callback: (deviceCode: import('@proma/shared').GithubCopilotOAuthDeviceCode) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, deviceCode: import('@proma/shared').GithubCopilotOAuthDeviceCode) => callback(deviceCode)
+    ipcRenderer.on(CHANNEL_IPC_CHANNELS.GITHUB_COPILOT_OAUTH_DEVICE_CODE, listener)
+    return () => ipcRenderer.removeListener(CHANNEL_IPC_CHANNELS.GITHUB_COPILOT_OAUTH_DEVICE_CODE, listener)
+  },
+
   xaiOAuthLogin: () => {
     return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.XAI_OAUTH_LOGIN)
   },
@@ -2090,6 +2103,10 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.START_MCP_OAUTH, input)
   },
 
+  saveMcpOAuthClientSecret: (input: import('@proma/shared').SaveMcpOAuthClientSecretInput) => {
+    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SAVE_MCP_OAUTH_CLIENT_SECRET, input)
+  },
+
   saveMcpApiKey: (input: import('@proma/shared').SaveMcpApiKeyInput) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SAVE_MCP_API_KEY, input)
   },
@@ -2108,10 +2125,6 @@ const electronAPI: ElectronAPI = {
 
   testMcpServer: (workspaceSlug: string, name: string, entry: import('@proma/shared').McpServerEntry) => {
     return ipcRenderer.invoke(AGENT_IPC_CHANNELS.TEST_MCP_SERVER, workspaceSlug, name, entry) as Promise<{ success: boolean; message: string }>
-  },
-
-  setBuiltinMcpEnabled: (workspaceSlug: string, id: string, enabled: boolean) => {
-    return ipcRenderer.invoke(AGENT_IPC_CHANNELS.SET_BUILTIN_MCP_ENABLED, workspaceSlug, id, enabled)
   },
 
   getWorkspaceSkills: (workspaceSlug: string) => {
@@ -2321,16 +2334,8 @@ const electronAPI: ElectronAPI = {
     return ipcRenderer.invoke(CHAT_TOOL_IPC_CHANNELS.GET_ALL_TOOLS)
   },
 
-  getChatToolCredentials: (toolId: string) => {
-    return ipcRenderer.invoke(CHAT_TOOL_IPC_CHANNELS.GET_TOOL_CREDENTIALS, toolId)
-  },
-
   updateChatToolState: (toolId: string, state: ChatToolState) => {
     return ipcRenderer.invoke(CHAT_TOOL_IPC_CHANNELS.UPDATE_TOOL_STATE, toolId, state)
-  },
-
-  updateChatToolCredentials: (toolId: string, credentials: Record<string, string>) => {
-    return ipcRenderer.invoke(CHAT_TOOL_IPC_CHANNELS.UPDATE_TOOL_CREDENTIALS, toolId, credentials)
   },
 
   createCustomChatTool: (meta: ChatToolMeta) => {
@@ -2345,10 +2350,6 @@ const electronAPI: ElectronAPI = {
     const listener = (): void => callback()
     ipcRenderer.on(CHAT_TOOL_IPC_CHANNELS.CUSTOM_TOOL_CHANGED, listener)
     return () => { ipcRenderer.removeListener(CHAT_TOOL_IPC_CHANNELS.CUSTOM_TOOL_CHANGED, listener) }
-  },
-
-  testChatTool: (toolId: string) => {
-    return ipcRenderer.invoke(CHAT_TOOL_IPC_CHANNELS.TEST_TOOL, toolId)
   },
 
   // AskUserQuestion 交互式问答

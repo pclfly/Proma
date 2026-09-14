@@ -303,6 +303,16 @@ const DEEPSEEK_V4_FLASH_PROFILE: ReasoningProfile = {
   },
 }
 
+const DEEPSEEK_FLASH_PROFILE: ReasoningProfile = {
+  id: 'deepseek-flash',
+  levels: DEEPSEEK_V4_LEVELS,
+  defaultLevel: 'high',
+  normalize: normalizeDeepSeekV4Level,
+  encodings: {
+    'anthropic-messages': { kind: 'deepseek-output-effort', effortMap: DEEPSEEK_V4_FLASH_EFFORT_MAP },
+  },
+}
+
 const DEEPSEEK_V4_PRO_PROFILE: ReasoningProfile = {
   id: 'deepseek-v4-pro',
   levels: DEEPSEEK_V4_LEVELS,
@@ -381,6 +391,7 @@ const OPENAI_ASTRA_PROFILE: ReasoningProfile = {
 
 export const REASONING_PROFILES: readonly ReasoningProfile[] = [
   DEEPSEEK_V4_FLASH_PROFILE,
+  DEEPSEEK_FLASH_PROFILE,
   DEEPSEEK_V4_PRO_PROFILE,
   K3_PROFILE,
   GLM_52_PROFILE,
@@ -447,10 +458,12 @@ export function resolveReasoningProfile(input: ResolveReasoningProfileInput): Re
   if (modelId === 'gpt-6-astra') {
     return OPENAI_ASTRA_PROFILE.encodings[input.transport] ? OPENAI_ASTRA_PROFILE : undefined
   }
-  const profile = /^deepseek-v4-flash(?:-|$)/.test(modelId)
-    ? DEEPSEEK_V4_FLASH_PROFILE
-    : /^deepseek-v4-pro(?:-|$)/.test(modelId)
-      ? DEEPSEEK_V4_PRO_PROFILE
+  const profile = /^deepseek-flash(?:-|$)/.test(modelId)
+    ? DEEPSEEK_FLASH_PROFILE
+    : /^deepseek-v4-flash(?:-|$)/.test(modelId)
+      ? DEEPSEEK_V4_FLASH_PROFILE
+      : /^deepseek-v4-pro(?:-|$)/.test(modelId)
+        ? DEEPSEEK_V4_PRO_PROFILE
       : /^(?:k3(?:-256k)?|kimi-k3)$/.test(modelId)
         ? K3_PROFILE
         : modelId === 'glm-5.3' || modelId === 'glm-5.3-flash'

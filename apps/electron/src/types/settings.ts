@@ -361,10 +361,6 @@ export interface AppSettings {
   visionRelay?: VisionRelaySettings
   /** 已确认的受管浏览器风险告知版本；低于当前版本时首次使用会再次要求确认。 */
   browserRiskDisclaimerVersion?: number
-  /** 用户手动开启的 Proma 内置能力 ID 列表（默认关闭的 Nano Banana）。 */
-  builtinMcpEnabledIds?: string[]
-  /** 用户手动关闭的 Proma 内置能力 ID 列表（默认开启的能力，如 AI 生图）。 */
-  builtinMcpDisabledIds?: string[]
   /** Todo、日程与 Obsidian 的可见性和 Agent 工具注入开关，默认全部开启。 */
   productivityTools: ProductivityToolsSettings
   /** 启动时自动清理临时文件（proma-preview、proma-installers），默认 true */
