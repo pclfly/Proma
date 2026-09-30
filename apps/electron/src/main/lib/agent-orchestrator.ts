@@ -1875,7 +1875,17 @@ export class AgentOrchestrator {
                 if (isPromptTooLongError(detailedMessage, originalError)) {
                   errorCode = 'prompt_too_long'
                 }
-                const typedError = mapAgentErrorToTypedError(errorCode, friendlyErrorMessage(detailedMessage), originalError)
+                const typedError = mapAgentErrorToTypedError(
+                  errorCode,
+                  friendlyErrorMessage(detailedMessage),
+                  originalError,
+                  {
+                    channelName: channel.name,
+                    provider: channel.provider,
+                    modelId: selectedModelId,
+                    thinkingLevel: piThinkingLevel,
+                  },
+                )
 
                 // Session 不存在错误：清除 sdkSessionId，切换到上下文回填模式重试
                 if (isSessionNotFoundError(detailedMessage, originalError) && wasResuming) {

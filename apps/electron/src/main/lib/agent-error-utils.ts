@@ -10,6 +10,7 @@ import {
   THINKING_SIGNATURE_ERROR_TITLE,
   isThinkingSignatureError as matchesThinkingSignatureError,
 } from '@proma/shared'
+import { summarizeDetail } from './channel-test-error'
 import { TRANSIENT_NETWORK_PATTERN, isMalformedResponseError } from './error-patterns'
 
 // Agent 错误消息友好化
@@ -76,8 +77,9 @@ function extractHttpStatusFromErrorText(...messages: string[]): number | null {
   const combined = messages.filter(Boolean).join('\n')
   const patterns = [
     /API Error:\s*(\d{3})/i,
-    /API error[^:]*:\s+(\d{3})/i,
+    /API error[^:\r\n]*?\(?(\d{3})\)?\s*:/i,
     /\b(?:HTTP|status|statusCode)\s*[:=]?\s*(\d{3})\b/i,
+    /\b(\d{3})\s+status code\b/i,
     /\b(\d{3})\s+\{[^}]*"error"/is,
   ]
 
@@ -90,11 +92,38 @@ function extractHttpStatusFromErrorText(...messages: string[]): number | null {
   return null
 }
 
+export interface AgentErrorContext {
+  channelName?: string
+  provider?: string
+  modelId?: string
+  thinkingLevel?: string
+}
+
+function buildHttpErrorDetails(
+  status: number,
+  originalError: string,
+  context?: AgentErrorContext,
+): string[] {
+  const combined = originalError.trim()
+  const hasEmptyBody = /\bstatus code \(no body\)/i.test(combined)
+  const originalSummary = summarizeDetail(combined)
+  return [
+    `HTTP 状态码: ${status}`,
+    ...(hasEmptyBody ? ['上游响应体: 空'] : []),
+    ...(context?.channelName ? [`渠道: ${context.channelName}`] : []),
+    ...(context?.provider ? [`协议: ${context.provider}`] : []),
+    ...(context?.modelId ? [`模型: ${context.modelId}`] : []),
+    ...(context?.thinkingLevel ? [`思考深度: ${context.thinkingLevel}`] : []),
+    ...(originalSummary ? [`原始错误: ${originalSummary}`] : []),
+  ]
+}
+
 /** 将 Agent 错误映射为 TypedError */
 export function mapAgentErrorToTypedError(
   errorCode: string,
   detailedMessage: string,
   originalError: string,
+  context?: AgentErrorContext,
 ): TypedError {
   if (isThinkingSignatureError(detailedMessage, originalError)) {
     return {
@@ -235,6 +264,25 @@ export function mapAgentErrorToTypedError(
   }
 
   const httpStatus = extractHttpStatusFromErrorText(detailedMessage, originalError)
+  if (httpStatus === 400) {
+    const hasEmptyBody = /\bstatus code \(no body\)/i.test(`${detailedMessage}\n${originalError}`)
+    return {
+      code: 'invalid_request',
+      title: hasEmptyBody ? '请求被上游拒绝' : '请求无效',
+      message: hasEmptyBody
+        ? '上游返回 HTTP 400，但没有返回错误详情。请先重试；若持续出现，请检查模型、Base URL 和思考深度等渠道配置。'
+        : detailedMessage || 'API 请求参数无效，请检查当前渠道与模型配置',
+      actions: [
+        { key: 's', label: '设置', action: 'settings' },
+        ...(hasEmptyBody ? [{ key: 'r', label: '重试', action: 'retry' } as const] : []),
+      ],
+      canRetry: hasEmptyBody,
+      retryDelayMs: hasEmptyBody ? 1000 : undefined,
+      details: buildHttpErrorDetails(httpStatus, originalError, context),
+      originalError,
+    }
+  }
+
   if (httpStatus != null && (httpStatus === 429 || httpStatus >= 500)) {
     const isRateLimited = httpStatus === 429
     const isUnavailable = httpStatus === 503
