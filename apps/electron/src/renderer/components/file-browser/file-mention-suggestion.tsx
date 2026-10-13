@@ -13,7 +13,7 @@ import { toast } from 'sonner'
 import { FileMentionList } from './FileMentionList'
 import type { FileMentionRef } from './FileMentionList'
 import type { FileIndexEntry } from '@proma/shared'
-import { createDebouncedSuggestionLoader, createLatestSuggestionRequestGuard, createMentionPopup, positionPopup, isSuggestionTriggerPresent, shouldSuppressEscTrigger, shouldClearEscSuppressionOnExit, type EscSuppressedTrigger } from '@/components/agent/mention-popup-utils'
+import { createDebouncedSuggestionLoader, createLatestSuggestionRequestGuard, createMentionPluginKey, createMentionPopup, isDeletionTransaction, positionPopup, isSuggestionTriggerPresent, scheduleExitSuggestion, shouldDismissEmptySuggestion, shouldSuppressEscTrigger, shouldClearEscSuppressionOnExit, type EscSuppressedTrigger } from '@/components/agent/mention-popup-utils'
 import { shouldAllowMentionTrigger, shouldShowMentionSuggestion } from '@/components/ai-elements/mention-utils'
 import { resolveFileMentionPath } from './file-mention-path'
 
@@ -35,10 +35,19 @@ export function createFileMentionSuggestion(
   let suppressedTrigger: EscSuppressedTrigger | null = null
   const requestGuard = createLatestSuggestionRequestGuard<FileIndexEntry>()
   const queryLoader = createDebouncedSuggestionLoader(requestGuard)
+  const pluginKey = createMentionPluginKey('@')
+  // 仅当菜单因“已输入查询但无匹配”被收起时，删除字符才重新打开；Esc 关闭保持原行为。
+  let dismissedForEmptyResult = false
 
   return {
     char: '@',
+    pluginKey,
     allowSpaces: false,
+    shouldResetDismissed: ({ transaction }) => {
+      if (!dismissedForEmptyResult || !isDeletionTransaction(transaction)) return false
+      dismissedForEmptyResult = false
+      return true
+    },
     allowedPrefixes: null,
     shouldShow: ({ transaction }) => shouldShowMentionSuggestion(transaction.getMeta('uiEvent')),
     allow: ({ state, range }) => {
@@ -169,6 +178,12 @@ export function createFileMentionSuggestion(
           }
           suppressedTrigger = null
 
+          if (shouldDismissEmptySuggestion({ itemCount: props.items.length, query: props.query, isLatestResult: requestGuard.isLatest(props.items) })) {
+            dismissedForEmptyResult = true
+            scheduleExitSuggestion(props.editor.view, pluginKey)
+            return
+          }
+
           mentionActiveRef.current = true
           if (mentionItemCountRef) mentionItemCountRef.current = props.items.length
           editorRef = props.editor
@@ -204,6 +219,12 @@ export function createFileMentionSuggestion(
           if (!requestGuard.isLatest(props.items)) {
             return
           }
+          if (shouldDismissEmptySuggestion({ itemCount: props.items.length, query: props.query, isLatestResult: true })) {
+            dismissedForEmptyResult = true
+            cleanup()
+            scheduleExitSuggestion(props.editor.view, pluginKey)
+            return
+          }
           if (mentionItemCountRef) mentionItemCountRef.current = props.items.length
           latestClientRect = props.clientRect
 
@@ -222,6 +243,7 @@ export function createFileMentionSuggestion(
         onKeyDown(props) {
           // 记录 Esc 关闭时的触发片段文本与位置，onStart/onExit 据此判断同一片段
           if (props.event.key === 'Escape') {
+            dismissedForEmptyResult = false
             suppressedTrigger = {
               from: props.range.from,
               text: props.view.state.doc.textBetween(props.range.from, props.range.to, '', ''),

@@ -11,7 +11,7 @@ import type { SuggestionOptions } from '@tiptap/suggestion'
 import { CalendarDays, ListTodo, MessageSquareText, Sparkles, Server } from 'lucide-react'
 import { MentionList } from './MentionList'
 import type { MentionListRef } from './MentionList'
-import { createDebouncedSuggestionLoader, createLatestSuggestionRequestGuard, createMentionPopup, positionPopup, isSuggestionTriggerPresent, shouldSuppressEscTrigger, shouldClearEscSuppressionOnExit, type EscSuppressedTrigger } from './mention-popup-utils'
+import { createDebouncedSuggestionLoader, createLatestSuggestionRequestGuard, createMentionPluginKey, createMentionPopup, isDeletionTransaction, positionPopup, isSuggestionTriggerPresent, scheduleExitSuggestion, shouldDismissEmptySuggestion, shouldSuppressEscTrigger, shouldClearEscSuppressionOnExit, type EscSuppressedTrigger } from './mention-popup-utils'
 import type { AgentSessionReferenceSearchResult, WorkspaceCapabilities } from '@proma/shared'
 import { shouldAllowMentionTrigger, shouldShowMentionSuggestion } from '@/components/ai-elements/mention-utils'
 import {
@@ -57,10 +57,19 @@ function createMentionSuggestion<T>(
   let suppressedTrigger: EscSuppressedTrigger | null = null
   const requestGuard = createLatestSuggestionRequestGuard<T>()
   const queryLoader = createDebouncedSuggestionLoader(requestGuard)
+  const pluginKey = createMentionPluginKey(config.char)
+  // 仅当菜单因“已输入查询但无匹配”被收起时，删除字符才重新打开；Esc 关闭保持原行为。
+  let dismissedForEmptyResult = false
 
   return {
     char: config.char,
+    pluginKey,
     allowSpaces: false,
+    shouldResetDismissed: ({ transaction }) => {
+      if (!dismissedForEmptyResult || !isDeletionTransaction(transaction)) return false
+      dismissedForEmptyResult = false
+      return true
+    },
     // allowedPrefixes 为 null：允许任意字符前缀触发（含中文等无空格场景，如 `你好#`）。
     // 注意：设为 [' '] 不能阻止"空输入框触发"——TipTap 在块开头的前缀为空串，
     // 始终通过校验；却会让中文/单词后紧跟触发符无法触发，属回归。
@@ -133,6 +142,12 @@ function createMentionSuggestion<T>(
           }
           suppressedTrigger = null
 
+          if (shouldDismissEmptySuggestion({ itemCount: props.items.length, query: props.query, isLatestResult: requestGuard.isLatest(props.items) })) {
+            dismissedForEmptyResult = true
+            scheduleExitSuggestion(props.editor.view, pluginKey)
+            return
+          }
+
           mentionActiveRef.current = true
           mentionItemCountRef.current = props.items.length
           editorDom = props.editor.view.dom
@@ -169,6 +184,12 @@ function createMentionSuggestion<T>(
           if (!requestGuard.isLatest(props.items)) {
             return
           }
+          if (shouldDismissEmptySuggestion({ itemCount: props.items.length, query: props.query, isLatestResult: true })) {
+            dismissedForEmptyResult = true
+            cleanup()
+            scheduleExitSuggestion(props.editor.view, pluginKey)
+            return
+          }
           mentionItemCountRef.current = props.items.length
           renderer?.updateProps({
             items: props.items,
@@ -184,6 +205,7 @@ function createMentionSuggestion<T>(
         onKeyDown(props) {
           // 记录 Esc 关闭时的触发片段文本与位置，onStart/onExit 据此判断同一片段
           if (props.event.key === 'Escape') {
+            dismissedForEmptyResult = false
             suppressedTrigger = {
               from: props.range.from,
               text: props.view.state.doc.textBetween(props.range.from, props.range.to, '', ''),

@@ -9,6 +9,45 @@
  */
 
 import type { Editor } from '@tiptap/react'
+import type { EditorView } from '@tiptap/pm/view'
+import type { Transaction } from '@tiptap/pm/state'
+import { PluginKey } from '@tiptap/pm/state'
+import { exitSuggestion } from '@tiptap/suggestion'
+
+/**
+ * 已输入查询词且最新一次搜索没有任何结果时，应收起提及菜单，避免空菜单遮挡输入。
+ * 仅输入触发符（query 为空）时保留空状态提示，以便说明“当前没有可引用项”的原因。
+ * 初始占位（尚未登记的空数组）和过期请求不算“最新结果”，不能触发收起。
+ */
+export function shouldDismissEmptySuggestion(input: {
+  itemCount: number
+  query: string | null | undefined
+  isLatestResult: boolean
+}): boolean {
+  return input.isLatestResult && input.itemCount === 0 && (input.query ?? '').trim().length > 0
+}
+
+/**
+ * 因无匹配而收起后，用户删除字符（查询变短、可能重新匹配）时应解除 TipTap 的 dismissed 状态。
+ * 继续输入只会让查询更严格，保持收起即可。
+ */
+export function isDeletionTransaction(transaction: Pick<Transaction, 'docChanged' | 'before' | 'doc'>): boolean {
+  return transaction.docChanged && transaction.doc.content.size < transaction.before.content.size
+}
+
+/** 为提及 suggestion 创建可引用的 PluginKey，以便主动退出该 suggestion。 */
+export function createMentionPluginKey(char: string): PluginKey {
+  return new PluginKey(`proma-mention-${char.codePointAt(0)?.toString(16) ?? 'x'}`)
+}
+
+/** 在当前更新周期结束后退出 suggestion，避免在插件 view.update 内部同步 dispatch。 */
+export function scheduleExitSuggestion(view: EditorView, pluginKey: PluginKey): void {
+  queueMicrotask(() => {
+    if (view.isDestroyed) return
+    const state = pluginKey.getState(view.state) as { active?: boolean } | undefined
+    if (state?.active) exitSuggestion(view, pluginKey)
+  })
+}
 
 const POPUP_GAP = 4
 const VIEWPORT_PADDING = 8

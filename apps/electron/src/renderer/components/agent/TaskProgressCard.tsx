@@ -64,8 +64,9 @@ function TaskRow({ item }: TaskRowProps): React.ReactElement {
         )}
       </span>
 
-      {/* 任务文字 */}
+      {/* 任务文字：过长被截断时悬停查看完整内容 */}
       <span
+        title={isInProgress && item.activeForm ? item.activeForm : item.subject}
         className={cn(
           'truncate flex-1',
           (isCompleted || isCancelled) && 'text-muted-foreground line-through',

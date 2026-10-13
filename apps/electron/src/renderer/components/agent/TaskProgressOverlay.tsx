@@ -230,7 +230,7 @@ export function TaskProgressOverlay({ activities, streaming, contextCompaction }
                 {displayCompaction.status === 'success' && <CheckCircle2 className="size-3.5 shrink-0 text-green-500" />}
                 {displayCompaction.status === 'noop' && <CheckCircle2 className="size-3.5 shrink-0 text-muted-foreground" />}
                 {displayCompaction.status === 'failed' && <CircleAlert className="size-3.5 shrink-0 text-destructive" />}
-                <span className="truncate text-[13px] text-foreground/90">{displayCompaction.label}</span>
+                <span className="truncate text-[13px] text-foreground/90" title={displayCompaction.label}>{displayCompaction.label}</span>
               </>
             ) : (
               <>
@@ -240,7 +240,7 @@ export function TaskProgressOverlay({ activities, streaming, contextCompaction }
                 <span className="shrink-0 text-[11px] text-muted-foreground tabular-nums">
                   {completedCount}/{displayItems.length}
                 </span>
-                <span className="truncate text-[13px] text-foreground/90">
+                <span className="truncate text-[13px] text-foreground/90" title={currentTask?.activeForm ?? currentTask?.subject ?? '任务已完成'}>
                   {currentTask?.activeForm ?? currentTask?.subject ?? '任务已完成'}
                 </span>
               </>

@@ -807,10 +807,25 @@ export class BrowserController {
       && browserSession.agentTabId !== activeTab.tabId
       && !activeTab.openedByAgent
       && (activeTab.state.url === '' || activeTab.state.url === 'about:blank')) {
-      return this.navigateDisplay(sessionId, USER_NEW_TAB_URL, activeTab.tabId)
+      const state = await this.navigateDisplay(sessionId, USER_NEW_TAB_URL, activeTab.tabId)
+      this.resetTabZoom(activeTab)
+      return state
     }
+    // 从界面打开浏览器时恢复 100% 缩放，不沿用上次 Ctrl/Cmd +/- 调整过的比例。
+    this.resetTabZoom(activeTab)
     this.emit(browserSession)
     return structuredClone(this.buildState(browserSession))
+  }
+
+  /** Chromium 按 origin 记忆缩放；用户界面打开/新建标签时统一复位到 100%。 */
+  private resetTabZoom(tab: BrowserTabRecord): void {
+    const contents = tab.view.webContents
+    if (contents.isDestroyed()) return
+    try {
+      if (contents.getZoomFactor() !== 1) contents.setZoomFactor(1)
+    } catch {
+      // 复位缩放失败不影响打开浏览器本身。
+    }
   }
 
   getState(sessionId: string): BrowserViewState | null {
@@ -1104,8 +1119,12 @@ export class BrowserController {
     this.activateDisplayTab(browserSession, tab)
     const reclaimed = this.reclaimExcessAgentTabs(browserSession)
     if (reclaimed > 0) this.trace(browserSession, tab, 'tab', `标签超过 ${MAX_BROWSER_TABS} 个上限，已回收 ${reclaimed} 个最久未使用的 Agent 标签`)
-    if (url?.trim()) return this.navigateDisplay(sessionId, url)
-    return this.navigateDisplay(sessionId, USER_NEW_TAB_URL, tab.tabId)
+    const state = url?.trim()
+      ? await this.navigateDisplay(sessionId, url)
+      : await this.navigateDisplay(sessionId, USER_NEW_TAB_URL, tab.tabId)
+    // 新标签加载后再复位：Chromium 会在导航时套用该 origin 记忆的缩放级别。
+    this.resetTabZoom(tab)
+    return state
   }
 
   /** 用户 UI 的 tab 选择只控制显示，不影响 Agent 之后的默认操作目标。 */

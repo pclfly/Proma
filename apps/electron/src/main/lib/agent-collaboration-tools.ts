@@ -37,7 +37,9 @@ import {
   buildDelegationTaskWithSharedContext,
   buildDelegationPrompt,
   createToolCallIdempotencyCache,
+  normalizePersistedDelegationStatus,
   resolveDelegationPermissionMode,
+  resolveDelegationWaitStatus,
 } from './agent-collaboration-utils'
 import { assertEnabledModelForChannel, listEnabledAgentModelsForChannel } from './agent-model-selection'
 import { serializePiToolResultPayload } from './adapters/pi-tool-result-json'
@@ -434,7 +436,7 @@ function getDelegationResult(parentSessionId: string, delegationId: string): Rec
 
   const resultSummary = session.delegationStatus && session.delegationStatus !== 'running'
     ? summarizeChildResult(session.id)
-    : undefined
+    : '委派已不在当前运行内存中（可能因应用重启而中断），未产生最终结果；可用 continue_delegation 继续。'
 
   return {
     delegationId,
@@ -447,9 +449,9 @@ function getDelegationResult(parentSessionId: string, delegationId: string): Rec
     role: session.delegationRole,
     goal: session.delegationGoal,
     permissionMode: session.permissionMode,
-    status: session.delegationStatus,
+    status: normalizePersistedDelegationStatus(session.delegationStatus),
     startedAt: session.createdAt,
-    completedAt: session.delegationStatus && session.delegationStatus !== 'running' ? session.updatedAt : undefined,
+    completedAt: session.updatedAt,
     resultSummary,
   }
 }
@@ -977,12 +979,17 @@ export function buildPiCollaborationTools(
           ? await waitForLiveRecords(liveRecords, timeoutSeconds, liveTarget)
           : 'completed'
         const allDelegations = [...liveRecords.map(getDelegationSummary), ...settled]
+        const completedCount = allDelegations.filter((item) => item.status !== 'running').length
+        const status = resolveDelegationWaitStatus({ finishedCount: completedCount, targetCompleted })
         return piJsonResult({
-          status: waitResult,
+          status,
           mode,
-          completedCount: allDelegations.filter((item) => item.status !== 'running').length,
+          completedCount,
           runningCount: allDelegations.filter((item) => item.status === 'running').length,
           delegations: allDelegations,
+          note: status === 'timeout' || waitResult === 'timeout'
+            ? '等待未收敛：仍有委派在运行或未达到目标完成数，不能视为已完成。'
+            : undefined,
         })
       },
     }),

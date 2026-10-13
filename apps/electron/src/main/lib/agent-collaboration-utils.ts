@@ -77,6 +77,29 @@ export function resolveDelegationPermissionMode(
   return 'bypassPermissions'
 }
 
+/**
+ * 不在当前进程内存中的委派不可能仍在运行：子会话只由本进程驱动。
+ * 磁盘残留的 running（应用重启/崩溃后）应视为 interrupted，
+ * 否则等待屏障会把它当成“已收敛”或“仍在跑”而给出错误结论。
+ */
+export function normalizePersistedDelegationStatus(
+  status: AgentDelegationStatus | undefined,
+): AgentDelegationStatus {
+  return !status || status === 'running' ? 'interrupted' : status
+}
+
+/**
+ * 根据真实完成数量判定 wait_for_delegations 的最终状态。
+ * 不能只依赖等待 Promise 的结果：只要完成数未达到目标，就必须报告 timeout，
+ * 避免父会话在子会话仍运行时被误导为已全部完成。
+ */
+export function resolveDelegationWaitStatus(input: {
+  finishedCount: number
+  targetCompleted: number
+}): 'completed' | 'timeout' {
+  return input.finishedCount < input.targetCompleted ? 'timeout' : 'completed'
+}
+
 export function buildRecoveredDelegationState(input: {
   parentSessionId: string
   delegationId: string
@@ -87,9 +110,7 @@ export function buildRecoveredDelegationState(input: {
   // 从持久化记录恢复但不在 live Map 中，说明当前进程并没有这个委派在跑。
   // 若磁盘里还残留 running（例如应用重启/崩溃后），应视为 interrupted，
   // 否则 continue_delegation 会把它误判为“仍在运行”而拒绝恢复。
-  const status = persistedStatus === 'running'
-    ? 'interrupted'
-    : (persistedStatus ?? 'interrupted')
+  const status = normalizePersistedDelegationStatus(persistedStatus)
   return {
     delegationId: input.delegationId,
     parentSessionId: input.parentSessionId,
