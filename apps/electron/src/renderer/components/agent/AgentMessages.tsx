@@ -618,6 +618,11 @@ interface AgentTranscriptHistoryProps {
 
 const EMPTY_LIVE_GROUP_SET: ReadonlySet<MessageGroup> = new Set()
 const EMPTY_MESSAGE_GROUPS: MessageGroup[] = []
+/** `auto <高度>` 让浏览器记住渲染过的真实高度，滚动时不会跳动。 */
+const HISTORY_ROW_CONTAINMENT_STYLE: React.CSSProperties = {
+  contentVisibility: 'auto',
+  containIntrinsicSize: 'auto 240px',
+}
 
 /**
  * 比较两批 group 的“结构身份”是否一致。
@@ -703,7 +708,13 @@ const AgentTranscriptRows = React.memo(function AgentTranscriptRows({
         const groupId = getGroupId(group)
 
         return (
-          <div key={groupId} className="w-full pb-1">
+          <div
+            key={groupId}
+            className="w-full pb-1"
+            // 长会话切换时一次挂载全部历史 DOM；视口外的历史组跳过布局与绘制，避免主线程长任务卡住窗口。
+            // 仅用于非流式历史行：DOM 仍保留，scrollToMessage、选区与引用高亮不受影响。
+            style={!isLive && !streaming ? HISTORY_ROW_CONTAINMENT_STYLE : undefined}
+          >
             <MessageGroupRenderer
               group={group}
               allMessages={group.type === 'assistant-turn' ? allMessages : EMPTY_SDK_MESSAGES}

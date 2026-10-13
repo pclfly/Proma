@@ -62,5 +62,18 @@ describe('Pi native retry classifier', () => {
     expect(isRetryableAssistantError(
       failedAssistant('429 insufficient_quota: billing limit reached'),
     )).toBe(false)
+    expect(isRetryableAssistantError(
+      failedAssistant('429: You exceeded your current quota exceeded for this month'),
+    )).toBe(false)
+  })
+
+  test.each([
+    '429 Too Many Requests',
+    '429: {"message":"rate limit reached for requests"}',
+    // 真实会话中的 Bedrock 网关错误：AWS SDK 客户端重试令牌耗尽，并非账户额度用尽。
+    '429: {"message":"bedrock converse: operation error Bedrock Runtime: ConverseStream, https response error StatusCode: 429, ThrottlingException: Too many requests, please wait before trying again.\\nfailed to get rate limit token, retry quota exceeded, 2 available, 5 requested","type":"server_error","code":"upstream_error"}',
+    'ThrottlingException: Rate exceeded',
+  ])('retries transient 429 / throttling "%s"', (errorMessage) => {
+    expect(isRetryableAssistantError(failedAssistant(errorMessage))).toBe(true)
   })
 })

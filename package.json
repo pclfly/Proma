@@ -14,8 +14,8 @@
     "electron:build": "bun run --filter='@proma/electron' build",
     "electron:start": "bun run --filter='@proma/electron' start",
     "dist:mac": "bun run --filter='@proma/electron' dist:mac",
-  "dist:win": "bun run --filter='@proma/electron' dist:win",
-  "dist:linux": "bun run --filter='@proma/electron' dist:linux",
+    "dist:win": "bun run --filter='@proma/electron' dist:win",
+    "dist:linux": "bun run --filter='@proma/electron' dist:linux",
     "build": "bun run --filter='*' build",
     "typecheck": "bun run --filter='*' typecheck",
     "test": "bun test --isolate"
@@ -37,13 +37,17 @@
     "jotai-family": "^1.1.0"
   },
   "overrides": {
-    "@earendil-works/pi-agent-core": "0.87.1",
-    "@earendil-works/pi-ai": "0.87.1",
-    "@earendil-works/pi-coding-agent": "0.87.1",
-    "@earendil-works/pi-tui": "0.87.1"
+    "@earendil-works/pi-agent-core": "1.1.0",
+    "@earendil-works/pi-ai": "1.1.0",
+    "@earendil-works/pi-coding-agent": "1.1.0",
+    "@earendil-works/pi-tui": "1.1.0",
+    "@earendil-works/chord": "1.1.0",
+    "@earendil-works/pi-codemode": "1.1.0",
+    "@earendil-works/pi-mcp": "1.1.0",
+    "@earendil-works/pi-telemetry": "1.1.0"
   },
   "patchedDependencies": {
-    "@earendil-works/pi-ai@0.87.1": "patches/@earendil-works%2Fpi-ai@0.87.1.patch",
+    "@earendil-works/pi-ai@1.1.0": "patches/@earendil-works%2Fpi-ai@1.1.0.patch",
     "node-pty@1.1.0": "patches/node-pty@1.1.0.patch"
   }
 }

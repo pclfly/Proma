@@ -149,6 +149,42 @@ describe('Agent 会话 JSONL 读取', () => {
     expect(messages.map((message) => message.type)).toEqual(['user', 'assistant'])
   })
 
+  test('Given 工具结果含大内联截图 When 为 UI 读取 Then 剥离 base64 但保留磁盘与完整读取不变', async () => {
+    const imageData = 'A'.repeat(200_000)
+    const toolResult = {
+      type: 'user',
+      uuid: 'tool-result-1',
+      message: { content: [{ type: 'tool_result', tool_use_id: 'call-1', content: [
+        { type: 'text', text: '已截图' },
+        { type: 'image', data: imageData, mimeType: 'image/png' },
+      ] }] },
+      parent_tool_use_id: null,
+    }
+    writeAgentSessionJsonl('session-with-inline-image', [
+      JSON.stringify({ type: 'user', message: { content: [{ type: 'text', text: '截个图' }] }, parent_tool_use_id: null }),
+      JSON.stringify(toolResult),
+    ])
+
+    const uiMessages = await manager.getAgentSessionSDKMessagesForUi('session-with-inline-image')
+    const uiBlocks = (uiMessages[1] as unknown as typeof toolResult).message.content[0]!.content
+    expect(uiMessages).toHaveLength(2)
+    expect(uiBlocks[0]).toEqual({ type: 'text', text: '已截图' })
+    expect(uiBlocks[1]).toEqual({ type: 'image', data: '', mimeType: 'image/png' })
+
+    const fullMessages = manager.getAgentSessionSDKMessages('session-with-inline-image')
+    const fullBlocks = (fullMessages[1] as unknown as typeof toolResult).message.content[0]!.content
+    expect((fullBlocks[1] as { data: string }).data).toHaveLength(imageData.length)
+  })
+
+  test('Given 会话文件不存在 When 为 UI 读取 Then 返回空列表', async () => {
+    expect(await manager.getAgentSessionSDKMessagesForUi('session-missing-file')).toEqual([])
+  })
+
+  test('Given 小行或短图片数据 When 剥离 Then 保持原样', () => {
+    const small = JSON.stringify({ type: 'image', data: 'abc', mimeType: 'image/png' })
+    expect(manager.stripInlineImageDataForUi(small)).toBe(small)
+  })
+
   test('Given 会话 JSONL 存在损坏行 When 截断 SDKMessage Then 抛错避免重写不完整历史', () => {
     writeAgentSessionJsonl('session-truncate-bad-line', [
       JSON.stringify({ type: 'assistant', uuid: 'assistant-1', message: { content: [{ type: 'text', text: '完成' }] } }),

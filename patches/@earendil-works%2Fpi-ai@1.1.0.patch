@@ -1,7 +1,28 @@
 diff --git a/dist/utils/retry.js b/dist/utils/retry.js
 --- a/dist/utils/retry.js
 +++ b/dist/utils/retry.js
-@@ -63,9 +63,19 @@
+@@ -14,7 +14,9 @@
+     // quota/billing error code; the other strings cover common gateway wording.
+     "insufficient_quota",
+     "out of budget",
+-    "quota exceeded",
++    // AWS SDK client-side "retry quota exceeded" means local throttling tokens are
++    // exhausted, not account quota exhaustion; keep it retryable (Proma).
++    "(?<!retry )quota exceeded",
+     "billing",
+     // Sign in with ChatGPT: the subscription's shared usage limit, which resets
+     // after hours rather than seconds.
+@@ -29,6 +31,9 @@
+     "model is at capacity",
+     "rate.?limit",
+     "too many requests",
++    // AWS Bedrock throttling responses (Proma).
++    "throttlingexception",
++    "throttl(?:ed|ing)",
+     "429",
+     "500",
+     "502",
+@@ -69,12 +74,22 @@
      // "stream ended without ..." and "Anthropic stream ended before message_stop"
      // (#4433); Bedrock/Smithy can throw an HTTP/2 no-response error (#3594).
      "ended without",
@@ -12,6 +33,9 @@ diff --git a/dist/utils/retry.js b/dist/utils/retry.js
      "stream ended before message_stop",
      "stream ended before a terminal response event",
      "http2 request did not get a response",
+     // Node ERR_HTTP2_STREAM_CANCEL: the HTTP/2 session died before the request was
+     // sent, e.g. after the Bedrock SDK's 5-minute session timeout (#10379).
+     "pending stream has been canceled",
 +    // HTTP chunked/SSE proxies can close before the complete response body arrives.
 +    "unexpected non-whitespace character after JSON",
 +    "peer closed connection",

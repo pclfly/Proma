@@ -288,7 +288,7 @@ import {
   countArchivedAgentSessions,
   createAgentSession,
   getAgentSessionMeta,
-  getAgentSessionSDKMessages,
+  getAgentSessionSDKMessagesForUi,
   updateAgentSessionMeta,
   deleteAgentSession,
   migrateChatToAgentSession,
@@ -2679,7 +2679,8 @@ export function registerIpcHandlers(): void {
   ipcMain.handle(
     AGENT_IPC_CHANNELS.GET_SDK_MESSAGES,
     async (_, id: string): Promise<SDKMessage[]> => {
-      return getAgentSessionSDKMessages(id)
+      // 异步读盘并剥离 UI 不渲染的内联截图 base64，避免切换大会话时主进程与渲染进程短时卡死。
+      return getAgentSessionSDKMessagesForUi(id)
     }
   )
 

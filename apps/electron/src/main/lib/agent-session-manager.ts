@@ -10,6 +10,7 @@
 
 import { readFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, createReadStream, createWriteStream, statSync, type WriteStream } from 'node:fs'
 import { createInterface } from 'node:readline'
+import { readFile } from 'node:fs/promises'
 import { writeJsonFileAtomic, writeTextFileAtomic, readJsonFileSafe } from './safe-file'
 import { randomUUID } from 'node:crypto'
 import { rmSyncWithRetry, renameWithRetry } from './fs-retry'
@@ -600,6 +601,38 @@ export function getAgentSessionSDKMessages(id: string): SDKMessage[] {
     console.error(`[Agent 会话] 读取 SDKMessage 失败 (${id}):`, error)
     return []
   }
+}
+
+/**
+ * 工具结果中的内联图片（如截图）只服务模型上下文，renderer 不渲染其 base64。
+ * 单个会话可累积上百 MB 截图数据；读取给 UI 时剥离可显著降低 IPC 结构化克隆与渲染进程内存开销。
+ */
+const UI_INLINE_IMAGE_DATA_PATTERN = /("type":"image","data":")[A-Za-z0-9+/=]{1024,}(")/g
+/** 仅对大行做正则替换，普通消息保持零额外开销。 */
+const UI_INLINE_IMAGE_SCAN_MIN_LINE_LENGTH = 64 * 1024
+
+export function stripInlineImageDataForUi(line: string): string {
+  return line.length >= UI_INLINE_IMAGE_SCAN_MIN_LINE_LENGTH
+    ? line.replace(UI_INLINE_IMAGE_DATA_PATTERN, '$1$2')
+    : line
+}
+
+/**
+ * 供 renderer 展示的 SDKMessage 读取：异步读盘，避免大 JSONL 同步阻塞主进程事件循环；
+ * 并剥离 UI 不使用的内联图片 base64。模型上下文、恢复与 rewind 仍使用完整的同步读取。
+ */
+export async function getAgentSessionSDKMessagesForUi(id: string): Promise<SDKMessage[]> {
+  const filePath = getAgentSessionMessagesPath(id)
+  let raw: string
+  try {
+    raw = await readFile(filePath, 'utf-8')
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return []
+    console.error(`[Agent 会话] 读取 SDKMessage 失败 (${id}):`, error)
+    return []
+  }
+  const lines = raw.split('\n').filter((line) => line.trim()).map(stripInlineImageDataForUi)
+  return parseJsonlLenient<unknown>(lines, `读取 SDKMessage (${id})`).map(normalizePersistedSDKMessage)
 }
 
 /**
