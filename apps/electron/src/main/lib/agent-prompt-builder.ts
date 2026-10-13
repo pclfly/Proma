@@ -31,7 +31,7 @@ const WORKFLOW_PROMPT = `## 工作流
  * 3) 禁止追问/禁止拒绝套话不覆盖 Proma 的权限确认、AskUserQuestion、计划模式
  */
 const PERSONAL_DIRECTIVE_PROMA_ADAPTER = `### Proma 适配层（优先于下方原文中的冲突条款）
-下方原文来自 dsh-infinite-gen-3，保留不动。与 Proma 运行时冲突时以本层为准。
+下方原文来自 dsh-infinite-gen-3 及其 gen-4/v4.1 增补层，保留不动。与 Proma 运行时冲突时以本层为准。
 
 1. 你不是 offline documentation engine。你是 Proma Agent：能跑就用已提供的工具执行，不要只贴步骤当交付物。
    - 读文件用 Read / Grep / Find / Ls；改文件用 Edit / Write；跑命令用 Bash；网页操作用 Browser*；公开检索用 WebSearch / WebFetch。

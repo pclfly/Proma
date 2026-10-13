@@ -17,6 +17,7 @@ describe('Windows 一键打包流程', () => {
 
     expect(steps.map((step) => [step.command, ...step.args])).toEqual([
       ['bun', 'install', '--frozen-lockfile'],
+      ['bun', 'node_modules/electron/install.js'],
       ['bun', 'run', 'typecheck'],
       [
         'bun',
@@ -28,7 +29,7 @@ describe('Windows 一键打包流程', () => {
       ],
       ['bun', 'run', 'dist:win'],
     ])
-    expect(steps[3]).toEqual(expect.objectContaining({
+    expect(steps[4]).toEqual(expect.objectContaining({
       cwd: join(repoRoot, 'apps', 'electron'),
       env: {
         CSC_IDENTITY_AUTO_DISCOVERY: 'false',

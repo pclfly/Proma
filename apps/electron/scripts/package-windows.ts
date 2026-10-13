@@ -23,6 +23,15 @@ export function createWindowsPackageSteps(repoRoot: string): PackageStep[] {
       args: ['install', '--frozen-lockfile'],
     },
     {
+      name: '准备 Electron Windows 二进制',
+      cwd: electronDir,
+      command: 'bun',
+      args: ['node_modules/electron/install.js'],
+      env: {
+        ELECTRON_MIRROR: 'https://npmmirror.com/mirrors/electron/',
+      },
+    },
+    {
       name: 'TypeScript 类型检查',
       cwd: repoRoot,
       command: 'bun',

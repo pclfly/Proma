@@ -15,7 +15,9 @@ if errorlevel 1 (
   exit /b 1
 )
 
-bun run apps/electron/scripts/package-windows.ts
+rem Keep this batch file ASCII-only for reliable cmd.exe parsing.
+rem CALL is required because bun may resolve to bun.cmd.
+call bun run apps/electron/scripts/package-windows.ts
 set "PACKAGE_EXIT_CODE=%ERRORLEVEL%"
 
 if "%PACKAGE_EXIT_CODE%"=="0" (
