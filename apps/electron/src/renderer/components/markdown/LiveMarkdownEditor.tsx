@@ -1,3 +1,6 @@
+import { isolateHistory } from '@codemirror/commands'
+import { markdownFrontmatterGrammar } from './markdown-frontmatter-grammar'
+import { preserveMarkdownLineEndings, createMarkdownRawSource, type MarkdownRawSourceController } from './markdown-line-endings'
 import * as React from 'react'
 import { syntaxTree } from '@codemirror/language'
 import { Prec, RangeSetBuilder, StateEffect, StateField, type EditorState, type Extension } from '@codemirror/state'
@@ -9,16 +12,12 @@ import {
   createLiveMarkdownFindController,
   type ResolveLiveMarkdownImageSrc,
   type SaveLiveMarkdownPastedImage,
-  type ChangeLiveMarkdownProperties,
   type LiveMarkdownFindOptions,
 } from './LiveMarkdownPreview'
 import {
   shouldRebuildMarkdownHeadingDecorations,
   shouldRebuildMarkdownSyntaxDecorations,
 } from './live-markdown-lifecycle'
-export type { ChangeLiveMarkdownProperties } from './LiveMarkdownPreview'
-export type { LiveMarkdownPropertyEntry } from './live-markdown-frontmatter'
-import type { LiveMarkdownPropertyEntry } from './live-markdown-frontmatter'
 
 export type { LiveMarkdownFindOptions } from './LiveMarkdownPreview'
 
@@ -90,10 +89,10 @@ interface LiveMarkdownEditorProps {
   resolveImageSrc?: ResolveLiveMarkdownImageSrc
   /** 保存剪贴板图片并返回其可写入 Markdown 的相对来源。 */
   savePastedImage?: SaveLiveMarkdownPastedImage
-  /** Vault adapter callback for editing flat YAML Properties. */
-  onChangeProperties?: ChangeLiveMarkdownProperties
-  /** Vault-only opt-in for replacing flat YAML frontmatter with editable Properties. */
+  /** Vault显式启用嵌套Properties；编辑在当前CodeMirror文档上应用局部事务。 */
   enableProperties?: boolean
+  /** 仅 Vault 提供：Callout 与表格单元格内的 [[双链]] 可点击打开。 */
+  onOpenWikiLink?: (target: string) => void
   extensions?: readonly Extension[]
   className?: string
 }
@@ -286,6 +285,7 @@ const markdownSyntaxVisibility: Extension[] = [
 
 function createMeasureScheduler(
   getView: () => MeasureView | null,
+  onError: (error: unknown) => void,
   scheduleFrame: (callback: FrameRequestCallback) => number = requestAnimationFrame,
   cancelFrame: (handle: number) => void = cancelAnimationFrame,
 ): { request: () => void; dispose: () => void } {
@@ -295,7 +295,7 @@ function createMeasureScheduler(
       if (frame !== null) return
       frame = scheduleFrame(() => {
         frame = null
-        getView()?.requestMeasure()
+        try { getView()?.requestMeasure() } catch (error) { onError(error) }
       })
     },
     dispose: () => {
@@ -321,15 +321,21 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
   readOnly = false,
   resolveImageSrc,
   savePastedImage,
-  onChangeProperties,
   enableProperties = false,
+  onOpenWikiLink,
   extensions = [],
   className,
 }, ref): React.ReactElement {
   const hostRef = React.useRef<HTMLDivElement>(null)
+  const textareaRef = React.useRef<HTMLTextAreaElement>(null)
+  const [failed, setFailed] = React.useState(false)
+  const failedRef = React.useRef(false)
+  const mountedRef = React.useRef(true)
   const viewRef = React.useRef<EditorView | null>(null)
+  const rawSourceRef = React.useRef<MarkdownRawSourceController | null>(null)
   const instanceRef = React.useRef<Instance | null>(null)
   const valueRef = React.useRef(value)
+  const previousValueRef = React.useRef(value)
   const findControllerRef = React.useRef(createLiveMarkdownFindController())
   const findQueryRef = React.useRef<{ query: string; options: LiveMarkdownFindOptions; activeIndex: number } | null>(null)
   const findUpdateListenersRef = React.useRef(new Set<(update: { matchCount: number; activeIndex: number }) => void>())
@@ -338,21 +344,43 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
   const onCancelRef = React.useRef(onCancel)
   const onReadyRef = React.useRef(onReady)
   const onTextSelectionChangeRef = React.useRef(onTextSelectionChange)
-  const onChangePropertiesRef = React.useRef(onChangeProperties)
-  valueRef.current = value
+  // 扩展只在挂载时创建一次；用 ref 保持最新的 Vault 打开回调，避免重建编辑器。
+  const onOpenWikiLinkRef = React.useRef(onOpenWikiLink)
+  onOpenWikiLinkRef.current = onOpenWikiLink
+  const openWikiLink = React.useCallback((target: string): void => { onOpenWikiLinkRef.current?.(target) }, [])
+  if (previousValueRef.current !== value) {
+    valueRef.current = value
+    previousValueRef.current = value
+  }
   onChangeRef.current = onChange
   onSaveRef.current = onSave
   onCancelRef.current = onCancel
   onReadyRef.current = onReady
   onTextSelectionChangeRef.current = onTextSelectionChange
-  onChangePropertiesRef.current = onChangeProperties
 
-  const onChangePropertiesProxy = React.useCallback((entries: LiveMarkdownPropertyEntry[], documentValue?: string): void => {
-    // The extension is retained for the editor lifetime. Forward its live
-    // CodeMirror snapshot so the Vault adapter never falls back to a stale
-    // controlled prop after a body edit.
-    onChangePropertiesRef.current?.(entries, documentValue)
+  React.useEffect(() => {
+    mountedRef.current = true
+    return () => { mountedRef.current = false }
   }, [])
+  const externalSyncRef = React.useRef<string | null>(null)
+  const reportFailure = React.useCallback((error: unknown): void => {
+    if (!mountedRef.current || failedRef.current) return
+    failedRef.current = true
+    console.warn('[Markdown] 编辑器异常，已切换源码模式:', error)
+    // 外部同步失败保留传入新值，不能把尚未更新的旧view回传为本地编辑。
+    const externalDocument = externalSyncRef.current
+    if (externalDocument !== null) valueRef.current = externalDocument
+    else {
+      try { valueRef.current = preserveMarkdownLineEndings(valueRef.current, viewRef.current?.state.doc.toString() ?? instanceRef.current?.getDoc() ?? valueRef.current) } catch { /* 保留最后有效文档 */ }
+    }
+    setFailed(true)
+    if (!readOnly && externalDocument === null) {
+      try { onChangeRef.current(valueRef.current) } catch (callbackError) { console.warn('[Markdown] 草稿回调失败:', callbackError) }
+    }
+  }, [readOnly])
+  const safely = React.useCallback((action: () => void): void => {
+    try { action() } catch (error) { reportFailure(error) }
+  }, [reportFailure])
 
   const applyFindMatches = React.useCallback((query: string, options: LiveMarkdownFindOptions, activeIndex: number, scrollIntoView: boolean): number => {
     const view = viewRef.current
@@ -366,23 +394,31 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
       activeMatchFrom: nextActiveIndex >= 0 ? matches[nextActiveIndex]!.from : null,
     })
     const findEffect = liveMarkdownFindMatchesEffect.of({ matches, activeIndex: nextActiveIndex })
-    view.dispatch({
+    safely(() => view.dispatch({
       effects: scrollIntoView && nextActiveIndex >= 0
         ? [findEffect, EditorView.scrollIntoView(matches[nextActiveIndex]!.from, { y: 'center', yMargin: 24 })]
         : findEffect,
-    })
+    }))
     findUpdateListenersRef.current.forEach((listener) => listener({ matchCount: matches.length, activeIndex: nextActiveIndex }))
     return matches.length
-  }, [])
+  }, [safely])
 
   React.useImperativeHandle(ref, () => ({
-    focus: () => instanceRef.current?.focus(),
-    insert: (text) => instanceRef.current?.insert(text),
+    focus: () => safely(() => { if (failedRef.current) textareaRef.current?.focus(); else instanceRef.current?.focus() }),
+    insert: (text) => safely(() => {
+      if (readOnly) return
+      const textarea = textareaRef.current
+      if (failedRef.current && textarea) {
+        textarea.setRangeText(text, textarea.selectionStart, textarea.selectionEnd, 'end')
+        valueRef.current = preserveMarkdownLineEndings(valueRef.current, textarea.value)
+        onChangeRef.current(valueRef.current)
+      } else instanceRef.current?.insert(text)
+    }),
     scrollToPosition: (position) => {
       const view = viewRef.current
       if (!view) return
       const safePosition = Math.max(0, Math.min(position, view.state.doc.length))
-      view.dispatch({ effects: EditorView.scrollIntoView(safePosition, { y: 'start', yMargin: 8 }) })
+      safely(() => view.dispatch({ effects: EditorView.scrollIntoView(safePosition, { y: 'start', yMargin: 8 }) }))
     },
     setFindMatches: (query, options, activeIndex) => applyFindMatches(query, options, activeIndex, true),
     setActiveFindMatch: (activeIndex) => {
@@ -397,12 +433,12 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
         ...findState,
         activeMatchFrom: matches[nextActiveIndex]!.from,
       })
-      view.dispatch({
+      safely(() => view.dispatch({
         effects: [
           liveMarkdownFindMatchesEffect.of({ matches, activeIndex: nextActiveIndex }),
           EditorView.scrollIntoView(matches[nextActiveIndex]!.from, { y: 'center', yMargin: 24 }),
         ],
-      })
+      }))
       findUpdateListenersRef.current.forEach((listener) => listener({ matchCount: matches.length, activeIndex: nextActiveIndex }))
     },
     clearFindMatches: () => {
@@ -414,7 +450,7 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
         options: { caseSensitive: false, wholeWord: false, regex: false },
         activeMatchFrom: null,
       })
-      view.dispatch({ effects: liveMarkdownFindMatchesEffect.of({ matches: [], activeIndex: -1 }) })
+      safely(() => view.dispatch({ effects: liveMarkdownFindMatchesEffect.of({ matches: [], activeIndex: -1 }) }))
       findUpdateListenersRef.current.forEach((listener) => listener({ matchCount: 0, activeIndex: -1 }))
     },
     subscribeToFindUpdates: (listener) => {
@@ -424,14 +460,22 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
     getPositionAtViewportY: (viewportY) => {
       const view = viewRef.current
       if (!view) return null
-      const documentHeight = Math.max(0, (viewportY - view.documentTop) / view.scaleY)
-      return view.lineBlockAtHeight(documentHeight).from
+      let position: number | null = null
+      safely(() => {
+        const documentHeight = Math.max(0, (viewportY - view.documentTop) / view.scaleY)
+        position = view.lineBlockAtHeight(documentHeight).from
+      })
+      return position
     },
     getHost: () => hostRef.current,
     getView: () => viewRef.current,
-  }), [])
+  }), [readOnly, safely])
 
   React.useEffect(() => {
+    if (failed) {
+      onReadyRef.current?.()
+      return
+    }
     const host = hostRef.current
     if (!host) return
 
@@ -442,15 +486,35 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
     let ready = false
     let disposed = false
     let localInstance: Instance | null = null
-    const instancePromise = Promise.resolve(ink(mount, {
+    const fail = (error: unknown): void => { if (!disposed) reportFailure(error) }
+    const rawSource = createMarkdownRawSource(valueRef.current, () => externalSyncRef.current)
+    rawSourceRef.current = rawSource
+    const instancePromise = Promise.resolve().then(() => {
+      if (disposed) return null
+      return ink(mount, {
       doc: valueRef.current,
       files: { clipboard: false, dragAndDrop: false, injectMarkup: true },
-      hooks: { afterUpdate: (nextValue) => { if (ready) onChangeRef.current(nextValue) } },
+      hooks: { afterUpdate: (nextValue) => {
+        if (ready && !disposed) {
+          const raw = rawSource.getSource()
+          const preserved = raw.replace(/\r\n?/g, '\n') === nextValue ? raw : preserveMarkdownLineEndings(valueRef.current, nextValue)
+          valueRef.current = preserved
+          onChangeRef.current(preserved)
+        }
+      } },
       interface: {
         appearance: 'auto', attribution: false, autocomplete: false, images: false,
         lists: true, readonly: readOnly, spellcheck: false, toolbar: false,
       },
-      plugins: [
+      plugins: [...[
+        rawSource.extension,
+        EditorView.updateListener.of((update) => {
+          // EOL-only Undo/Redo没有docChanged，但仍需向受控父组件回传精确原文。
+          if (!ready || disposed || update.docChanged || externalSyncRef.current !== null) return
+          const source = rawSource.getSource()
+          if (source !== valueRef.current) { valueRef.current = source; onChangeRef.current(source) }
+        }),
+        EditorView.exceptionSink.of(fail),
         Prec.highest(keymap.of([{
           key: 'Mod-s',
           run: () => {
@@ -493,7 +557,7 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
           }
           const scheduleSelectionReport = (): void => {
             if (selectionFrame) cancelAnimationFrame(selectionFrame)
-            selectionFrame = requestAnimationFrame(reportSelection)
+            selectionFrame = requestAnimationFrame(() => { if (!disposed) safely(reportSelection) })
           }
           // 只在鼠标松开后展示动作，不要在拖选过程中不断弹出、跟随选区移动。
           // rAF 仍可覆盖 ink-mde 只读预览的 selection transaction 时序。
@@ -527,25 +591,33 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
           }
         }),
         ...markdownSyntaxVisibility,
-        createLiveMarkdownBlockPreview(resolveImageSrc, savePastedImage, onChangePropertiesProxy, enableProperties, findControllerRef.current),
+        createLiveMarkdownBlockPreview(resolveImageSrc, savePastedImage, enableProperties, findControllerRef.current, onOpenWikiLink ? openWikiLink : undefined),
         ...extensions,
-      ].map((extension) => ({ type: 'default' as const, value: extension })),
+      ].map((extension) => ({ type: 'default' as const, value: extension })), { type: 'grammar', value: markdownFrontmatterGrammar }],
       search: false,
       toolbar: { bold: false, code: false, codeBlock: false, heading: false, image: false, italic: false, link: false, list: false, orderedList: false, quote: false, taskList: false, upload: false },
-    }))
+      })
+    })
     void instancePromise.then((instance) => {
+      if (!instance) return
       localInstance = instance
-      if (disposed) {
+      if (disposed || failedRef.current) {
         instance.destroy()
         return
       }
       instanceRef.current = instance
-      if (instance.getDoc() !== valueRef.current) instance.update(valueRef.current)
+      if (instance.getDoc() !== valueRef.current.replace(/\r\n?/g, '\n')) {
+        externalSyncRef.current = valueRef.current
+        try { instance.update(valueRef.current) }
+        catch (error) { fail(error) }
+        finally { externalSyncRef.current = null }
+      }
+      if (failedRef.current) return
       ready = true
       onReadyRef.current?.()
-    })
+    }).catch(fail)
 
-    const scheduler = createMeasureScheduler(() => viewRef.current)
+    const scheduler = createMeasureScheduler(() => viewRef.current, fail)
     const resizeObserver = new ResizeObserver(scheduler.request)
     resizeObserver.observe(host)
     const onTransitionEnd = (event: TransitionEvent): void => {
@@ -561,19 +633,33 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
       resizeObserver.disconnect()
       scheduler.dispose()
       window.removeEventListener('transitionend', onTransitionEnd)
-      if (localInstance) localInstance.destroy()
+      try {
+        if (localInstance) localInstance.destroy()
+        else viewRef.current?.destroy()
+      } catch (error) { console.warn('[Markdown] 销毁异常编辑器失败:', error) }
+      viewRef.current = null
       if (instanceRef.current === localInstance) instanceRef.current = null
+      if (rawSourceRef.current === rawSource) rawSourceRef.current = null
       mount.remove()
     }
   // The editor owns its document state after initialization; external reloads use the effect below.
   // `readOnly` 是 ink-mde construction option；文件来源切换由调用方的 editor key 显式重建，
   // 不要因 render callback 引用变化而意外销毁 CodeMirror，避免丢失选区与滚动状态。
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [readOnly])
+  }, [readOnly, failed, reportFailure, safely])
 
   React.useEffect(() => {
     const instance = instanceRef.current
-    if (!instance || instance.getDoc() === value) return
+    if (!instance || failed) return
+    externalSyncRef.current = value
+    try {
+    if (instance.getDoc() === value.replace(/\r\n?/g, '\n')) {
+      const source = rawSourceRef.current
+      if (source && source.getSource() !== value) {
+        viewRef.current?.dispatch({ effects: source.synchronize(value), annotations: isolateHistory.of('full'), userEvent: 'input.external' })
+      }
+      return
+    }
     // External document refreshes (for example an Agent writing the opened Vault
     // note) must not eject a reader back to the top of a long CodeMirror document.
     const scroller = hostRef.current?.querySelector<HTMLElement>('.cm-scroller')
@@ -586,7 +672,22 @@ export const LiveMarkdownEditor = React.forwardRef<LiveMarkdownEditorHandle, Liv
         scroller.scrollLeft = scrollLeft
       })
     }
-  }, [value])
+    } catch (error) { reportFailure(error) }
+    finally { externalSyncRef.current = null }
+  }, [value, failed, reportFailure])
 
-  return <div ref={hostRef} className={cn('live-markdown-editor vault-ink-mde h-full min-h-0', className)} />
+  return <div ref={hostRef} className={cn('live-markdown-editor vault-ink-mde h-full min-h-0', className)}>
+    {failed && <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 items-center justify-between gap-2 px-3 py-2 text-xs text-muted-foreground" role="status">
+        <span>Markdown 预览异常，已切换源码模式。内容仍可{readOnly ? '阅读' : '编辑和保存'}。</span>
+        <button type="button" className="rounded px-2 py-1 hover:bg-muted" onClick={() => { failedRef.current = false; setFailed(false) }}>重试预览</button>
+      </div>
+      <textarea ref={textareaRef} aria-label="Markdown 源码（降级模式）" className="min-h-0 w-full flex-1 resize-none bg-transparent p-3 font-mono text-sm outline-none" value={valueRef.current} readOnly={readOnly}
+        onChange={(event) => { valueRef.current = preserveMarkdownLineEndings(valueRef.current, event.target.value); onChangeRef.current(valueRef.current) }}
+        onKeyDown={(event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); if (!readOnly) onSaveRef.current?.() }
+          if (event.key === 'Escape') onCancelRef.current?.()
+        }} />
+    </div>}
+  </div>
 })

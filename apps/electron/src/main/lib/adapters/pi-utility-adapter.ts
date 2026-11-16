@@ -12,7 +12,11 @@ import {
 } from '@proma/shared'
 import type { PermissionResult, CanUseToolOptions } from '../agent-permission-service'
 import { AgentRuntimeClient } from '../agent-runtime-client'
+import { AgentQueryDrainError } from '../agent-query-drain'
 import type { PiAgentQueryOptions } from './pi-agent-adapter'
+import { serializePiQueryInput } from './pi-query-input'
+import { NetworkRequestError } from '../network/network-errors'
+import { parseUtilityNetworkFailure } from '../network/utility-network-reporting'
 
 type PendingQuery = {
   queryId: string
@@ -25,9 +29,10 @@ type PendingQuery = {
   runtimeFailed: boolean
 }
 
-type CapabilityRequest = {
+interface CapabilityRequest {
   controller: AbortController
   queryId: string
+  requestId: string
 }
 
 type QueryAbortResponse = {
@@ -65,13 +70,29 @@ export class PiUtilityAdapter {
       runtimeFailed: false,
     }
     this.pendingQueries.set(queryId, pending)
-    client.setRequestHandler((request) => this.handleRuntimeRequest(request))
+    client.setRequestHandler((request) => this.handleRuntimeRequest(request, queryId))
     const unsubscribe = client.onEvent((event) => this.handleRuntimeEvent(event))
 
     try {
+      // 网络运行时在测试/CLI/旧环境中可能不可用；不因此阻断 Agent 查询。
+      let networkEpoch = 0
+      let routeEpoch = 0
+      try {
+        const { getRouteEpoch, systemNetwork } = await import('../network/system-network-runtime')
+        await systemNetwork.ensureReady()
+        networkEpoch = systemNetwork.snapshot().networkEpoch
+        routeEpoch = getRouteEpoch()
+      } catch {
+        // 保持 epoch 0；utility 侧仍可独立运行。
+      }
       await client.call(
         AGENT_RUNTIME_METHODS.QUERY_START,
-        { queryId, input: serializeQueryInput(input) },
+        {
+          queryId,
+          input: serializePiQueryInput(input),
+          networkEpoch,
+          routeEpoch,
+        },
         { queryId },
       )
       pending.accepted = true
@@ -95,7 +116,7 @@ export class PiUtilityAdapter {
           { queryId, timeoutMs: 5_000 },
         ).catch(() => {})
       }
-      await client.stop()
+      await this.stopRuntime(pending)
     }
   }
 
@@ -118,7 +139,7 @@ export class PiUtilityAdapter {
         // QUERY_ABORT confirms the utility query has ended. Close its process
         // before resolving deletion's stop-and-drain barrier instead of relying
         // on the async iterator's later finally block.
-        await pending.client.stop()
+        await this.stopRuntime(pending)
       }).catch(async (error) => {
         console.warn(`[PiUtilityAdapter] abort failed: sessionId=${sessionId}`, error)
         await this.failStoppedQuery(pending, error)
@@ -133,7 +154,19 @@ export class PiUtilityAdapter {
       this.abortCapabilitiesForQuery(pending.queryId)
       pending.queue.fail(error)
     }
-    await pending.client.stop()
+    await this.stopRuntime(pending)
+  }
+
+  /**
+   * 子进程退出未被确认时不能把 query 当作已收尾；用专用清理错误让上层隔离该会话，
+   * 而不是把“已发送 kill”当成“旧运行时已停止写入”。
+   */
+  private async stopRuntime(pending: PendingQuery): Promise<void> {
+    try {
+      await pending.client.stop()
+    } catch (error) {
+      throw new AgentQueryDrainError(error)
+    }
   }
 
   private abortCapabilitiesForQuery(queryId: string): void {
@@ -174,30 +207,51 @@ export class PiUtilityAdapter {
     for (const pending of this.pendingQueries.values()) {
       pending.runtimeFailed = true
       pending.queue.fail(new Error('Agent utility stopped'))
-      void pending.client.stop()
+      // stop 现在可能在退出未确认时拒绝；应用退出阶段只记录，不能产生 unhandled rejection。
+      void pending.client.stop().catch((error: unknown) => {
+        console.warn(`[PiUtilityAdapter] 停止运行时进程失败: sessionId=${pending.sessionId}`, error)
+      })
     }
     this.pendingQueries.clear()
     for (const { controller } of this.capabilityAbortControllers.values()) controller.abort()
     this.capabilityAbortControllers.clear()
   }
 
-  async handleRuntimeRequest(request: AgentRuntimeRequest): Promise<unknown> {
+  private registerCapability(requestId: string, queryId: string): CapabilityRequest {
+    const key = JSON.stringify([queryId, requestId])
+    if (this.capabilityAbortControllers.has(key)) throw new Error('Duplicate active Agent capability request')
+    const capability = { controller: new AbortController(), queryId, requestId }
+    this.capabilityAbortControllers.set(key, capability)
+    return capability
+  }
+
+  private releaseCapability(capability: CapabilityRequest): void {
+    const key = JSON.stringify([capability.queryId, capability.requestId])
+    if (this.capabilityAbortControllers.get(key) === capability) this.capabilityAbortControllers.delete(key)
+  }
+
+  async handleRuntimeRequest(request: AgentRuntimeRequest, originQueryId?: string): Promise<unknown> {
     const payload = request.payload as Record<string, unknown> | undefined
     const queryId = typeof payload?.queryId === 'string' ? payload.queryId : undefined
     const pending = queryId ? this.pendingQueries.get(queryId) : undefined
 
     if (request.method === AGENT_RUNTIME_METHODS.CAPABILITY_CANCEL) {
       const requestId = typeof payload?.requestId === 'string' ? payload.requestId : ''
-      this.capabilityAbortControllers.get(requestId)?.controller.abort()
+      const owner = originQueryId ?? request.queryId ?? queryId
+      const matches = owner
+        ? [this.capabilityAbortControllers.get(JSON.stringify([owner, requestId]))].filter((item): item is CapabilityRequest => Boolean(item))
+        : Array.from(this.capabilityAbortControllers.values()).filter((item) => item.requestId === requestId)
+      if (matches.length === 1) matches[0]!.controller.abort()
       return { accepted: true }
     }
 
+    if (originQueryId && queryId !== originQueryId) throw new Error('Agent capability belongs to another query transport')
     if (!pending) throw new Error(`No active Agent query: ${queryId ?? 'unknown'}`)
 
     if (request.method === AGENT_RUNTIME_METHODS.CAPABILITY_CAN_USE_TOOL) {
       if (!pending.input.canUseTool) throw new Error(`No canUseTool handler: ${pending.sessionId}`)
-      const controller = new AbortController()
-      this.capabilityAbortControllers.set(request.requestId, { controller, queryId: pending.queryId })
+      const capability = this.registerCapability(request.requestId, pending.queryId)
+      const { controller } = capability
       try {
         const options = (payload?.options && typeof payload.options === 'object' ? payload.options : {}) as Record<string, unknown>
         return await pending.input.canUseTool(
@@ -206,7 +260,7 @@ export class PiUtilityAdapter {
           { ...options, signal: controller.signal } as CanUseToolOptions,
         ) as PermissionResult
       } finally {
-        this.capabilityAbortControllers.delete(request.requestId)
+        this.releaseCapability(capability)
       }
     }
 
@@ -214,8 +268,8 @@ export class PiUtilityAdapter {
       const toolName = String(payload?.toolName ?? '')
       const tool = pending.input.customTools?.find((candidate) => candidate.name === toolName)
       if (!tool) throw new Error(`No custom tool handler: ${toolName}`)
-      const controller = new AbortController()
-      this.capabilityAbortControllers.set(request.requestId, { controller, queryId: pending.queryId })
+      const capability = this.registerCapability(request.requestId, pending.queryId)
+      const { controller } = capability
       try {
         const execute = tool.execute as unknown as (
           toolCallId: string,
@@ -224,7 +278,7 @@ export class PiUtilityAdapter {
         ) => Promise<unknown>
         return await execute(String(payload?.toolCallId ?? ''), asRecord(payload?.input), controller.signal)
       } finally {
-        this.capabilityAbortControllers.delete(request.requestId)
+        this.releaseCapability(capability)
       }
     }
 
@@ -239,6 +293,41 @@ export class PiUtilityAdapter {
     if (request.method === AGENT_RUNTIME_METHODS.CAPABILITY_XAI_OAUTH_REFRESHED) {
       await pending.input.onXaiOAuthCredentialsRefreshed?.(payload?.credentials as never)
       return { accepted: true }
+    }
+
+    if (request.method === AGENT_RUNTIME_METHODS.CAPABILITY_KNOWLEDGE_MUTATION_BEGIN
+      || request.method === AGENT_RUNTIME_METHODS.CAPABILITY_KNOWLEDGE_MUTATION_FINISH
+      || request.method === AGENT_RUNTIME_METHODS.CAPABILITY_KNOWLEDGE_MUTATION_WITNESS) {
+      // 不信 payload 自称的 query：envelope 与已解析的 pending 必须一致。
+      if (request.queryId !== pending.queryId || payload?.sessionId !== pending.sessionId
+        || (request.sessionId !== undefined && request.sessionId !== pending.sessionId)) {
+        throw new Error('Knowledge mutation capability belongs to another query')
+      }
+      const observer = pending.input.knowledgeMutationObserver
+      const mutation = payload?.request
+      if (!observer || !mutation || typeof mutation !== 'object') {
+        return request.method === AGENT_RUNTIME_METHODS.CAPABILITY_KNOWLEDGE_MUTATION_BEGIN ? null : { accepted: false }
+      }
+      const capability = this.registerCapability(request.requestId, pending.queryId)
+      const { signal } = capability.controller
+      try {
+        if (request.method === AGENT_RUNTIME_METHODS.CAPABILITY_KNOWLEDGE_MUTATION_WITNESS) {
+          if (request.sessionId !== pending.sessionId || !observer.readWitness) return undefined
+          const input = mutation as Record<string, unknown>
+          if (typeof input.ticketId !== 'string' || typeof input.toolCallId !== 'string'
+            || typeof input.path !== 'string' || input.path.length > 32768) return undefined
+          const witness = await observer.readWitness({ ticketId: input.ticketId, toolCallId: input.toolCallId, path: input.path }, signal)
+          return signal.aborted ? undefined : witness
+        }
+        if (request.method === AGENT_RUNTIME_METHODS.CAPABILITY_KNOWLEDGE_MUTATION_BEGIN) {
+          const ticket = await observer.begin(mutation as never, signal)
+          return signal.aborted ? null : ticket
+        }
+        await observer.finish(mutation as never, signal)
+        return { accepted: !signal.aborted }
+      } finally {
+        this.releaseCapability(capability)
+      }
     }
 
     throw new Error(`Unsupported Agent runtime request: ${request.method}`)
@@ -273,6 +362,16 @@ export class PiUtilityAdapter {
     const pending = this.pendingQueries.get(queryId)
     if (!pending) return
 
+    if (event.method === AGENT_RUNTIME_METHODS.EVENT_NETWORK_FAILURE) {
+      void (async () => {
+        const { networkDiagnostics, networkRecovery, systemNetwork } = await import('../network/system-network-runtime')
+        const notice = parseUtilityNetworkFailure(payload, systemNetwork.snapshot().networkEpoch)
+        if (!notice) return
+        networkDiagnostics.recordUtilityFailure(notice)
+        networkRecovery.notify('transport-error', new NetworkRequestError(notice.failure, notice.scope))
+      })().catch(() => undefined)
+      return
+    }
     if (event.method === AGENT_RUNTIME_METHODS.EVENT_QUERY) {
       const message = payload?.message
       if (message && typeof message === 'object') pending.queue.push(message as SDKMessage)
@@ -313,32 +412,6 @@ export class PiUtilityAdapter {
         )
         break
     }
-  }
-}
-
-function serializeQueryInput(input: PiAgentQueryOptions): Record<string, unknown> {
-  const {
-    abortSignal: _abortSignal,
-    canUseTool: _canUseTool,
-    customTools,
-    onSessionId: _onSessionId,
-    onPiEntryBindings: _onPiEntryBindings,
-    onModelResolved: _onModelResolved,
-    onContextWindow: _onContextWindow,
-    onRetry: _onRetry,
-    onSkillActivated: _onSkillActivated,
-    onCodexOAuthCredentialsRefreshed: _onCodexOAuthCredentialsRefreshed,
-    onGithubCopilotOAuthCredentialsRefreshed: _onGithubCopilotOAuthCredentialsRefreshed,
-    onXaiOAuthCredentialsRefreshed: _onXaiOAuthCredentialsRefreshed,
-    ...serializable
-  } = input
-  const serializedCustomTools = (customTools ?? []).map((tool) => {
-    const { execute: _execute, ...descriptor } = tool as unknown as Record<string, unknown>
-    return descriptor
-  })
-  return {
-    ...serializable,
-    ...(serializedCustomTools.length > 0 ? { customTools: serializedCustomTools } : {}),
   }
 }
 

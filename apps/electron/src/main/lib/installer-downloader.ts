@@ -6,13 +6,12 @@
  */
 
 import { createHash } from 'crypto'
-import { createWriteStream, existsSync, promises as fsp } from 'fs'
-import { get as httpsGet } from 'https'
-import { get as httpGet, IncomingMessage } from 'http'
+import { existsSync, promises as fsp } from 'fs'
 import path from 'path'
-import { URL } from 'url'
 
 import { app, BrowserWindow, shell } from 'electron'
+import { createHostSystemFetch } from './network/host-system-fetch'
+import { writeDownloadBody } from './network/download-body'
 
 import {
   INSTALLER_IPC_CHANNELS,
@@ -101,127 +100,41 @@ function downloadToFile(
   key: string,
   sender: BrowserWindow | undefined,
 ): Promise<void> {
-  return new Promise((resolve, reject) => {
-    let cancelled = false
-    let requestToAbort: { destroy: (err?: Error) => void } | null = null
+  const controller = new AbortController()
+  const cancel = () => controller.abort()
+  activeDownloads.set(key, cancel)
+  const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15 * 60_000)])
 
-    const cancel = () => {
-      cancelled = true
-      if (requestToAbort) {
-        requestToAbort.destroy(new Error('cancelled'))
-      }
-    }
-    activeDownloads.set(key, cancel)
-
-    const cleanup = () => {
-      activeDownloads.delete(key)
-    }
-
-    const fileStream = createWriteStream(filePath)
-
-    const getModule = (u: URL) => (u.protocol === 'http:' ? httpGet : httpsGet)
-
-    const doGet = (targetUrl: string, redirectsLeft: number) => {
-      let parsed: URL
-      try {
-        parsed = new URL(targetUrl)
-      } catch (e) {
-        fileStream.close()
-        cleanup()
-        reject(e)
-        return
-      }
-
-      const request = getModule(parsed)(targetUrl, (res: IncomingMessage) => {
-        // 处理重定向
-        if (
-          res.statusCode &&
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
-          res.resume()
-          if (redirectsLeft <= 0) {
-            fileStream.close()
-            cleanup()
-            reject(new Error('重定向次数过多'))
-            return
-          }
-          const next = new URL(res.headers.location, parsed).toString()
-          doGet(next, redirectsLeft - 1)
-          return
-        }
-
-        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-          fileStream.close()
-          cleanup()
-          reject(new Error(`HTTP ${res.statusCode ?? '?'}`))
-          res.resume()
-          return
-        }
-
-        const totalFromHeader = Number(res.headers['content-length'] ?? 0)
-        const total = totalFromHeader > 0 ? totalFromHeader : source.sizeBytes
-        let downloaded = 0
-        let lastEmit = 0
-        let lastEmitBytes = 0
-
-        res.on('data', (chunk: Buffer) => {
-          if (cancelled) return
-          downloaded += chunk.length
+  let response: Response | undefined
+  return (async () => {
+    try {
+      response = await createHostSystemFetch('download')(url, { signal, redirect: 'follow' })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const total = Number(response.headers.get('content-length')) || source.sizeBytes
+      let downloaded = 0
+      let lastEmit = Date.now()
+      let lastBytes = 0
+      await writeDownloadBody(response, filePath, {
+        signal,
+        onProgress: (received) => {
+          downloaded = received
           const now = Date.now()
-          if (now - lastEmit >= 250 || downloaded === total) {
-            const elapsed = (now - lastEmit) / 1000 || 1
-            const speed = Math.round((downloaded - lastEmitBytes) / elapsed)
-            lastEmit = now
-            lastEmitBytes = downloaded
-            emitProgress(sender, { key, downloaded, total, speed })
-          }
-        })
-
-        res.pipe(fileStream)
-
-        fileStream.on('finish', () => {
-          fileStream.close()
-          cleanup()
-          if (cancelled) {
-            reject(new Error('cancelled'))
-          } else {
-            // 最终再发一次 100% 进度
-            emitProgress(sender, {
-              key,
-              downloaded: total,
-              total,
-              speed: 0,
-            })
-            resolve()
-          }
-        })
-
-        fileStream.on('error', (err) => {
-          fileStream.close()
-          cleanup()
-          reject(err)
-        })
-
-        res.on('error', (err) => {
-          fileStream.close()
-          cleanup()
-          reject(err)
-        })
+          if (now - lastEmit < 250 && downloaded !== total) return
+          const speed = Math.round((downloaded - lastBytes) / ((now - lastEmit) / 1e3 || 1))
+          lastEmit = now
+          lastBytes = downloaded
+          emitProgress(sender, { key, downloaded, total, speed })
+        },
       })
-
-      requestToAbort = request
-
-      request.on('error', (err: Error) => {
-        fileStream.close()
-        cleanup()
-        reject(err)
-      })
+      emitProgress(sender, { key, downloaded, total: total || downloaded, speed: 0 })
+    } catch (error) {
+      if (controller.signal.aborted) throw new Error('cancelled')
+      throw error
+    } finally {
+      if (activeDownloads.get(key) === cancel) activeDownloads.delete(key)
+      await response?.body?.cancel().catch(() => {})
     }
-
-    doGet(url, 5)
-  })
+  })()
 }
 
 function emitProgress(sender: BrowserWindow | undefined, payload: InstallerProgressPayload) {

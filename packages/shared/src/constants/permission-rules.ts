@@ -8,6 +8,7 @@
 /** 始终安全的工具（免询问） */
 export const SAFE_TOOLS: readonly string[] = [
   'Read',            // 文件读取
+  'ReadContext',     // 仅按引用读取当前会话分支已有原文；无任意路径或工具重放
   'Glob',            // 文件名搜索
   'Grep',            // 内容搜索
   // Pi 受管浏览器：网页隔离、下载与弹窗策略已在主进程处理，网页权限默认拒绝。

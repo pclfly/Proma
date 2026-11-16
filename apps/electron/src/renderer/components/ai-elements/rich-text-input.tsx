@@ -550,7 +550,8 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
         CodeBlockLowlight.configure({
           lowlight,
           HTMLAttributes: {
-            class: 'rounded-md p-3 font-mono text-sm',
+            // 相对阅读根只缩放一次，medium保持原14px；pre code继承，避免再次乘比例。
+            class: 'rounded-md p-3 font-mono text-[0.933333em]',
           },
         }),
       ] : []),
@@ -708,11 +709,11 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
       attributes: {
         class: cn(
           'prose dark:prose-invert max-w-none focus:outline-none',
-          'min-h-[101px] w-full text-[15px] leading-[1.6]',
+          'min-h-[101px] w-full text-[length:var(--md-preview-font-size,15px)] leading-[1.6]',
           '[&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
           '[&_pre]:rounded-md [&_pre]:p-3',
-          '[&_code]:bg-muted [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-sm [&_code]:text-foreground',
-          '[&_pre_code]:bg-transparent [&_pre_code]:p-0'
+          '[&_code]:bg-muted [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-[0.875em] [&_code]:text-foreground',
+          '[&_pre_code]:bg-transparent [&_pre_code]:p-0 [&_pre_code]:text-[1em]'
         ),
       },
       // 监听 IME 输入状态
@@ -1286,7 +1287,9 @@ export const RichTextInput = forwardRef<RichTextInputHandle, RichTextInputProps>
           className
         )}
       >
-      <EditorContent editor={editor} className="w-full" />
+      <div data-proma-composer="true" className="w-full">
+        <EditorContent editor={editor} className="w-full" />
+      </div>
       {/* 折叠/展开切换按钮 — sticky 悬浮在滚动区域内 */}
       {showCollapseToggle && (
         <Tooltip>

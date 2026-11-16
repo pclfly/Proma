@@ -22,6 +22,7 @@ import {
   ContextMenuSeparator,
 } from '@/components/ui/context-menu'
 import {
+  fileResolutionCacheKey,
   getFileName,
   getFilePathDisplayPath,
   isAbsoluteFilePath,
@@ -40,9 +41,7 @@ interface FileResolutionCacheEntry {
 /** 文件存在性缓存（模块级共享，避免重复 IPC）。key 包含会话授权上下文。 */
 const fileExistsCache = new Map<string, FileResolutionCacheEntry>()
 const fileResolutionRequests = new Map<string, Promise<FileResolutionCacheEntry>>()
-function existsCacheKey(filePath: string, bases: string[], sessionId?: string): string {
-  return `${sessionId ?? ''}\0${filePath}\0${bases.join('\0')}`
-}
+const existsCacheKey = fileResolutionCacheKey
 
 function resolveFilePathEntry(filePath: string, bases: string[], sessionId?: string): Promise<FileResolutionCacheEntry> {
   const key = existsCacheKey(filePath, bases, sessionId)
@@ -110,6 +109,23 @@ export function FilePathChip({ filePath, basePath, basePaths, sessionId, classNa
 
   const getSessionId = React.useCallback(() => sessionId ?? store.get(currentAgentSessionIdAtom) ?? undefined, [sessionId, store])
 
+  // 流式输出时父组件每帧都会重建 candidateBases 数组；解析 effect 必须只依赖
+  // 内容稳定的 key，否则每帧都会把已解析状态重置回 idle，表现为文件 chip 闪烁。
+  const resolutionKey = React.useMemo(
+    () => existsCacheKey(cleanPath, candidateBases, sessionId ?? store.get(currentAgentSessionIdAtom) ?? undefined),
+    [candidateBases, cleanPath, sessionId, store],
+  )
+  const resolutionArgsRef = React.useRef<{ cleanPath: string; candidateBases: string[]; sessionId?: string }>({
+    cleanPath,
+    candidateBases,
+    sessionId,
+  })
+  resolutionArgsRef.current = {
+    cleanPath,
+    candidateBases,
+    sessionId: sessionId ?? store.get(currentAgentSessionIdAtom) ?? undefined,
+  }
+
   const resolveCurrentPath = React.useCallback((): Promise<void> => {
     const resolvedSessionId = getSessionId()
     const key = existsCacheKey(cleanPath, candidateBases, resolvedSessionId)
@@ -135,19 +151,37 @@ export function FilePathChip({ filePath, basePath, basePaths, sessionId, classNa
   }, [cleanPath, candidateBases, getSessionId])
 
   // IntersectionObserver 首次懒检查可使用缓存；Tooltip 打开时会绕过缓存重新解析。
+  // 只依赖内容稳定的 resolutionKey：父组件重建数组引用时不会重置已解析状态。
   React.useEffect(() => {
     const el = chipRef.current
-    if (!el || typeof IntersectionObserver === 'undefined') return
-
-    requestGenerationRef.current += 1
     mountedRef.current = true
-    setFileStatus('idle')
-    setResolvedPath(undefined)
-    const key = existsCacheKey(cleanPath, candidateBases, getSessionId())
+    const generation = ++requestGenerationRef.current
+    const { cleanPath: path, candidateBases: bases, sessionId: resolvedSessionId } = resolutionArgsRef.current
+    const key = existsCacheKey(path, bases, resolvedSessionId)
+
+    const applyEntry = (entry: FileResolutionCacheEntry): void => {
+      if (!isAsyncResultCurrent(generation, requestGenerationRef.current, mountedRef.current)) return
+      setFileStatus(entry.exists ? 'resolved' : 'broken')
+      setResolvedPath(entry.resolvedPath)
+    }
+
     const cached = fileExistsCache.get(key)
     if (cached) {
-      setFileStatus(cached.exists ? 'resolved' : 'broken')
-      setResolvedPath(cached.resolvedPath)
+      applyEntry(cached)
+      return () => {
+        mountedRef.current = false
+        requestGenerationRef.current += 1
+      }
+    }
+
+    const beginResolve = (): void => {
+      void resolveFilePathEntry(path, bases, resolvedSessionId)
+        .then(applyEntry)
+        .catch(() => { /* IPC 失败时保留当前状态 */ })
+    }
+
+    if (!el || typeof IntersectionObserver === 'undefined') {
+      beginResolve()
       return () => {
         mountedRef.current = false
         requestGenerationRef.current += 1
@@ -158,7 +192,7 @@ export function FilePathChip({ filePath, basePath, basePaths, sessionId, classNa
       (entries) => {
         if (!entries[0]?.isIntersecting) return
         observer.disconnect()
-        void resolveCurrentPath()
+        beginResolve()
       },
       { threshold: 0 },
     )
@@ -168,7 +202,7 @@ export function FilePathChip({ filePath, basePath, basePaths, sessionId, classNa
       requestGenerationRef.current += 1
       observer.disconnect()
     }
-  }, [cleanPath, candidateBases, getSessionId, resolveCurrentPath])
+  }, [resolutionKey])
 
   const handleTooltipOpenChange = React.useCallback((open: boolean) => {
     if (open) void resolveCurrentPath()
@@ -177,13 +211,17 @@ export function FilePathChip({ filePath, basePath, basePaths, sessionId, classNa
   const handleClick = React.useCallback(() => {
     const resolvedSessionId = getSessionId()
     if (!resolvedSessionId) return
-
+    // 优先用主进程解析出的绝对路径。用户主动点击即视为对该单文件的预览授权，
+    // 主进程只放行这一个文件，不会因此把所在目录整体变成可预览根。
+    // 即使此前解析失败（例如文件在会话授权根之外）也允许重试：点击本身就是授权行为。
+    const targetPath = resolvedPath ?? cleanPath
     openPreview(resolvedSessionId, {
-      filePath: cleanPath,
+      filePath: targetPath,
       previewOnly: true,
       basePaths: candidateBases.length > 0 ? candidateBases : undefined,
+      explicitPreviewFiles: [targetPath],
     })
-  }, [getSessionId, openPreview, cleanPath, candidateBases])
+  }, [getSessionId, openPreview, cleanPath, candidateBases, resolvedPath])
 
   const handleShowInFolder = React.useCallback(() => {
     const bases = candidateBases.length > 0 ? candidateBases : undefined
@@ -217,7 +255,9 @@ export function FilePathChip({ filePath, basePath, basePaths, sessionId, classNa
           </TooltipTrigger>
         </ContextMenuTrigger>
         <TooltipContent side="bottom" className="max-w-[400px] break-all font-mono text-[11px]">
-          {fileStatus === 'broken' ? `文件不存在: ${displayPath}` : displayPath}
+          {fileStatus === 'broken'
+            ? `无法解析该路径（文件不存在或不在会话授权范围）: ${displayPath}`
+            : displayPath}
         </TooltipContent>
       </Tooltip>
       <ContextMenuContent className="w-48 z-[9999]">
@@ -240,7 +280,7 @@ interface ResolvableFilePathChipProps extends FilePathChipProps {
 
 /**
  * 用于模型自由文本中的路径候选。只有文件存在且位于当前会话授权范围内时才升级为 Chip；
- * 解析期间和失败后都保留调用方提供的原始 Markdown 外观。
+ * 图片路径例外：即使解析不到也保留可点击形态，用户点击即视为对该单文件的预览授权。
  */
 export function ResolvableFilePathChip({ fallback, filePath, basePath, basePaths, sessionId, className }: ResolvableFilePathChipProps): React.ReactElement {
   const store = useStore()
@@ -256,21 +296,30 @@ export function ResolvableFilePathChip({ fallback, filePath, basePath, basePaths
     [candidateBases, cleanPath, resolvedSessionId],
   )
   const [resolvedKey, setResolvedKey] = React.useState<string | null>(null)
+  // 解析参数放进 ref：effect 只跟随内容稳定的 key，避免流式重渲染反复回退到 fallback。
+  const resolutionArgsRef = React.useRef({ cleanPath, candidateBases, resolvedSessionId })
+  resolutionArgsRef.current = { cleanPath, candidateBases, resolvedSessionId }
 
   React.useEffect(() => {
     let cancelled = false
-    setResolvedKey(null)
-    void resolveFilePathEntry(cleanPath, candidateBases, resolvedSessionId)
+    const { cleanPath: path, candidateBases: bases, resolvedSessionId: sid } = resolutionArgsRef.current
+    const cached = fileExistsCache.get(resolutionKey)
+    if (cached) {
+      if (cached.exists) setResolvedKey(resolutionKey)
+      return () => { cancelled = true }
+    }
+    // 只在解析成功后升级；解析中/失败保持调用方的 Markdown 外观，且不清空旧结果。
+    void resolveFilePathEntry(path, bases, sid)
       .then((entry) => {
         if (!cancelled && entry.exists) setResolvedKey(resolutionKey)
       })
-      .catch(() => {
-        if (!cancelled) setResolvedKey(null)
-      })
+      .catch(() => { /* 解析失败保留 fallback */ })
     return () => { cancelled = true }
-  }, [candidateBases, cleanPath, resolvedSessionId, resolutionKey])
+  }, [resolutionKey])
 
-  if (resolvedKey !== resolutionKey) return fallback
+  // 图片路径即使当前授权范围解析不到，也保留可点击形态：用户点击本身即视为
+  // 对该单文件的预览授权，允许主动查看项目外的临时截图等文件。
+  if (resolvedKey !== resolutionKey && !isImageFilePath(cleanPath)) return fallback
   return <FilePathChip filePath={filePath} basePath={basePath} basePaths={basePaths} sessionId={sessionId} className={className} />
 }
 

@@ -1,9 +1,9 @@
 /**
  * ScrollMinimap — 消息导航迷你地图 + 滚动进度条
  *
- * 在消息区域右侧显示：
- * 1. 短横杠代表每条消息的位置（迷你地图），悬浮时弹出消息预览列表
- * 2. 可拖拽的滚动进度条，提供丝滑的滚动体验
+ * 布局：
+ * 1. 左侧消息导航：短横杠代表每条消息的位置，悬浮时向右展开消息预览列表
+ * 2. 右侧滚动进度条：可拖拽，提供丝滑的滚动体验
  * 必须放在 StickToBottom（Conversation）内部使用。
  */
 
@@ -14,9 +14,9 @@ import remarkGfm from 'remark-gfm'
 import { AlertTriangle, Search } from 'lucide-react'
 import { useStickToBottomContext } from 'use-stick-to-bottom'
 import { Input } from '@/components/ui/input'
-import { UserAvatar } from '@/components/chat/UserAvatar'
+import { UserAvatar } from '@/components/session-shared/UserAvatar'
 import { getModelLogo, resolveModelProvider } from '@/lib/model-logo'
-import { channelsAtom } from '@/atoms/chat-atoms'
+import { channelsAtom } from '@/atoms/channel-atoms'
 import { useShortcut } from '@/hooks/useShortcut'
 import { cn } from '@/lib/utils'
 import { MAX_SEARCH_QUERY_SOURCE_LENGTH } from '@proma/shared'
@@ -454,19 +454,17 @@ export function ScrollMinimap({ items, searchMessages, onRevealSearchResult }: S
       const normalizedQuery = query.toLowerCase()
       return items.filter((item) => item.preview.toLowerCase().includes(normalizedQuery))
     }
-    const itemById = new Map(items.map((item) => [item.id, item]))
-    return searchResults.map((result) => {
-      const item = itemById.get(result.messageId)
-      return {
-        id: result.messageId,
-        role: result.role === 'system' ? 'status' : result.role,
-        preview: result.snippet,
-        avatar: item?.avatar,
-        model: item?.model,
-        matchStart: result.matchStart,
-        matchLength: result.matchLength,
-      }
-    })
+    return searchResults
+      .filter((result) => result.role === 'user')
+      .map((result) => {
+        return {
+          id: result.messageId,
+          role: 'user' as const,
+          preview: result.snippet,
+          matchStart: result.matchStart,
+          matchLength: result.matchLength,
+        }
+      })
   }, [items, searchMessages, searchQuery, searchResults])
 
   /** 列表居中锚点：优先用主区视口中心对应的消息；该消息被搜索过滤掉时退回第一条可见消息 */
@@ -552,26 +550,29 @@ export function ScrollMinimap({ items, searchMessages, onRevealSearchResult }: S
   const barCount = Math.min(items.length, MAX_BARS)
 
   return (
-    <div className="absolute right-1 top-0 bottom-0 z-30 flex pointer-events-none">
-      {/* ── 迷你地图悬停区域（面板 + 横杠） ── */}
-      <div className="flex items-start h-full">
+    <>
+      {/* ── 左侧消息导航：横杠固定，面板作为浮层向右展开，不挤压正文 ── */}
+      <div className="absolute left-2 top-1/2 z-30 flex h-[min(50vh,360px)] -translate-y-1/2 items-center pointer-events-none">
         {/* 展开面板 */}
         {hovered && (
           <div
             className={cn(
-              'mr-1 w-[280px] rounded-lg border bg-popover shadow-xl origin-top-right flex flex-col overflow-hidden pointer-events-auto',
+              'absolute left-full top-1/2 ml-3 w-[280px] -translate-y-1/2 rounded-lg border bg-popover shadow-xl origin-left flex flex-col overflow-hidden pointer-events-auto',
               isLeaving
                 ? 'animate-out fade-out-0 zoom-out-95 duration-75'
                 : 'animate-in fade-in-0 zoom-in-95 duration-150'
             )}
-            style={{ maxHeight: 'min(420px, 60vh)', marginTop: 12 }}
+            style={{ maxHeight: 'min(420px, 60vh)' }}
             onMouseEnter={handleMouseEnter}
             onMouseLeave={handleMouseLeave}
           >
             {/* 标题栏 */}
             <div className="flex items-center justify-between px-3 py-2 border-b shrink-0">
               <span className="text-xs font-medium text-popover-foreground/70">消息导航</span>
-              <span className="text-[11px] text-muted-foreground tabular-nums">
+              <span
+                className="text-[11px] text-muted-foreground tabular-nums"
+                title="当前视口内可见的消息数 / 可导航消息总数"
+              >
                 {visibleIds.size}/{items.length}
               </span>
             </div>
@@ -648,7 +649,7 @@ export function ScrollMinimap({ items, searchMessages, onRevealSearchResult }: S
 
         {/* ── 迷你地图横杠 —— 只有这里触发面板展开 ── */}
         {canScroll && <div
-          className="relative mt-3 flex-shrink-0 pointer-events-auto"
+          className="relative flex-shrink-0 pointer-events-auto"
           style={{ width: 24, height: barCount * MINIMAP_BAR_SPACING }}
           onMouseEnter={handleMouseEnter}
           onMouseLeave={handleMouseLeave}
@@ -678,30 +679,35 @@ export function ScrollMinimap({ items, searchMessages, onRevealSearchResult }: S
         </div>}
       </div>
 
-      {/* ── 滚动进度条 ── */}
-      {canScroll && <div className="relative ml-[4px] py-4 flex-shrink-0 pointer-events-auto" style={{ width: SCROLL_PROGRESS_WIDTH }}>
+      {/* ── 右侧滚动进度条 ── */}
+      {canScroll && (
         <div
-          ref={trackRef}
-          className="relative h-full rounded-full cursor-pointer scroll-progress-track"
-          onMouseDown={handleTrackMouseDown}
+          className="absolute right-1 top-1/2 z-30 -translate-y-1/2 py-4 pointer-events-auto"
+          style={{ width: SCROLL_PROGRESS_WIDTH, height: 'min(50vh, 360px)' }}
         >
           <div
-            ref={thumbRef}
-            className={cn(
-              'absolute left-0 right-0 rounded-full transition-colors duration-100 scroll-progress-thumb',
-              isDragging
-                ? 'scroll-progress-thumb-active cursor-grabbing'
-                : 'cursor-grab'
-            )}
-            style={{
-              height: `${thumbHeightPct}%`,
-              top: '0%',
-            }}
-            onMouseDown={handleThumbMouseDown}
-          />
+            ref={trackRef}
+            className="relative h-full rounded-full cursor-pointer scroll-progress-track"
+            onMouseDown={handleTrackMouseDown}
+          >
+            <div
+              ref={thumbRef}
+              className={cn(
+                'absolute left-0 right-0 rounded-full transition-colors duration-100 scroll-progress-thumb',
+                isDragging
+                  ? 'scroll-progress-thumb-active cursor-grabbing'
+                  : 'cursor-grab'
+              )}
+              style={{
+                height: `${thumbHeightPct}%`,
+                top: '0%',
+              }}
+              onMouseDown={handleThumbMouseDown}
+            />
+          </div>
         </div>
-      </div>}
-    </div>
+      )}
+    </>
   )
 }
 

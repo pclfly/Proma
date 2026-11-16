@@ -49,6 +49,18 @@ export interface AgentRuntimeEvent<Payload = unknown> extends AgentRuntimeEnvelo
 
 export type AgentRuntimeEnvelope = AgentRuntimeRequest | AgentRuntimeResponse | AgentRuntimeEvent
 
+export interface AgentRuntimeNetworkFailurePayload {
+  epoch: number
+  scope: string
+  phase: string
+  failure: string
+}
+
+export interface AgentRuntimeNetworkEpochPayload {
+  epoch: number
+  routeEpoch?: number
+}
+
 export type AgentRuntimeStatus = 'starting' | 'ready' | 'stopping' | 'stopped' | 'crashed'
 
 export interface AgentRuntimeState {
@@ -79,12 +91,17 @@ export const AGENT_RUNTIME_METHODS = {
   QUERY_ABORT: 'agent.query.abort',
   QUERY_SEND_QUEUED_MESSAGE: 'agent.query.sendQueuedMessage',
   QUERY_SET_PERMISSION_MODE: 'agent.query.setPermissionMode',
+  EVENT_NETWORK_FAILURE: 'agent.network.failure',
+  EVENT_NETWORK_EPOCH: 'agent.network.epoch',
   CAPABILITY_CAN_USE_TOOL: 'agent.capability.canUseTool',
   CAPABILITY_CANCEL: 'agent.capability.cancel',
   CAPABILITY_CUSTOM_TOOL: 'agent.capability.customTool',
   CAPABILITY_CODEX_OAUTH_REFRESHED: 'agent.capability.codex_oauth_refreshed',
   CAPABILITY_GITHUB_COPILOT_OAUTH_REFRESHED: 'agent.capability.github_copilot_oauth_refreshed',
   CAPABILITY_XAI_OAUTH_REFRESHED: 'agent.capability.xai_oauth_refreshed',
+  CAPABILITY_KNOWLEDGE_MUTATION_BEGIN: 'agent.capability.knowledgeMutation.begin',
+  CAPABILITY_KNOWLEDGE_MUTATION_FINISH: 'agent.capability.knowledgeMutation.finish',
+  CAPABILITY_KNOWLEDGE_MUTATION_WITNESS: 'agent.capability.knowledgeMutation.witness',
   EVENT_STATE: 'runtime.state',
   EVENT_CRASHED: 'runtime.crashed',
   EVENT_QUERY: 'agent.query.event',

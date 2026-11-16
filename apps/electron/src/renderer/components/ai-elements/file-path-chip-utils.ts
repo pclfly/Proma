@@ -118,3 +118,18 @@ export function getFilePathDisplayPath({ originalPath, resolvedPath, lineColSuff
 export function isAsyncResultCurrent(requestGeneration: number, currentGeneration: number, mounted: boolean): boolean {
   return mounted && requestGeneration === currentGeneration
 }
+
+/**
+ * 文件解析缓存/effect 的稳定 key。
+ *
+ * 流式输出时父组件每帧都会重建 basePaths 数组；key 只取字符串内容，
+ * 保证引用变化不会触发重新解析、把已解析的 chip 打回 fallback。
+ */
+export function fileResolutionCacheKey(
+  filePath: string,
+  bases: readonly string[],
+  sessionId?: string,
+): string {
+  // JSON 保留数组边界，避免路径本身含分隔符时发生 key 碰撞。
+  return JSON.stringify([sessionId ?? null, filePath, bases])
+}

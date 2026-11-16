@@ -10,6 +10,7 @@
  */
 
 import { BrowserWindow } from 'electron'
+import { existsSync } from 'node:fs'
 import type {
   DingTalkBridgeState,
   DingTalkBotBridgeState,
@@ -92,6 +93,7 @@ interface DingTalkImageAttachment {
   id: string
   data: Buffer
   mediaType: string
+  prepared?: { sessionId: string; workspaceId: string; attachment: BridgeAttachment }
 }
 
 // ===== Bridge 实例 =====
@@ -157,15 +159,8 @@ class DingTalkBridge {
         `钉钉 Bridge/${botConfig.name}`,
       ),
       onWorkspaceSwitched: async (workspaceId) => {
-        const { saveDingTalkBotConfig } = await import('./dingtalk-config')
-        saveDingTalkBotConfig({
-          id: this.botConfig.id,
-          name: this.botConfig.name,
-          enabled: this.botConfig.enabled,
-          clientId: this.botConfig.clientId,
-          clientSecret: '',
-          defaultWorkspaceId: workspaceId,
-        })
+        const { updateDingTalkDefaultWorkspace } = await import('./dingtalk-config')
+        updateDingTalkDefaultWorkspace(this.botConfig.id, workspaceId)
         this.botConfig = { ...this.botConfig, defaultWorkspaceId: workspaceId }
       },
     })
@@ -391,38 +386,30 @@ class DingTalkBridge {
     // 文字消息：合并缓冲
     const pendingEntry = this.pendingImages.get(chatId)
     const pending = pendingEntry ? pendingEntry.images : []
-    const allImages = [...pending, ...downloads]
-    this.pendingImages.delete(chatId)
+    const allImages = [...pending, ...downloads].slice(-DingTalkBridge.PENDING_IMAGES_MAX)
+    if (allImages.length > 0) this.pendingImages.set(chatId, { images: allImages, createdAt: pendingEntry?.createdAt ?? Date.now() })
 
     if (allImages.length === 0) {
       await this.commandHandler.handleIncomingMessage(chatId, text, ctx)
       return
     }
 
-    // 命令消息携带图片：把图片放回缓冲，仅处理命令
-    if (text.startsWith('/')) {
-      this.pendingImages.set(chatId, { images: allImages, createdAt: Date.now() })
+    // 命令不消费媒体，也不延长原缓冲的TTL。
+    if (text.trimStart().startsWith('/')) {
       await this.commandHandler.handleIncomingMessage(chatId, text, ctx)
       return
     }
 
     // 有图片：先检查 session 是否正在运行，避免保存图片后消息被拦截
     if (this.commandHandler.isSessionActive(chatId)) {
-      this.pendingImages.set(chatId, { images: allImages, createdAt: Date.now() })
       await this.replyTextViaWebhook(data.sessionWebhook, '❌ 上一条消息仍在处理中，图片已暂存，请稍候再试')
       return
     }
 
-    // 先验证 workspace 是否有效，避免 ensureBinding 创建孤儿 binding
-    const preCheckWorkspaceId = this.botConfig.defaultWorkspaceId ?? getSettings().agentWorkspaceId ?? ''
-    if (!preCheckWorkspaceId || !getAgentWorkspace(preCheckWorkspaceId)) {
-      await this.replyTextViaWebhook(data.sessionWebhook, '⚠️ 当前未设置项目，无法保存图片')
-      return
-    }
-
+    // 与文字共用绑定解析；有效旧会话优先于默认项目，拒绝路径保留媒体。
     const binding = this.commandHandler.ensureBinding(chatId)
     if (!binding) {
-      await this.replyTextViaWebhook(data.sessionWebhook, '请先在 Proma 设置中选择 Agent 渠道。')
+      await this.replyTextViaWebhook(data.sessionWebhook, this.commandHandler.getBindingFailureMessage(chatId))
       return
     }
     const workspace = getAgentWorkspace(binding.workspaceId)
@@ -431,20 +418,38 @@ class DingTalkBridge {
       return
     }
 
-    const attachments: BridgeAttachment[] = allImages.map((img) => {
-      const hint = `dingtalk-${img.id}`
-      const absolutePath = saveImageToSession(
-        workspace.slug,
-        binding.sessionId,
-        hint,
-        img.mediaType,
-        img.data,
-      )
-      const label = `${hint}.${inferExtension(img.mediaType)}`
-      return { absolutePath, label, kind: 'image' as const }
-    })
-
-    await this.commandHandler.handleIncomingMessage(chatId, text, ctx, attachments)
+    const target = { sessionId: binding.sessionId, workspaceId: binding.workspaceId }
+    const attachments: BridgeAttachment[] = []
+    try {
+      for (const img of allImages) {
+        const cached = img.prepared
+        if (cached?.sessionId === target.sessionId && cached.workspaceId === target.workspaceId && existsSync(cached.attachment.absolutePath)) {
+          attachments.push(cached.attachment)
+          continue
+        }
+        const hint = `dingtalk-${img.id}`
+        const attachment: BridgeAttachment = {
+          absolutePath: saveImageToSession(workspace.slug, target.sessionId, hint, img.mediaType, img.data),
+          label: `${hint}.${inferExtension(img.mediaType)}`,
+          kind: 'image',
+        }
+        img.prepared = { ...target, attachment }
+        attachments.push(attachment)
+      }
+    } catch (error) {
+      console.error('[钉钉 Bridge] 保存图片失败:', redactSensitiveLogValue(error))
+      await this.replyTextViaWebhook(data.sessionWebhook, '图片保存失败，附件已暂存，请稍后重试。')
+      return
+    }
+    const accepted = await this.commandHandler.handleIncomingMessage(chatId, text, ctx, attachments, target)
+    if (accepted) {
+      const current = this.pendingImages.get(chatId)
+      if (current) {
+        const remaining = current.images.filter((img) => !allImages.includes(img))
+        if (remaining.length) this.pendingImages.set(chatId, { ...current, images: remaining })
+        else this.pendingImages.delete(chatId)
+      }
+    }
   }
 
   /** 通过 sessionWebhook 发送纯文本（用于提示/警告） */

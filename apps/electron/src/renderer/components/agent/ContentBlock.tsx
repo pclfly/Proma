@@ -4,22 +4,23 @@
  * 支持三种内容块类型：
  * - text: 通过 MessageResponse 渲染 Markdown
  * - tool_use: 语义化短语行（如 "读取 foo.ts 第 10-60 行"），展开显示结构化结果
- * - thinking: 默认折叠，左上角 "Thinking" 标签 + 虚线边框内容区
+ * - thinking: 过程流中的分析行，状态标签 + 首行标题 + 可折叠正文
  */
 
 import * as React from 'react'
+import { canExpandToolDetails } from './tool-expansion-state'
 import {
   ChevronRight,
-  ChevronDown,
   ChevronUp,
   XCircle,
   Loader2,
+  Sparkles,
   Brain,
   MessageSquareText,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { MessageResponse } from '@/components/ai-elements/message'
-import { getToolIcon, extractFilePath } from './tool-utils'
+import { getToolDisplayName, getToolIcon, extractFilePath } from './tool-utils'
 import { getToolPhrase, getToolResultSummary, shouldShowToolKindLabel } from './tool-phrase'
 import { ToolResultRenderer } from './tool-result-renderers'
 import { PreviewOpenButton } from './tool-result-renderers/preview-open-button'
@@ -210,6 +211,12 @@ export interface ContentBlockProps {
   childBlocks?: SDKContentBlock[]
   /** 是否正在流式输出中（仅流式中的未完成工具调用才显示 spinner） */
   isStreaming?: boolean
+  /** 该块是当前过程流末尾且本轮仍在输出，用于「正在分析」状态文案。 */
+  isCurrent?: boolean
+  /** 紧随工具调用之后的思考块；展开工具行时在缩进区一并显示。 */
+  nestedThinking?: Array<{ block: SDKContentBlock; isCurrent?: boolean }>
+  /** 嵌套在工具展开区内的思考块默认展开正文（外层点击已经完成一次展开动作）。 */
+  thinkingDefaultExpanded?: boolean
 }
 
 // ===== 提示词折叠行 =====
@@ -321,6 +328,14 @@ function TaskListCollapsedSummary({ tasks }: { tasks: ParsedTaskListItem[] }): R
 
 // ===== 工具调用块 =====
 
+/** 过程行活动标签：命令类工具用动作描述，其余保留工具名便于定位。 */
+function buildToolActivityLabel(toolName: string, completed: boolean, compactName: string): string {
+  if (toolName === 'Bash') return completed ? '执行了命令' : '正在执行命令'
+  // MCP 短语本身已包含 "SERVER / TOOL"，不再重复拼工具名。
+  if (toolName.startsWith('mcp__')) return completed ? '已执行工具' : '正在执行工具'
+  return `${completed ? '已执行工具' : '正在执行工具'} ${compactName}`
+}
+
 interface ToolUseBlockProps {
   block: SDKToolUseBlock
   allMessages: SDKMessage[]
@@ -331,14 +346,18 @@ interface ToolUseBlockProps {
   basePath?: string
   /** 是否正在流式输出中 */
   isStreaming?: boolean
+  /** 紧随本次工具调用的思考块，展开工具行时在缩进区显示。 */
+  nestedThinking?: Array<{ block: SDKContentBlock; isCurrent?: boolean }>
 }
 
-function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed = false, childBlocks, basePath, isStreaming }: ToolUseBlockProps): React.ReactElement {
+function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed = false, childBlocks, basePath, isStreaming, nestedThinking = [] }: ToolUseBlockProps): React.ReactElement {
   const [expanded, setExpanded] = React.useState(false)
+  /** 运行中默认只显示状态；用户点击后才展开命令/参数全文。 */
+  const [liveExpanded, setLiveExpanded] = React.useState(false)
   const toolResult = useToolResult(block.id, allMessages)
   const resultText = toolResult?.result
   const isError = toolResult?.isError === true
-  const shouldShowResult = !!resultText
+  const shouldShowDetails = canExpandToolDetails(block.name, block.input, resultText)
   const taskGetSummary = React.useMemo(() => {
     if (block.name !== 'TaskGet' || !resultText || isError) return null
     return parseTaskGetResult(resultText)
@@ -364,6 +383,34 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
 
   // 运行中显示进行时短语，完成或非流式（已终止）显示完成态短语
   const displayLabel = (isCompleted || !isStreaming) ? phrase.label : phrase.loadingLabel
+  const toolCompleted = isCompleted || !isStreaming
+  const activityLabel = buildToolActivityLabel(block.name, toolCompleted, toolKindLabel)
+  // Bash 优先展示实际命令；其余工具只在短语比工具名更具体时才附带详情。
+  const bashCommand = block.name === 'Bash' && typeof block.input.command === 'string'
+    ? block.input.command.trim()
+    : ''
+  const activityDetail = block.name === 'Bash'
+    ? (bashCommand || (displayLabel !== getToolDisplayName('Bash') ? displayLabel : ''))
+    : (displayLabel !== getToolDisplayName(block.name) ? displayLabel : '')
+  const showActivityDetail = toolCompleted || liveExpanded
+  const hasNestedThinking = nestedThinking.length > 0
+  const canExpandRow = shouldShowDetails || hasNestedThinking
+  const nestedThinkingContent = hasNestedThinking ? (
+    <div className="space-y-2">
+      {nestedThinking.map((nested, nestedIndex) => (
+        <ContentBlock
+          key={`nested-thinking-${nestedIndex}`}
+          block={nested.block}
+          allMessages={allMessages}
+          basePath={basePath}
+          dimmed={dimmed}
+          isStreaming={isStreaming}
+          isCurrent={nested.isCurrent}
+          thinkingDefaultExpanded
+        />
+      ))}
+    </div>
+  ) : null
   const filePath = extractFilePath(block.input)
   const isPreviewable = (
     (block.name === 'Read' || block.name === 'Edit' || block.name === 'Write') &&
@@ -447,6 +494,9 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
               />
             ))}
 
+            {/* 紧随该工具调用的思考块 */}
+            {nestedThinkingContent}
+
             {/* SubAgent 完成信息 */}
             {isCompleted && (
               <SubAgentFooter
@@ -481,7 +531,15 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
         <button
           type="button"
           className="group inline-flex max-w-full min-w-0 items-center gap-2 rounded-md py-1 text-left transition-[background-color,opacity] hover:bg-muted/40 hover:opacity-90"
-          onClick={() => setExpanded(!expanded)}
+          onClick={() => {
+            // 运行中只展开命令/参数全文，不提前打开尚为空的结果面板。
+            if (!toolCompleted) {
+              setLiveExpanded(true)
+              return
+            }
+            if (canExpandRow) setExpanded(!expanded)
+          }}
+          aria-expanded={canExpandRow ? expanded : undefined}
         >
           {!isCompleted && isStreaming ? (
             <Loader2 className="size-3.5 shrink-0 animate-spin text-primary/60" />
@@ -490,16 +548,19 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
           ) : null}
 
           <ToolIcon className="size-3.5 shrink-0 text-muted-foreground" />
-          {showToolKindLabel && (
+          <span className={cn(
+            'shrink-0 whitespace-nowrap text-[14px] font-medium',
+            dimmed ? 'text-muted-foreground/60' : 'text-muted-foreground/70',
+          )}>{activityLabel}</span>
+          {showActivityDetail && activityDetail && (
             <>
-              <span className="min-w-0 max-w-[28%] truncate text-[14px] font-medium text-muted-foreground/65">{toolKindLabel}</span>
               <span className="shrink-0 text-muted-foreground/30">·</span>
+              <span className={cn(
+                'min-w-0 max-w-[60%] truncate text-[14px]',
+                dimmed ? 'text-muted-foreground/70' : 'text-muted-foreground',
+              )}>{activityDetail}</span>
             </>
           )}
-          <span className={cn(
-            'min-w-0 max-w-[60%] truncate text-[14px]',
-            dimmed ? 'text-muted-foreground/70' : 'text-muted-foreground',
-          )}>{displayLabel}</span>
 
           {resultSummary && (
             <span className={cn(
@@ -534,124 +595,142 @@ function ToolUseBlock({ block, allMessages, animate = false, index = 0, dimmed =
             </span>
           )}
 
-          <ChevronRight
-            className={cn(
-              'size-3 shrink-0 text-muted-foreground/40 transition-transform duration-150',
-              expanded && 'rotate-90',
-            )}
-          />
+          {(canExpandRow || !toolCompleted) && (
+            <ChevronRight
+              className={cn(
+                'size-3 shrink-0 text-muted-foreground/40 transition-transform duration-150',
+                expanded && 'rotate-90',
+              )}
+            />
+          )}
 
           {isPreviewable && (
             <PreviewOpenButton filePath={filePath} />
           )}
         </button>
 
-      {shouldShowResult && resultText && expanded && (
+      {canExpandRow && expanded && (
         <div className={cn(
           'ml-5.5 mt-1 mb-2 pl-3 border-l-2 border-border/30',
           animate && 'animate-in fade-in slide-in-from-top-1 duration-150',
         )}>
-          <ToolResultRenderer
-            toolName={block.name}
-            input={block.input}
-            result={resultText}
-            isError={isError}
-            basePath={basePath}
-          />
+          {shouldShowDetails && (
+            <ToolResultRenderer
+              toolName={block.name}
+              input={block.input}
+              result={resultText ?? ''}
+              isError={isError}
+              basePath={basePath}
+            />
+          )}
+          {nestedThinkingContent}
         </div>
       )}
     </div>
   )
 }
 
-// ===== 思考块（默认折叠，Thinking 标签 + 虚线边框） =====
+// ===== 思考块（扁平分析行：默认收起，点击展开全文） =====
 
 interface ThinkingBlockProps {
   block: SDKThinkingBlock
   dimmed?: boolean
   isStreaming?: boolean
+  /** 本轮仍在流式输出且该块位于过程流末尾，用于区分「正在分析 / 已完成分析」。 */
+  isCurrent?: boolean
+  /** 初次渲染即展开正文；用于工具行展开区内的嵌套思考块。 */
+  defaultExpanded?: boolean
 }
 
-/** 思考块折叠行数阈值 */
-const THINKING_COLLAPSE_LINE_THRESHOLD = 4
+/** 首行常是「用户要求:」这类小标题；过长或没有换行时整段作为正文。 */
+function splitThinkingContent(text: string): { title: string; body?: string } {
+  const normalized = text.replace(/^\s+/, '')
+  const newline = normalized.indexOf('\n')
+  if (newline < 0) return { title: normalized.trim() }
+  return {
+    title: normalized.slice(0, newline).trim(),
+    body: normalized.slice(newline + 1).trim() || undefined,
+  }
+}
 
-function ThinkingBlock({ block, dimmed = false, isStreaming = false }: ThinkingBlockProps): React.ReactElement {
-  const [isExpanded, setIsExpanded] = React.useState(false)
-  const [shouldCollapse, setShouldCollapse] = React.useState(false)
-  const contentRef = React.useRef<HTMLDivElement>(null)
+function ThinkingBlock({ block, dimmed = false, isStreaming = false, isCurrent = false, defaultExpanded = false }: ThinkingBlockProps): React.ReactElement {
+  const [expanded, setExpanded] = React.useState(defaultExpanded)
   const { displayedContent } = useSmoothStream({
     content: block.thinking,
     isStreaming,
   })
 
-  // 流式期间避免对每批思考文本同步读取 scrollHeight；这会强制布局且与 Markdown 重渲染叠加。
-  // 输出完成后再测量，保留历史态的默认折叠行为。
-  React.useLayoutEffect(() => {
-    if (isStreaming || !contentRef.current) return
-    const el = contentRef.current
-    const lineHeight = parseFloat(getComputedStyle(el).lineHeight) || 22
-    const maxHeight = lineHeight * THINKING_COLLAPSE_LINE_THRESHOLD
-    setShouldCollapse(el.scrollHeight > maxHeight + 10)
-  }, [displayedContent, isStreaming])
-
-  const toggleExpand = React.useCallback(() => {
-    setIsExpanded((prev) => !prev)
-  }, [])
+  const analyzing = isStreaming && isCurrent
+  const { title: firstLine, body: rest } = splitThinkingContent(displayedContent)
+  const hasTitle = firstLine.length > 0 && (analyzing || firstLine.length <= 80)
+  const title = hasTitle ? firstLine : ''
+  const body = hasTitle ? rest : displayedContent
+  const expandable = analyzing || Boolean(body)
+  // 运行中默认不展示流式文本；完成后保留首行标题，正文统一点击展开。
+  const showTitle = Boolean(title) && (!analyzing || expanded)
 
   return (
-    <div className="relative mb-3">
-      <div className="flex items-center gap-1.5 mb-1.5">
-        <Brain className={cn('size-3.5', dimmed ? 'text-muted-foreground/70' : 'text-muted-foreground')} />
-        <span className={cn('text-[14px] uppercase tracking-wider', dimmed ? 'text-muted-foreground/70' : 'text-muted-foreground')}>
-          Thinking
-        </span>
-      </div>
-      <div
+    <div className="mb-2.5">
+      <button
+        type="button"
+        disabled={!expandable}
+        aria-expanded={expandable ? expanded : undefined}
+        onClick={() => setExpanded((prev) => !prev)}
         className={cn(
-          'relative rounded-lg px-3.5 py-2.5',
-          dimmed ? 'bg-muted/30' : 'bg-muted/50',
+          'flex w-full min-w-0 items-center gap-1.5 text-left',
+          expandable ? 'transition-opacity hover:opacity-75' : 'cursor-default',
         )}
-        style={{
-          border: 'none',
-          backgroundImage: `url("data:image/svg+xml,%3csvg width='100%25' height='100%25' xmlns='http://www.w3.org/2000/svg'%3e%3crect width='100%25' height='100%25' fill='none' rx='8' ry='8' stroke='${dimmed ? 'rgba(128,128,128,0.3)' : 'rgba(128,128,128,0.5)'}' stroke-width='1.5' stroke-dasharray='8%2c 6' stroke-dashoffset='0' stroke-linecap='round'/%3e%3c/svg%3e")`,
-        }}
       >
-        <div
-          ref={contentRef}
-          data-agent-history-selection-excluded={shouldCollapse && !isExpanded ? 'true' : undefined}
+        <Sparkles
           className={cn(
-            'prose prose-sm dark:prose-invert max-w-none prose-p:my-1 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 text-[14px] leading-relaxed overflow-hidden transition-[max-height] duration-200',
-            dimmed ? 'text-muted-foreground' : 'text-foreground/90',
-            shouldCollapse && !isExpanded && 'max-h-[5.6em]',
+            'size-3.5 shrink-0',
+            dimmed ? 'text-muted-foreground/60' : 'text-muted-foreground/75',
           )}
-        >
-          <MessageResponse className="font-normal prose-strong:font-normal [&_strong]:font-normal [&_b]:font-normal">
-            {displayedContent}
-          </MessageResponse>
-        </div>
-        {shouldCollapse && (
-          <button
-            type="button"
-            onClick={toggleExpand}
-            className={cn(
-              'mt-2 flex items-center gap-1 text-xs text-foreground/35 transition-colors',
-              'hover:text-foreground/55'
-            )}
-          >
-            {isExpanded ? (
-              <>
-                <ChevronUp className="size-3" />
-                <span>收起</span>
-              </>
-            ) : (
-              <>
-                <ChevronDown className="size-3" />
-                <span>展开思考</span>
-              </>
-            )}
-          </button>
+        />
+        <span className={cn('shrink-0 text-[14px]', dimmed ? 'text-muted-foreground/60' : 'text-muted-foreground')}>
+          {analyzing ? '正在分析' : '已完成分析'}
+        </span>
+        {showTitle && (
+          <>
+            <span className="shrink-0 text-[14px] text-muted-foreground/30">·</span>
+            <span className="min-w-0 truncate text-[14px] font-medium text-foreground/80">{title}</span>
+          </>
         )}
-      </div>
+        {expandable && (
+          <ChevronRight
+            className={cn(
+              'size-3 shrink-0 text-muted-foreground/40 transition-transform duration-150',
+              expanded && 'rotate-90',
+            )}
+          />
+        )}
+      </button>
+      {expanded && body && (
+        <div className="mt-2 ml-5">
+          <div className="mb-1.5 flex items-center gap-1.5">
+            <Brain className={cn('size-3.5', dimmed ? 'text-muted-foreground/60' : 'text-muted-foreground/70')} />
+            <span className={cn('text-[11px] uppercase tracking-wider', dimmed ? 'text-muted-foreground/50' : 'text-muted-foreground/60')}>
+              Thinking
+            </span>
+          </div>
+          <div
+            className="relative rounded-lg px-3.5 py-2.5"
+            style={{
+              border: 'none',
+              backgroundImage: `url("data:image/svg+xml,%3csvg width='100%25' height='100%25' xmlns='http://www.w3.org/2000/svg'%3e%3crect width='100%25' height='100%25' fill='none' rx='8' ry='8' stroke='${dimmed ? 'rgba(128,128,128,0.3)' : 'rgba(128,128,128,0.5)'}' stroke-width='1.5' stroke-dasharray='8%2c 6' stroke-dashoffset='0' stroke-linecap='round'/%3e%3c/svg%3e")`,
+            }}
+          >
+            <div className={cn(
+              'prose prose-sm dark:prose-invert max-w-none text-[length:var(--content-font-size,14px)] leading-relaxed prose-p:my-1 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
+              dimmed ? 'text-muted-foreground' : 'text-foreground/80',
+            )}>
+              <MessageResponse className="font-normal prose-strong:font-normal [&_strong]:font-normal [&_b]:font-normal">
+                {body}
+              </MessageResponse>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -677,7 +756,7 @@ function StreamingTextBlock({
 
 // ===== ContentBlock 主组件 =====
 
-export function ContentBlock({ block, allMessages, basePath, basePaths, animate = false, index = 0, dimmed = false, childBlocks, isStreaming }: ContentBlockProps): React.ReactElement | null {
+export function ContentBlock({ block, allMessages, basePath, basePaths, animate = false, index = 0, dimmed = false, childBlocks, isStreaming, isCurrent = false, nestedThinking, thinkingDefaultExpanded = false }: ContentBlockProps): React.ReactElement | null {
   // text 块 — 主要内容，不受 dimmed 影响
   if (block.type === 'text') {
     const textBlock = block as SDKTextBlock
@@ -705,6 +784,7 @@ export function ContentBlock({ block, allMessages, basePath, basePaths, animate 
         childBlocks={childBlocks}
         basePath={basePath}
         isStreaming={isStreaming}
+        nestedThinking={nestedThinking}
       />
     )
   }
@@ -713,7 +793,15 @@ export function ContentBlock({ block, allMessages, basePath, basePaths, animate 
   if (block.type === 'thinking') {
     const thinkingBlock = block as SDKThinkingBlock
     if (!thinkingBlock.thinking) return null
-    return <ThinkingBlock block={thinkingBlock} dimmed={dimmed} isStreaming={isStreaming} />
+    return (
+      <ThinkingBlock
+        block={thinkingBlock}
+        dimmed={dimmed}
+        isStreaming={isStreaming}
+        isCurrent={isCurrent}
+        defaultExpanded={thinkingDefaultExpanded}
+      />
+    )
   }
 
   return null

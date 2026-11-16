@@ -375,12 +375,14 @@ interface WeChatImageAttachment {
   id: string
   data: Buffer
   mediaType: string
+  prepared?: { sessionId: string; workspaceId: string; attachment: BridgeAttachment }
 }
 
 interface WeChatFileAttachment {
   id: string
   data: Buffer
   fileName: string
+  prepared?: { sessionId: string; workspaceId: string; attachment: BridgeAttachment }
 }
 
 class WeChatBridge {
@@ -809,14 +811,14 @@ class WeChatBridge {
     // 合并缓冲图片
     const pendingImgEntry = this.pendingImages.get(chatId)
     const pendingImgs = pendingImgEntry ? pendingImgEntry.images : []
-    const allImages = [...pendingImgs, ...imageDownloads]
-    this.pendingImages.delete(chatId)
+    const allImages = [...pendingImgs, ...imageDownloads].slice(-WeChatBridge.PENDING_IMAGES_MAX)
+    if (allImages.length) this.pendingImages.set(chatId, { images: allImages, createdAt: pendingImgEntry?.createdAt ?? Date.now() })
 
     // 合并缓冲文件
     const pendingFileEntry = this.pendingFiles.get(chatId)
     const pendingFls = pendingFileEntry ? pendingFileEntry.files : []
-    const allFiles = [...pendingFls, ...fileDownloads]
-    this.pendingFiles.delete(chatId)
+    const allFiles = [...pendingFls, ...fileDownloads].slice(-WeChatBridge.PENDING_FILES_MAX)
+    if (allFiles.length) this.pendingFiles.set(chatId, { files: allFiles, createdAt: pendingFileEntry?.createdAt ?? Date.now() })
 
     // 无媒体 → 原有纯文本路径
     if (allImages.length === 0 && allFiles.length === 0) {
@@ -824,26 +826,14 @@ class WeChatBridge {
       return
     }
 
-    // 命令消息携带媒体（极少见）：把媒体放回缓冲，仅处理命令
+    // 命令不消费媒体，也不延长原TTL。
     if (text.trimStart().startsWith('/')) {
-      if (allImages.length > 0) {
-        this.pendingImages.set(chatId, { images: allImages, createdAt: Date.now() })
-      }
-      if (allFiles.length > 0) {
-        this.pendingFiles.set(chatId, { files: allFiles, createdAt: Date.now() })
-      }
       await this.commandHandler.handleIncomingMessage(chatId, text, { contextToken })
       return
     }
 
     // 有媒体：先检查 session 是否正在运行
     if (this.commandHandler.isSessionActive(chatId)) {
-      if (allImages.length > 0) {
-        this.pendingImages.set(chatId, { images: allImages, createdAt: Date.now() })
-      }
-      if (allFiles.length > 0) {
-        this.pendingFiles.set(chatId, { files: allFiles, createdAt: Date.now() })
-      }
       await this.client.sendText(chatId, '❌ 上一条消息仍在处理中，附件已暂存，请稍候再试', contextToken)
       return
     }
@@ -851,7 +841,7 @@ class WeChatBridge {
     // 确保 binding 存在，保存媒体到会话目录
     const binding = this.commandHandler.ensureBinding(chatId)
     if (!binding) {
-      await this.client.sendText(chatId, '请先在 Proma 设置中选择 Agent 渠道。', contextToken)
+      await this.client.sendText(chatId, this.commandHandler.getBindingFailureMessage(chatId), contextToken)
       return
     }
     const workspace = binding.workspaceId ? getAgentWorkspace(binding.workspaceId) : undefined
@@ -860,34 +850,58 @@ class WeChatBridge {
       return
     }
 
+    const target = { sessionId: binding.sessionId, workspaceId: binding.workspaceId }
     const attachments: BridgeAttachment[] = []
-
-    // 保存图片
-    for (const img of allImages) {
-      const hint = `wechat-${img.id}`
-      const absolutePath = saveImageToSession(
-        workspace.slug,
-        binding.sessionId,
-        hint,
-        img.mediaType,
-        img.data,
-      )
-      const label = `${hint}.${inferExtension(img.mediaType)}`
-      attachments.push({ absolutePath, label, kind: 'image' as const })
+    try {
+      for (const img of allImages) {
+        const cached = img.prepared
+        if (cached?.sessionId === target.sessionId && cached.workspaceId === target.workspaceId && existsSync(cached.attachment.absolutePath)) {
+          attachments.push(cached.attachment)
+          continue
+        }
+        const hint = `wechat-${img.id}`
+        const attachment: BridgeAttachment = {
+          absolutePath: saveImageToSession(workspace.slug, target.sessionId, hint, img.mediaType, img.data),
+          label: `${hint}.${inferExtension(img.mediaType)}`,
+          kind: 'image',
+        }
+        img.prepared = { ...target, attachment }
+        attachments.push(attachment)
+      }
+      for (const file of allFiles) {
+        const cached = file.prepared
+        if (cached?.sessionId === target.sessionId && cached.workspaceId === target.workspaceId && existsSync(cached.attachment.absolutePath)) {
+          attachments.push(cached.attachment)
+          continue
+        }
+        const attachment: BridgeAttachment = {
+          absolutePath: saveFileToSession(workspace.slug, target.sessionId, file.fileName, file.data),
+          label: file.fileName,
+          kind: 'file',
+        }
+        file.prepared = { ...target, attachment }
+        attachments.push(attachment)
+      }
+    } catch (error) {
+      console.error('[微信 Bridge] 保存附件失败:', redactSensitiveLogValue(error))
+      await this.client.sendText(chatId, '附件保存失败，原附件已暂存，请稍后重试。', contextToken)
+      return
     }
-
-    // 保存文件
-    for (const file of allFiles) {
-      const absolutePath = saveFileToSession(
-        workspace.slug,
-        binding.sessionId,
-        file.fileName,
-        file.data,
-      )
-      attachments.push({ absolutePath, label: file.fileName, kind: 'file' as const })
+    const accepted = await this.commandHandler.handleIncomingMessage(chatId, text, { contextToken }, attachments, target)
+    if (accepted) {
+      const images = this.pendingImages.get(chatId)
+      if (images) {
+        const remaining = images.images.filter((img) => !allImages.includes(img))
+        if (remaining.length) this.pendingImages.set(chatId, { ...images, images: remaining })
+        else this.pendingImages.delete(chatId)
+      }
+      const files = this.pendingFiles.get(chatId)
+      if (files) {
+        const remaining = files.files.filter((file) => !allFiles.includes(file))
+        if (remaining.length) this.pendingFiles.set(chatId, { ...files, files: remaining })
+        else this.pendingFiles.delete(chatId)
+      }
     }
-
-    await this.commandHandler.handleIncomingMessage(chatId, text, { contextToken }, attachments)
   }
 
   // ===== 同步游标持久化 =====

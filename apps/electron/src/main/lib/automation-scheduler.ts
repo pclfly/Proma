@@ -11,9 +11,12 @@
  * - 强制 bypassPermissions，否则无人值守时写操作会因权限弹窗永久阻塞
  * - 来源会话/目标会话忙时跳过本轮，不排队堆积
  * - 连续失败达上限自动暂停
- * - 启动时恢复：已过期的 nextRunAt 顺延到下一个完整间隔，避免重启雪崩触发
+ * - 启动时恢复：遗留 running 记录标为中断；已过期的 nextRunAt 顺延到下一个完整间隔，避免重启雪崩触发
+ *
+ * 运行生命周期（启动即落盘 running、按 runId 结算一次、立即返回启动摘要）见 automation-run-controller.ts。
  */
 
+import { randomUUID } from 'node:crypto'
 import { BrowserWindow } from 'electron'
 import {
   AUTOMATION_MAX_CONSECUTIVE_FAILURES,
@@ -21,18 +24,25 @@ import {
   AUTOMATION_DEFAULT_SESSION_MODE,
   type Automation,
   type AutomationRun,
+  type AutomationRunStartResult,
 } from '@proma/shared'
 import {
   listAutomations,
   getAutomation,
-  appendRun,
+  insertAutomationRun,
+  attachAutomationRunSession,
+  settleAutomationRun,
+  recoverInterruptedAutomationRuns,
   updateAutomation,
   setNextRunAt,
-  setLastSessionId,
   computeNextRunAt,
 } from './automation-manager'
+import {
+  createAutomationRunController,
+  type AutomationRunSessionTarget,
+} from './automation-run-controller'
 import { createAgentSession, updateAgentSessionMeta, getAgentSessionMeta } from './agent-session-manager'
-import { getSessionContextUsageRatio } from './agent-session-usage'
+import { getAgentTurnUsage } from './agent-turn-usage-service'
 import { runAgentHeadless, isAgentSessionActive } from './agent-service'
 import { notifyAutomationRunFinished } from './automation-notification-service'
 
@@ -95,8 +105,6 @@ function formatScheduleLabel(a: Automation): string {
 }
 
 let tickTimer: NodeJS.Timeout | undefined
-/** 正在执行中的 automation id 集合，防止同一任务重入 */
-const runningAutomations = new Set<string>()
 
 /** 向所有渲染窗口广播任务列表变更，触发前端刷新 */
 export function broadcastChanged(): void {
@@ -108,160 +116,108 @@ export function broadcastChanged(): void {
 }
 
 /**
- * 执行一次定时任务：新建子会话 + headless 运行
- *
- * @param automation 任务定义
- * @param manual 是否手动「立即运行」（手动运行也走同一路径，但不影响调度计时由 appendRun 统一推进）
+ * 解析本轮要执行的子会话
+ * - reuse：lastSessionId 存在且会话还活着就复用，否则新建
+ * - daily：再叠加一层「同一自然日」+「上下文占用率 < 阈值」双重判断
+ *   （基于 automation.lastRunAt 排除 skipped 运行；占用率读不到时按"未知"保守复用）
+ * 已被用户手动接管（automationGraduated）的会话不再复用，避免把定时任务消息注入用户的私人会话。
  */
-export async function runAutomation(automation: Automation, manual = false): Promise<void> {
-  if (runningAutomations.has(automation.id)) {
-    console.log(`[定时任务] ${automation.name} 上一轮尚未结束，跳过本轮`)
-    appendRun(automation.id, {
-      runAt: Date.now(),
-      sessionId: '',
-      status: 'skipped',
-      skipReason: '上一轮尚未结束',
-    })
-    broadcastChanged()
-    return
+async function resolveRunSession(automation: Automation, runAt: number): Promise<AutomationRunSessionTarget> {
+  const sessionMode = automation.sessionMode ?? AUTOMATION_DEFAULT_SESSION_MODE
+
+  let reuseSessionId: string | undefined
+  const lastSessionMeta = automation.lastSessionId ? getAgentSessionMeta(automation.lastSessionId) : undefined
+  if (lastSessionMeta?.automationGraduated) {
+    console.log(`[定时任务] ${automation.name} 上次会话已被用户接管，本次自动开新会话`)
+  }
+  if (automation.lastSessionId && lastSessionMeta && !lastSessionMeta.automationGraduated) {
+    if (lastSessionMeta.workspaceId !== automation.workspaceId) {
+      console.warn(`[定时任务] ${automation.name} 上次会话项目已变化，本次自动开新会话`)
+    } else if (sessionMode === 'reuse') {
+      reuseSessionId = automation.lastSessionId
+    } else if (
+      sessionMode === 'daily' &&
+      automation.lastRunAt &&
+      isSameLocalDay(automation.lastRunAt, runAt)
+    ) {
+      const usageRatio = await getAgentTurnUsage(automation.lastSessionId)
+      if (usageRatio === undefined || usageRatio < DAILY_CONTEXT_ROLLOVER_THRESHOLD) {
+        reuseSessionId = automation.lastSessionId
+      } else {
+        console.log(
+          `[定时任务] ${automation.name} 上下文占用 ${(usageRatio * 100).toFixed(1)}% 已达阈值 ${DAILY_CONTEXT_ROLLOVER_THRESHOLD * 100}%，本次自动开新会话`,
+        )
+      }
+    }
   }
 
-  runningAutomations.add(automation.id)
-  const runAt = Date.now()
+  if (reuseSessionId) return { sessionId: reuseSessionId, reused: true }
 
-  try {
-    // 根据 sessionMode 决定新建或复用子会话
-    //  - reuse：lastSessionId 存在且会话还活着就复用，否则新建
-    //  - daily：再叠加一层「同一自然日」+「上下文占用率 < 阈值」双重判断
-    //    （基于 automation.lastRunAt 排除 skipped 运行；占用率读不到时按"未知"保守复用）
-    const sessionMode = automation.sessionMode ?? AUTOMATION_DEFAULT_SESSION_MODE
+  const created = createAgentSession(automation.name, automation.channelId, automation.workspaceId, automation.modelId)
+  updateAgentSessionMeta(created.id, { sourceAutomationId: automation.id })
+  return { sessionId: created.id, reused: false }
+}
 
-    let reuseSessionId: string | undefined
-    const lastSessionMeta = automation.lastSessionId ? getAgentSessionMeta(automation.lastSessionId) : undefined
-    // 已被用户手动接管（毕业）的会话不再复用，强制新建，避免把定时任务消息注入用户的私人会话
-    if (lastSessionMeta?.automationGraduated) {
-      console.log(`[定时任务] ${automation.name} 上次会话已被用户接管，本次自动开新会话`)
-    }
-    if (automation.lastSessionId && lastSessionMeta && !lastSessionMeta.automationGraduated) {
-      if (lastSessionMeta.workspaceId !== automation.workspaceId) {
-        console.warn(`[定时任务] ${automation.name} 上次会话项目已变化，本次自动开新会话`)
-      } else if (sessionMode === 'reuse') {
-        reuseSessionId = automation.lastSessionId
-      } else if (
-        sessionMode === 'daily' &&
-        automation.lastRunAt &&
-        isSameLocalDay(automation.lastRunAt, runAt)
-      ) {
-        const usageRatio = getSessionContextUsageRatio(automation.lastSessionId)
-        if (usageRatio === undefined || usageRatio < DAILY_CONTEXT_ROLLOVER_THRESHOLD) {
-          reuseSessionId = automation.lastSessionId
-        } else {
-          console.log(
-            `[定时任务] ${automation.name} 上下文占用 ${(usageRatio * 100).toFixed(1)}% 已达阈值 ${DAILY_CONTEXT_ROLLOVER_THRESHOLD * 100}%，本次自动开新会话`,
-          )
-        }
-      }
-    }
+/** 运行收尾副作用：完成通知 + 失败退避（只在结算真正生效时调用一次） */
+function afterRunSettled(automation: Automation, run: AutomationRun): void {
+  void notifyAutomationRunFinished({ automation, run }).catch((err) => {
+    console.error(`[定时任务] 发送完成通知失败: ${automation.name}`, err)
+  })
 
-    let targetSessionId: string
-    if (reuseSessionId) {
-      targetSessionId = reuseSessionId
-    } else {
-      const created = createAgentSession(automation.name, automation.channelId, automation.workspaceId, automation.modelId)
-      updateAgentSessionMeta(created.id, { sourceAutomationId: automation.id })
-      targetSessionId = created.id
-      setLastSessionId(automation.id, created.id)
-    }
-
-
-    await new Promise<void>((resolveRun) => {
-      let settled = false
-      const finish = (status: 'success' | 'error', error?: string): void => {
-        if (settled) return
-        settled = true
-        if (timeoutTimer) clearTimeout(timeoutTimer)
-        const run: AutomationRun = {
-          runAt,
-          sessionId: targetSessionId,
-          status,
-          durationMs: Date.now() - runAt,
-          error,
-        }
-        appendRun(automation.id, run)
-        broadcastChanged()
-        void notifyAutomationRunFinished({ automation, run }).catch((err) => {
-          console.error(`[定时任务] 发送完成通知失败: ${automation.name}`, err)
-        })
-        // 失败退避：连续失败达上限自动暂停
-        const latest = getAutomation(automation.id)
-        if (
-          latest &&
-          latest.active &&
-          (latest.consecutiveFailures ?? 0) >= AUTOMATION_MAX_CONSECUTIVE_FAILURES
-        ) {
-          updateAutomation({ id: automation.id, active: false })
-          console.warn(`[定时任务] ${automation.name} 连续失败 ${latest.consecutiveFailures} 次，已自动暂停`)
-          broadcastChanged()
-        }
-        resolveRun()
-      }
-
-      // 超时保护：防止 runAgentHeadless 永远不回调导致 automation 永久卡死
-      const timeoutTimer = setTimeout(() => {
-        finish('error', `执行超时（超过 ${RUN_TIMEOUT_MS / 3600_000} 小时）`)
-        console.warn(`[定时任务] ${automation.name} 执行超时，强制结束`)
-      }, RUN_TIMEOUT_MS)
-
-      runAgentHeadless(
-        {
-          sessionId: targetSessionId,
-          userMessage: automation.prompt + '\n<!--PROMA_SCHEDULED_RUN-->',
-          automationContext: `这是 Proma 定时任务「${automation.name}」的自动执行（ID: ${automation.id}，${formatScheduleLabel(automation)}）。这本身就是定时任务，不要建议用户再创建定时任务。直接执行任务即可。如发现本任务连续失败、输出价值低、频率不合适或提示词不完整，可以使用 automation 工具读取并更新当前任务。`,
-          channelId: automation.channelId,
-          modelId: automation.modelId,
-          workspaceId: automation.workspaceId,
-          permissionModeOverride: automation.permissionMode ?? 'bypassPermissions',
-          triggeredBy: 'automation',
-          startedAt: runAt,
-        },
-        {
-          source: 'bridge',
-          onError: (error) => finish('error', error),
-          onComplete: () => finish('success'),
-          onTitleUpdated: () => { /* 子会话标题不需要特殊处理 */ },
-        },
-      ).catch((err) => {
-        finish('error', err instanceof Error ? err.message : '未知错误')
-      })
-    })
-  } catch (err) {
-    console.error(`[定时任务] ${automation.name} 执行异常:`, err)
-    const run: AutomationRun = {
-      runAt,
-      sessionId: '',
-      status: 'error',
-      durationMs: Date.now() - runAt,
-      error: err instanceof Error ? err.message : '未知错误',
-    }
-    appendRun(automation.id, run)
+  const latest = getAutomation(automation.id)
+  if (
+    latest &&
+    latest.active &&
+    (latest.consecutiveFailures ?? 0) >= AUTOMATION_MAX_CONSECUTIVE_FAILURES
+  ) {
+    updateAutomation({ id: automation.id, active: false })
+    console.warn(`[定时任务] ${automation.name} 连续失败 ${latest.consecutiveFailures} 次，已自动暂停`)
     broadcastChanged()
-    void notifyAutomationRunFinished({ automation, run }).catch((notifyError) => {
-      console.error(`[定时任务] 发送异常通知失败: ${automation.name}`, notifyError)
-    })
-  } finally {
-    runningAutomations.delete(automation.id)
   }
 }
 
-/** 立即运行一次（手动触发，不影响调度计时之外的逻辑） */
-export async function runAutomationNow(id: string): Promise<void> {
+const runController = createAutomationRunController({
+  now: () => Date.now(),
+  createRunId: () => randomUUID(),
+  getAutomation,
+  insertRun: insertAutomationRun,
+  attachSession: attachAutomationRunSession,
+  settleRun: settleAutomationRun,
+  resolveSession: resolveRunSession,
+  startSessionRun: (automation, target, runAt, callbacks) => runAgentHeadless(
+    {
+      sessionId: target.sessionId,
+      userMessage: automation.prompt + '\n<!--PROMA_SCHEDULED_RUN-->',
+      automationContext: `这是 Proma 定时任务「${automation.name}」的自动执行（ID: ${automation.id}，${formatScheduleLabel(automation)}）。这本身就是定时任务，不要建议用户再创建定时任务。直接执行任务即可。如发现本任务连续失败、输出价值低、频率不合适或提示词不完整，可以使用 automation 工具读取并更新当前任务。`,
+      channelId: automation.channelId,
+      modelId: automation.modelId,
+      workspaceId: automation.workspaceId,
+      permissionModeOverride: automation.permissionMode ?? 'bypassPermissions',
+      triggeredBy: 'automation',
+      startedAt: runAt,
+    },
+    {
+      source: 'bridge',
+      onError: callbacks.onError,
+      onComplete: callbacks.onComplete,
+      onTitleUpdated: () => { /* 子会话标题不需要特殊处理 */ },
+    },
+  ),
+  afterSettled: afterRunSettled,
+  broadcast: broadcastChanged,
+  timeoutMs: RUN_TIMEOUT_MS,
+})
+
+/**
+ * 立即运行一次（手动触发，不影响调度计时）
+ *
+ * 会话创建完成后立即返回摘要，不等待任务执行结束；
+ * 并发 / 配置不完整 / 启动失败通过 started:false + reason 表达。
+ */
+export async function runAutomationNow(id: string): Promise<AutomationRunStartResult> {
   const automation = getAutomation(id)
   if (!automation) throw new Error(`定时任务不存在: ${id}`)
-  // 草稿态（缺 channelId / workspaceId）拒绝运行，兜底前端 disabled 防止 IPC 绕过
-  if (!automation.channelId || !automation.workspaceId) {
-    throw new Error('请先为该任务配置模型与项目')
-  }
-  await runAutomation(automation, true)
+  return runController.start(id, 'manual')
 }
 
 /** 一个 tick：扫描所有 active 且到期的任务并触发 */
@@ -272,24 +228,34 @@ function tick(): void {
     // 完整度兜底：老用户可能存在「active=true 但缺工作区 / 渠道」的历史数据，跳过避免运行时崩溃
     if (!automation.channelId || !automation.workspaceId) continue
     if (now < automation.nextRunAt) continue
-    if (runningAutomations.has(automation.id)) continue
+    if (runController.isRunning(automation.id)) continue
     // 来源会话忙时跳过（极端情况下的额外保险，主要靠新建子会话规避）
     if (automation.sourceSessionId && isAgentSessionActive(automation.sourceSessionId)) {
       continue
     }
-    // 不 await，让多个任务可以并行触发；各自有 runningAutomations 重入保护
-    void runAutomation(automation)
+    // 不 await，让多个任务可以并行触发；各自有 runController 的重入保护
+    void runController.start(automation.id, 'schedule')
   }
 }
 
 /**
  * 启动调度器
  *
- * 恢复策略：把已过期的 nextRunAt 顺延到「现在 + 一个完整间隔」，
- * 避免应用重启后一堆历史任务在同一 tick 内雪崩触发。
+ * 恢复策略：
+ * 1. 先把上次进程遗留的 running 记录标为 interrupted（只改记录，不重跑）；
+ * 2. 把已过期的 nextRunAt 顺延到「现在 + 一个完整间隔」，避免应用重启后一堆历史任务在同一 tick 内雪崩触发。
  */
 export function startScheduler(): void {
   if (tickTimer) return
+  try {
+    const recovered = recoverInterruptedAutomationRuns()
+    if (recovered > 0) {
+      console.warn(`[定时任务] 启动恢复：${recovered} 条未结束的运行已标记为中断，不会自动重跑`)
+      broadcastChanged()
+    }
+  } catch (error) {
+    console.error('[定时任务] 启动恢复运行记录失败:', error)
+  }
   const now = Date.now()
   for (const automation of listAutomations()) {
     if (automation.active && automation.nextRunAt <= now) {

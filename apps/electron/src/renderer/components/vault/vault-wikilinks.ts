@@ -8,7 +8,7 @@ const frontmatterEnds = new WeakMap<Text, number>()
 function frontmatterEnd(doc: Text): number {
   const cached = frontmatterEnds.get(doc)
   if (cached !== undefined) return cached
-  const range = doc.line(1).text.replace(/^\uFEFF/, '') === '---'
+  const range = /^(?:\uFEFF)?---[ \t]*$/.test(doc.line(1).text)
     ? getLeadingFrontmatterRange(doc.toJSON()) : null
   const end = range ? doc.line(range.endLine).to : 0
   frontmatterEnds.set(doc, end)

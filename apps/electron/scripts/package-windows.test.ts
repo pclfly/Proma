@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { cleanWindowsPackageOutput, createWindowsPackageSteps } from './package-windows'
 
 const tempDirs: string[] = []
@@ -19,14 +19,7 @@ describe('Windows 一键打包流程', () => {
       ['bun', 'install', '--frozen-lockfile'],
       ['bun', 'node_modules/electron/install.js'],
       ['bun', 'run', 'typecheck'],
-      [
-        'bun',
-        'test',
-        '--path-ignore-patterns=**/agent-session-manager.test.ts',
-        '--path-ignore-patterns=**/agent-workspace-manager.test.ts',
-        '--path-ignore-patterns=**/planning-manager.test.ts',
-        '--path-ignore-patterns=**/pi-image-generation-tool.test.ts',
-      ],
+      ['bun', 'run', 'test'],
       ['bun', 'run', 'dist:win'],
     ])
     expect(steps[4]).toEqual(expect.objectContaining({
@@ -36,6 +29,16 @@ describe('Windows 一键打包流程', () => {
         ELECTRON_MIRROR: 'https://npmmirror.com/mirrors/electron/',
       },
     }))
+  })
+
+  test('Given 测试文件使用模块mock When 打包测试 Then 复用根隔离全量入口且不排除文件', () => {
+    const repoRoot = resolve(import.meta.dir, '..', '..', '..')
+    const manifest = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as { scripts: { test: string } }
+    const step = createWindowsPackageSteps(repoRoot).find((item) => item.name === '运行测试')
+
+    expect(step).toEqual({ name: '运行测试', cwd: repoRoot, command: 'bun', args: ['run', 'test'] })
+    expect(manifest.scripts.test).toBe('bun test --isolate')
+    expect(step?.args.some((arg) => arg.includes('path-ignore-patterns'))).toBe(false)
   })
 
   test('Given 输出目录存在旧安装包 When 开始打包 Then 只清理当前项目输出目录', () => {

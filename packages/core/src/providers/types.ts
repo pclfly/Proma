@@ -6,7 +6,7 @@
  * core 层不依赖 Electron / Node fs，通过注入函数访问平台能力。
  */
 
-import type { AgentThinkingLevel, ChatMessage, FileAttachment, ProviderType } from '@proma/shared'
+import type { AgentThinkingLevel, ProviderMessage, FileAttachment, ProviderType } from '@proma/shared'
 
 // ===== 图片附件数据 =====
 
@@ -209,7 +209,7 @@ export interface StreamRequestInput {
   /** 模型 ID */
   modelId: string
   /** 经过裁剪的历史消息（不含当前用户消息） */
-  history: ChatMessage[]
+  history: ProviderMessage[]
   /** 当前用户消息文本 */
   userMessage: string
   /** 系统提示词 */

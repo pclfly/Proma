@@ -14,9 +14,10 @@ import { createRequire } from 'node:module'
 import { createHash } from 'node:crypto'
 import AdmZip from 'adm-zip'
 import { DOMParser } from '@xmldom/xmldom'
-import type { FilePreviewReadResult, OfficePreviewResult } from '@proma/shared'
+import { isUnviewableBinary, UNVIEWABLE_BINARY_HEAD_BYTES, type FilePreviewReadResult, type OfficePreviewResult } from '@proma/shared'
 import { getBundledOfficeCliPath } from './officecli-manager'
 import { expandHomeDirectory } from './agent-file-path'
+import { buildPdfPreviewHtml, isPdfPreviewPath } from './pdf-preview-html'
 
 const require = createRequire(__filename)
 const PDFJS_PACKAGE = 'pdfjs-dist'
@@ -580,6 +581,11 @@ export function resolveAndReadFile(filePath: string, basePaths?: string[]): File
       return { resolvedPath: safePath, content: '', isBinary: false, isTooLarge: true, metadata }
     }
     const rawContent = readFileSync(safePath)
+    // 官方 0.22.28：容器/可执行等二进制不再尝试内联预览，避免把压缩包或
+    // 可执行文件按文本猜出乱码；扩展名与头部魔数任一命中即走“系统打开”。
+    if (isUnviewableBinary(metadata.name, rawContent.subarray(0, UNVIEWABLE_BINARY_HEAD_BYTES))) {
+      return { resolvedPath: safePath, content: '', isBinary: true, isTooLarge: false, metadata }
+    }
     const content = readSafeText(rawContent)
     if (content === null) {
       return { resolvedPath: safePath, content: '', isBinary: true, isTooLarge: false, metadata }
@@ -599,9 +605,15 @@ export function resolveFilePath(filePath: string, basePaths?: string[]): string 
 /** 为内联 PDF 预览生成临时 HTML 文件（使用 proma-file:// 加载 PDF，无体积膨胀） */
 export async function preparePdfPreview(filePath: string, basePaths?: string[]): Promise<{ resolvedPath: string; tmpHtmlUrl: string } | null> {
   const safePath = resolveTargetPath(filePath, basePaths)
-  if (!existsSync(safePath)) return null
-  const st = statSync(safePath)
-  if (st.size > MAX_FILE_SIZE) return null
+  // 渲染端只对 .pdf 扩展名进入该分支；主进程侧再兜底一次，避免任意文件被交给 pdf.js 解析。
+  if (!isPdfPreviewPath(safePath)) return null
+  try {
+    if (!existsSync(safePath)) return null
+    const st = statSync(safePath)
+    if (!st.isFile() || st.size > MAX_FILE_SIZE) return null
+  } catch {
+    return null
+  }
 
   let fileUrl: string
   let pdfScriptUrl: string
@@ -621,75 +633,7 @@ export async function preparePdfPreview(filePath: string, basePaths?: string[]):
     return null
   }
 
-  const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: transparent; overflow: auto; padding: 16px; }
-  #c { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; width: fit-content; min-width: 100%; }
-  #c canvas { box-shadow: 0 2px 8px rgba(0,0,0,0.15); margin: 0 auto; display: block; }
-  .loading { color: #888; font: 12px/1.5 system-ui; padding: 40px; text-align: center; width: 100%; }
-  .error { color: #f87171; font: 12px/1.5 system-ui; padding: 20px; text-align: center; width: 100%; }
-  .page-info { color: #888; font: 11px/1.5 system-ui; text-align: center; padding: 4px; width: 100%; }
-</style>
-</head><body>
-  <div class="loading" id="c">正在加载 PDF...</div>
-  <script type="module">
-    const container = document.getElementById('c');
-    const fileUrl = ${JSON.stringify(fileUrl)};
-    const pdfScriptUrl = ${JSON.stringify(pdfScriptUrl)};
-    const pdfWorkerUrl = ${JSON.stringify(pdfWorkerUrl)};
-    const standardFontDataUrl = ${JSON.stringify(standardFontDataUrl)};
-    const STEPS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3];
-    let stepIdx = 2;
-    let pdfDoc = null;
-
-    function notifyZoom() {
-      window.parent.postMessage({ type: 'pdf-zoom-changed', zoom: Math.round(STEPS[stepIdx] * 100) }, '*');
-    }
-
-    async function renderAll() {
-      if (!pdfDoc) return;
-      container.innerHTML = '';
-      const userScale = STEPS[stepIdx];
-      const dpr = window.devicePixelRatio || 1;
-      for (let i = 1; i <= pdfDoc.numPages; i++) {
-        const page = await pdfDoc.getPage(i);
-        const vp = page.getViewport({ scale: userScale * dpr });
-        const canvas = document.createElement('canvas');
-        canvas.width = vp.width; canvas.height = vp.height;
-        canvas.style.width = (vp.width / dpr) + 'px';
-        canvas.style.height = (vp.height / dpr) + 'px';
-        await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
-        container.appendChild(canvas);
-      }
-      const info = document.createElement('div');
-      info.className = 'page-info';
-      info.textContent = '共 ' + pdfDoc.numPages + ' 页';
-      container.appendChild(info);
-      notifyZoom();
-    }
-
-    window.addEventListener('message', (e) => {
-      if (e.data?.type === 'pdf-zoom') {
-        if (e.data.direction === 'in' && stepIdx < STEPS.length - 1) { stepIdx++; renderAll(); }
-        if (e.data.direction === 'out' && stepIdx > 0) { stepIdx--; renderAll(); }
-      }
-    });
-
-    try {
-      const pdfjsLib = await import(pdfScriptUrl);
-      pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
-      pdfDoc = await pdfjsLib.getDocument({
-        url: fileUrl,
-        standardFontDataUrl,
-      }).promise;
-      await renderAll();
-    } catch (err) {
-      container.innerHTML = '<div class="error">PDF 加载失败: ' + err.message + '<\\/div>';
-    }
-  <\/script>
-<\/body><\/html>`
+  const html = buildPdfPreviewHtml({ fileUrl, pdfScriptUrl, pdfWorkerUrl, standardFontDataUrl })
   const tmpHtmlPath = writeTempHtml(html)
   const tmpHtmlUrl = registerFilePath(tmpHtmlPath)
   return { resolvedPath: safePath, tmpHtmlUrl }

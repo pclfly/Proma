@@ -701,7 +701,7 @@ export function getDelegationTabLabel(title: string | null | undefined): string 
   return title?.trim() || '委派任务'
 }
 
-export type AgentSidePanelBaseTab = 'files' | 'changes' | 'chat' | 'temporary-agent' | 'delegation' | WorkspaceComponentTab
+export type AgentSidePanelBaseTab = 'files' | 'changes' | 'temporary-agent' | 'delegation' | WorkspaceComponentTab
 /** 工作区组件、每个 Pi 探索分支、协作子 Agent、浏览器网页和文件预览都处于右侧工作区顶栏。 */
 export type AgentSidePanelTab = AgentSidePanelBaseTab | `exploration:${string}` | `browser:${string}` | `preview:${string}` | `terminal:${string}`
 
@@ -996,6 +996,19 @@ export const sessionPersistedPermissionModeAtom = atomFamily((sessionId: string)
   atom((get) => {
     const sessions = get(agentSessionsAtom)
     return sessions.find((s) => s.id === sessionId)?.permissionMode
+  }),
+)
+
+/**
+ * 按 sessionId 派生该会话是否启用破甲。
+ *
+ * 会话级字段，未设置即为 false：新建会话永远默认关闭，
+ * 不继承上一个会话或全局设置的开启状态。
+ */
+export const sessionArmorEnabledAtom = atomFamily((sessionId: string) =>
+  atom((get) => {
+    const sessions = get(agentSessionsAtom)
+    return sessions.find((s) => s.id === sessionId)?.armorEnabled === true
   }),
 )
 

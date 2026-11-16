@@ -78,6 +78,44 @@ body {
   background-color: hsl(var(--primary) / 0.50);
 }
 
+/* 用户消息气泡是固定的白底黑字（官方 0.22.0 视觉），主题 primary/20% 叠在白底上
+ * 几乎不可见。这里改用中性灰 #B6B6B6（与系统默认高亮色一致），白底+黑字下对比清晰，
+ * 不与气泡里的主题色文案抢色。
+ */
+.message-item.is-user ::selection {
+  background-color: #b6b6b6;
+  color: #000;
+}
+.message-item.is-user ::-moz-selection {
+  background-color: #b6b6b6;
+  color: #000;
+}
+
+/* 用户消息气泡固定白底黑字，但气泡内的引用/附件 chip 仍按主题语义色着色：
+ * 深色主题的 --primary 接近纯白、--muted 偏暗、--foreground 为浅色，这些 token
+ * 叠在白底上会让 chip 文字（如 @file 引用、附件名、引用块）几乎不可见。
+ * 这里只把气泡内部的语义 token 回落到浅色值，气泡外的操作按钮不受影响。 */
+.message-item.is-user .message-bubble {
+  --foreground: 0 0% 9%;
+  --primary: 0 0% 9%;
+  --primary-foreground: 0 0% 98%;
+  --secondary: 0 0% 96.1%;
+  --secondary-foreground: 0 0% 9%;
+  --muted: 0 0% 96.1%;
+  --muted-foreground: 0 0% 45.1%;
+  --accent: 0 0% 96.1%;
+  --accent-foreground: 0 0% 9%;
+  --border: 0 0% 89.8%;
+}
+
+/* todo / 日程 chip 的 dark: 变体面向深色正文（浅色文字）；白底气泡内改用同色系深色文字。 */
+.message-item.is-user .message-bubble [data-mention-type="todo"] {
+  color: #92400e; /* amber-800 */
+}
+.message-item.is-user .message-bubble [data-mention-type="calendar_event"] {
+  color: #155e75; /* cyan-800 */
+}
+
 /* CRT 终端：亮绿选区 + 黑字 */
 .theme-terminal-dark ::selection,
 .theme-terminal-dark ::-moz-selection {
@@ -156,6 +194,11 @@ body {
     --dashed-border-hover: 0 0% 9% / 0.50;
     /* Markdown 预览正文字号（medium 档默认；initializer 加载用户偏好后会覆盖） */
     --md-preview-font-size: 15px;
+    /* 全局字号轴（官方 0.22.0）：内容/代码/终端；菜单快捷键步进后由主进程广播 */
+    --content-font-size: 15px;
+    --code-font-size: 12px;
+    --terminal-font-size: 14px;
+    --reading-font-size-offset: 0px;
   }
 
   .dark {
@@ -2775,6 +2818,93 @@ body {
   line-height: 1.2;
 }
 
+/* Vault 阅读态：表格单元格与 Callout 内的 [[双链]]。 */
+.vault-wikilink-inline {
+  color: hsl(262 83% 58%);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+}
+.vault-wikilink-inline:hover {
+  color: hsl(262 83% 50%);
+}
+
+/* Obsidian Callout 阅读块；不改变 Markdown 原文，光标进入即恢复源码。 */
+.live-markdown-callout {
+  --callout-accent: hsl(212 92% 58%);
+  box-sizing: border-box;
+  margin-block: 0.4rem;
+  border-left: 3px solid var(--callout-accent);
+  border-radius: 0.35rem;
+  background: color-mix(in srgb, var(--callout-accent) 8%, transparent);
+  padding: 0.5rem 0.75rem 0.55rem;
+}
+.live-markdown-callout.is-tip { --callout-accent: hsl(160 84% 39%); }
+.live-markdown-callout.is-important { --callout-accent: hsl(262 83% 58%); }
+.live-markdown-callout.is-warning { --callout-accent: hsl(35 92% 50%); }
+.live-markdown-callout.is-danger { --callout-accent: hsl(0 72% 51%); }
+.live-markdown-callout.is-question { --callout-accent: hsl(199 89% 48%); }
+.live-markdown-callout.is-quote { --callout-accent: hsl(215 15% 45%); }
+.live-markdown-callout.is-example { --callout-accent: hsl(271 76% 53%); }
+.live-markdown-callout.is-success { --callout-accent: hsl(142 71% 40%); }
+.live-markdown-callout-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  color: var(--callout-accent);
+  font-weight: 600;
+  line-height: 1.45;
+}
+.live-markdown-callout-icon {
+  display: inline-block;
+  width: 0.42rem;
+  height: 0.42rem;
+  flex: none;
+  border-radius: 9999px;
+  background: currentColor;
+}
+.live-markdown-callout-title {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.live-markdown-callout-fold {
+  margin-left: auto;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  line-height: 1;
+  padding: 0.15rem 0.25rem;
+  border-radius: 0.25rem;
+}
+.live-markdown-callout-fold:hover {
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+.live-markdown-callout-body {
+  margin-top: 0.35rem;
+  color: hsl(var(--foreground));
+  overflow-wrap: anywhere;
+}
+.live-markdown-callout-body > :first-child { margin-top: 0; }
+.live-markdown-callout-body > :last-child { margin-bottom: 0; }
+.live-markdown-callout-body p { margin-block: 0.3rem; }
+.live-markdown-callout-body pre {
+  overflow-x: auto;
+  border-radius: 0.375rem;
+  background: hsl(var(--muted));
+  padding: 0.5rem 0.7rem;
+}
+.live-markdown-callout-body code {
+  border-radius: 0.25rem;
+  background: hsl(var(--muted));
+  padding: 0.05rem 0.25rem;
+  font-size: 0.9em;
+}
+.live-markdown-callout-body pre code { background: none; padding: 0; }
+.live-markdown-callout-body a { color: hsl(var(--primary)); text-decoration: underline; }
+
 .vault-ink-mde .vault-properties {
   display: block;
   box-sizing: border-box;
@@ -2950,4 +3080,35 @@ body {
 }
 .vault-ink-mde .vault-mermaid-block .mermaid-block-wrapper {
   margin: 0;
+}
+
+/* Skills/MCP 共用内容壳；局部圆角不受全局卡片上限影响，保留 CRT 的直角主题。 */
+.agent-skills-content {
+  border-radius: 12px;
+  overflow: hidden;
+  isolation: isolate;
+}
+:root .agent-skills-content .rounded-xl { border-radius: 12px; }
+:root .agent-skills-content .rounded-2xl { border-radius: 16px; }
+
+.theme-terminal-dark .agent-skills-content { border-radius: 0; }
+
+/* 全局代码字号轴：内容区代码块与行内代码统一跟随设置。 */
+.prose code,
+.prose pre,
+.prose pre code {
+  font-size: var(--code-font-size, 12px);
+}
+
+/* 侧栏标题跑马灯：仅在文本被截断且悬停时滚动。 */
+@keyframes sidebar-title-marquee-scroll {
+  0%, 12% { transform: translateX(0); }
+  88%, 100% { transform: translateX(var(--marquee-shift, -50%)); }
+}
+.sidebar-title-marquee {
+  animation: sidebar-title-marquee-scroll 6s ease-in-out infinite;
+  max-width: none;
+}
+@media (prefers-reduced-motion: reduce) {
+  .sidebar-title-marquee { animation: none; }
 }

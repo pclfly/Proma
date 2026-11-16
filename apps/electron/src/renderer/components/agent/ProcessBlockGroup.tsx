@@ -1,6 +1,9 @@
 import * as React from 'react'
 import { ChevronRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { buildUsageTooltip } from '@/lib/turn-usage'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import type { AgentEventUsage } from '@proma/shared'
 import { getToolDisplayName, getToolIcon } from './tool-utils'
 import type {
   SDKContentBlock,
@@ -9,9 +12,21 @@ import type {
   SDKThinkingBlock,
 } from '@proma/shared'
 
+export type AssistantTurnOutcome = 'running' | 'completed' | 'stopped' | 'failed'
+
 interface ProcessBlockGroupProps {
   blocks: SDKContentBlock[]
   isStreaming?: boolean
+  /** 本轮终态；中断/失败必须保持展开并标注，不能自动折叠。 */
+  outcome?: AssistantTurnOutcome
+  /** 本轮开始时间，用于流式期间显示「持续 Xs」。 */
+  startedAt?: number
+  /** 已完成的耗时；优先于 startedAt 推算。 */
+  durationMs?: number
+  /** 已完成的过程步数（工具调用数）。 */
+  steps?: number
+  /** 本轮 token 用量；悬浮在过程摘要上显示耗时/输入/输出。 */
+  usage?: AgentEventUsage
   /** 惰性生成过程项；流式与历史态均渲染完整内容。 */
   renderChildren: () => React.ReactNode
   // 该过程组是否为整条消息的末尾项：是则流式中保留最后一段为正常显示，
@@ -20,13 +35,10 @@ interface ProcessBlockGroupProps {
 }
 
 const MAX_PROCESS_GROUP_ICONS = 4
-const PROCESS_GROUP_VIEWPORT_HEIGHT = 320
 const PROCESS_GROUP_LIVE_CHILD_WINDOW = 4
 const PROCESS_GROUP_COLLAPSE_DURATION_MS = 500
 const PROCESS_GROUP_AUTO_COLLAPSE_SOUND_DELAY_MS = 900
 const PROCESS_GROUP_AUTO_COLLAPSE_COUNTDOWN_SECONDS = 3
-const PROCESS_GROUP_FOLLOW_BOTTOM_THRESHOLD = 24
-const PROGRESS_SCROLL_KEYS = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '])
 
 interface IndexedContentBlock {
   block: SDKContentBlock
@@ -44,9 +56,20 @@ interface BuildAssistantTurnRenderItemsOptions {
   isStreaming?: boolean
 }
 
+/** OpenAI Responses 显式标记 final_answer 的文本块；优先于「末尾连续 text」启发式。 */
+function getFinalAnswerStartIndex(blocks: SDKContentBlock[]): number | null {
+  const index = blocks.findIndex(
+    (block) => block.type === 'text' && (block as SDKTextBlock).phase === 'final_answer',
+  )
+  return index >= 0 ? index : null
+}
+
 function getTrailingTextStartIndex(blocks: SDKContentBlock[]): number | null {
   const lastBlock = blocks[blocks.length - 1]
   if (lastBlock?.type !== 'text') return null
+  // 官方 0.22.80：显式标记为 commentary 的过程回复即使位于末尾，也不能当作最终答案；
+  // 否则「我先看一下」这类过程说明会被外置成答复，而真正的答案仍在工具之后。
+  if ((lastBlock as SDKTextBlock).phase === 'commentary') return null
 
   let finalStartIndex = blocks.length - 1
   while (finalStartIndex > 0 && blocks[finalStartIndex - 1]?.type === 'text') {
@@ -61,31 +84,35 @@ export function buildAssistantTurnRenderItems(
 ): AssistantTurnRenderItem[] {
   if (blocks.length === 0) return []
 
-  // 只要流式末尾出现 text，就按常规消息布局直接展示。若 Agent 之后继续调用工具，
-  // text 不再位于末尾，会自动回归过程组，避免把中间状态误认为最终答案。
+  // 最终回复必须始终留在过程组之外：
+  // 1. OpenAI Responses 显式 final_answer 阶段优先；
+  // 2. 其余模型退回「末尾连续 text」启发式。
+  // 流式期间若 Agent 之后继续调用工具，final text 不再位于末尾，会自动回归过程组。
   const hasProcessBlock = blocks.some((block) => block.type === 'tool_use' || block.type === 'thinking')
+  const finalAnswerStartIndex = getFinalAnswerStartIndex(blocks)
   const trailingTextStartIndex = getTrailingTextStartIndex(blocks)
+  const splitStartIndex = finalAnswerStartIndex ?? trailingTextStartIndex
   const canSplitStreamingFinalOutput = options.isStreaming
     && hasProcessBlock
-    && trailingTextStartIndex !== null
-    && trailingTextStartIndex > 0
+    && splitStartIndex !== null
+    && splitStartIndex > 0
 
   if (options.isStreaming && hasProcessBlock && !canSplitStreamingFinalOutput) {
     return buildProcessGroupItems(blocks)
   }
 
-  if (trailingTextStartIndex === null) {
+  if (splitStartIndex === null) {
     return buildProcessGroupItems(blocks)
   }
 
   const items: AssistantTurnRenderItem[] = []
-  if (trailingTextStartIndex > 0) {
+  if (splitStartIndex > 0) {
     items.push(...buildProcessGroupItems(
-      blocks.slice(0, trailingTextStartIndex),
+      blocks.slice(0, splitStartIndex),
     ))
   }
 
-  for (let index = trailingTextStartIndex; index < blocks.length; index++) {
+  for (let index = splitStartIndex; index < blocks.length; index++) {
     const block = blocks[index]
     if (!block) continue
     items.push({ type: 'block', item: { block, index } })
@@ -101,39 +128,104 @@ function buildProcessGroupItems(blocks: SDKContentBlock[]): AssistantTurnRenderI
   }]
 }
 
-/**
- * Reuse the previous array when streaming only changes a sibling block, such as
- * an already-externalized final text block. Delta updates replace changed block
- * objects immutably, so reference identity is enough to detect process changes.
- */
-export function stabilizeProcessBlockReferences(
-  previous: SDKContentBlock[],
-  next: SDKContentBlock[],
-): SDKContentBlock[] {
-  if (previous.length !== next.length) return next
-  for (let index = 0; index < next.length; index++) {
-    if (previous[index] !== next[index]) return next
-  }
-  return previous
+export interface NestedThinkingBlock {
+  block: SDKContentBlock
+  index: number
 }
 
-function buildProcessGroupSummary(blocks: SDKContentBlock[]): string {
-  let toolCount = 0
-  let messageCount = 0
+export interface NestedProcessItem {
+  block: SDKContentBlock
+  index: number
+  nestedThinking: NestedThinkingBlock[]
+}
 
-  for (const block of blocks) {
-    if (block.type === 'tool_use') {
-      toolCount += 1
-    } else if (block.type === 'thinking' || block.type === 'text') {
-      messageCount += 1
+/**
+ * 命令/工具行吸收紧随其后的连续思考块：展开工具行时在缩进区一并显示。
+ * 流式中的最后一段思考保持独立，避免「正在分析」被收进工具行后不可见。
+ */
+export function buildNestedProcessItems(
+  items: ReadonlyArray<{ block: SDKContentBlock; index: number }>,
+  options: { keepTailStandalone?: boolean } = {},
+): NestedProcessItem[] {
+  const keepIndex = options.keepTailStandalone ? items[items.length - 1]?.index : undefined
+  const result: NestedProcessItem[] = []
+
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i]!
+    if (item.block.type !== 'tool_use') {
+      result.push({ ...item, nestedThinking: [] })
+      continue
     }
+
+    const nestedThinking: NestedThinkingBlock[] = []
+    let next = i + 1
+    while (
+      next < items.length
+      && items[next]!.block.type === 'thinking'
+      && items[next]!.index !== keepIndex
+    ) {
+      nestedThinking.push(items[next]!)
+      next += 1
+    }
+    result.push({ ...item, nestedThinking })
+    i = next - 1
   }
 
-  const parts: string[] = []
-  if (toolCount > 0) parts.push(`${toolCount} 次工具调用`)
-  if (messageCount > 0) parts.push(`${messageCount} 条消息`)
-  const summary = parts.join('，') || '过程'
-  return `执行过程：${summary}`
+  return result
+}
+
+/** 过程摘要里的耗时使用中文单位，与截图的「5 分 52 秒」一致。 */
+export function formatProcessDuration(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))} 毫秒`
+  const totalSeconds = Math.round(ms / 1000)
+  if (totalSeconds < 60) return `${totalSeconds} 秒`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return seconds === 0 ? `${minutes} 分` : `${minutes} 分 ${seconds} 秒`
+}
+
+export interface ProcessSummaryInput {
+  outcome: AssistantTurnOutcome
+  /** 已结束轮次的耗时。 */
+  durationMs?: number
+  /** 流式期间实时耗时。 */
+  liveDurationMs?: number
+  /** 已完成的工具步数。 */
+  steps?: number
+}
+
+/**
+ * 过程摘要：一行终态文案。
+ * - 运行中：正在执行任务 · 已完成 3 步 · 持续 12 秒
+ * - 已完成，用时 1 分 5 秒 · 6 步
+ * - 已停止 / 运行失败
+ */
+export function buildProcessSummaryText({
+  outcome,
+  durationMs,
+  liveDurationMs,
+  steps,
+}: ProcessSummaryInput): string {
+  if (outcome === 'running') {
+    const parts = ['正在执行任务']
+    if (steps !== undefined && steps > 0) parts.push(`已完成 ${steps} 步`)
+    if (liveDurationMs !== undefined && liveDurationMs >= 0) {
+      parts.push(`持续 ${formatProcessDuration(liveDurationMs)}`)
+    }
+    return parts.join(' · ')
+  }
+
+  if (outcome === 'stopped') return '已停止'
+  if (outcome === 'failed') return '运行失败'
+
+  const base = durationMs !== undefined
+    ? `已完成，用时 ${formatProcessDuration(durationMs)}`
+    : '已完成'
+  return steps !== undefined && steps > 1 ? `${base} · ${steps} 步` : base
+}
+
+function countProcessSteps(blocks: SDKContentBlock[]): number {
+  return blocks.reduce((count, block) => count + (block.type === 'tool_use' ? 1 : 0), 0)
 }
 
 export function buildProcessGroupToolNames(blocks: SDKContentBlock[]): string[] {
@@ -152,14 +244,6 @@ export function buildProcessGroupToolNames(blocks: SDKContentBlock[]): string[] 
 }
 
 type ProcessGroupDisplayMode = 'collapsed' | 'expanded'
-
-export function isProgressViewportAtBottom({
-  clientHeight,
-  scrollHeight,
-  scrollTop,
-}: Pick<HTMLElement, 'clientHeight' | 'scrollHeight' | 'scrollTop'>): boolean {
-  return scrollHeight - scrollTop - clientHeight <= PROCESS_GROUP_FOLLOW_BOTTOM_THRESHOLD
-}
 
 function getProcessChildKey(child: React.ReactNode, index: number): string {
   if (React.isValidElement(child) && child.key != null) return String(child.key)
@@ -192,26 +276,31 @@ const StableProcessChild = React.memo(
   (previous, next) => previous.child === next.child,
 )
 
-export function ProcessBlockGroup({ blocks, isStreaming, renderChildren, isMessageTail = false }: ProcessBlockGroupProps): React.ReactElement {
-  const initialDisplayMode: ProcessGroupDisplayMode = !isStreaming
+export function ProcessBlockGroup({
+  blocks,
+  isStreaming,
+  outcome,
+  startedAt,
+  durationMs,
+  steps,
+  usage,
+  renderChildren,
+  isMessageTail = false,
+}: ProcessBlockGroupProps): React.ReactElement {
+  const turnOutcome: AssistantTurnOutcome = outcome ?? (isStreaming ? 'running' : 'completed')
+  // 中断/失败轮次必须保持展开并标注，不能被自动折叠吞掉。
+  const isTerminalOpen = turnOutcome === 'stopped' || turnOutcome === 'failed'
+  const initialDisplayMode: ProcessGroupDisplayMode = !isStreaming && !isTerminalOpen
     ? 'collapsed'
     : 'expanded'
   const [displayMode, setDisplayMode] = React.useState<ProcessGroupDisplayMode>(initialDisplayMode)
   const [shouldRenderContent, setShouldRenderContent] = React.useState(initialDisplayMode !== 'collapsed')
-  const [keepProgressViewport, setKeepProgressViewport] = React.useState(!!isStreaming)
   const [collapseCountdown, setCollapseCountdown] = React.useState<number | null>(null)
   const userToggledRef = React.useRef(false)
-  const followLatestRef = React.useRef(true)
-  const smoothScrollTargetRef = React.useRef<number | null>(null)
-  const scrollFrameRef = React.useRef<number | null>(null)
   const wasStreamingRef = React.useRef(!!isStreaming)
   const autoCollapseTimersRef = React.useRef<number[]>([])
   const contentRef = React.useRef<HTMLDivElement>(null)
-  const contentInnerRef = React.useRef<HTMLDivElement>(null)
   const stableChildrenRef = React.useRef(new Map<string, StableProcessChildCacheEntry>())
-  const stableProcessBlocksRef = React.useRef(blocks)
-  stableProcessBlocksRef.current = stabilizeProcessBlockReferences(stableProcessBlocksRef.current, blocks)
-  const stableProcessBlocks = stableProcessBlocksRef.current
   const collapseFrameRef = React.useRef<number | null>(null)
   const [measuredHeight, setMeasuredHeight] = React.useState<number | undefined>(undefined)
 
@@ -227,18 +316,16 @@ export function ProcessBlockGroup({ blocks, isStreaming, renderChildren, isMessa
   React.useEffect(() => {
     clearAutoCollapseTimers()
 
+    if (isTerminalOpen) {
+      setCollapseCountdown(null)
+      setDisplayMode('expanded')
+      wasStreamingRef.current = false
+      return clearAutoCollapseTimers
+    }
+
     if (isStreaming) {
       setCollapseCountdown(null)
-      setKeepProgressViewport(true)
-      if (!wasStreamingRef.current) {
-        userToggledRef.current = false
-        followLatestRef.current = true
-        smoothScrollTargetRef.current = null
-        if (scrollFrameRef.current !== null) {
-          cancelAnimationFrame(scrollFrameRef.current)
-          scrollFrameRef.current = null
-        }
-      }
+      if (!wasStreamingRef.current) userToggledRef.current = false
       if (!userToggledRef.current) setDisplayMode('expanded')
       wasStreamingRef.current = true
       return
@@ -248,7 +335,6 @@ export function ProcessBlockGroup({ blocks, isStreaming, renderChildren, isMessa
     wasStreamingRef.current = false
 
     if (!shouldAutoCollapseAfterCompletion) {
-      setKeepProgressViewport(false)
       if (!userToggledRef.current) setDisplayMode('collapsed')
       return
     }
@@ -264,92 +350,12 @@ export function ProcessBlockGroup({ blocks, isStreaming, renderChildren, isMessa
       autoCollapseTimersRef.current.push(window.setTimeout(() => {
         setCollapseCountdown(null)
         setDisplayMode('collapsed')
-        autoCollapseTimersRef.current.push(window.setTimeout(
-          () => setKeepProgressViewport(false),
-          PROCESS_GROUP_COLLAPSE_DURATION_MS,
-        ))
       }, PROCESS_GROUP_AUTO_COLLAPSE_COUNTDOWN_SECONDS * 1000))
     }, PROCESS_GROUP_AUTO_COLLAPSE_SOUND_DELAY_MS)
     autoCollapseTimersRef.current.push(soundDelayTimer)
 
     return clearAutoCollapseTimers
-  }, [clearAutoCollapseTimers, isStreaming])
-
-  const scrollToLatest = React.useCallback(() => {
-    if (!followLatestRef.current) return
-    const viewport = contentRef.current
-    if (!viewport) return
-
-    smoothScrollTargetRef.current = Math.max(0, viewport.scrollHeight - viewport.clientHeight)
-    if (scrollFrameRef.current !== null) return
-
-    const advanceScroll = (): void => {
-      const target = smoothScrollTargetRef.current
-      const activeViewport = contentRef.current
-      if (!followLatestRef.current || target == null || !activeViewport) {
-        scrollFrameRef.current = null
-        return
-      }
-
-      const distance = target - activeViewport.scrollTop
-      if (Math.abs(distance) <= 1) {
-        activeViewport.scrollTop = target
-        smoothScrollTargetRef.current = null
-        scrollFrameRef.current = null
-        return
-      }
-
-      // 内容突增时快速追近，正常增量则保持低成本的连续插值。
-      const nextTop = distance > 72
-        ? target - 48
-        : activeViewport.scrollTop + distance * 0.32
-      activeViewport.scrollTop = nextTop
-      scrollFrameRef.current = requestAnimationFrame(advanceScroll)
-    }
-
-    scrollFrameRef.current = requestAnimationFrame(advanceScroll)
-  }, [])
-
-  React.useLayoutEffect(() => {
-    if (!isStreaming || !keepProgressViewport) return
-    const content = contentInnerRef.current
-    if (!content) return
-
-    const frame = requestAnimationFrame(scrollToLatest)
-    const observer = new ResizeObserver(scrollToLatest)
-    observer.observe(content)
-    return () => {
-      cancelAnimationFrame(frame)
-      if (scrollFrameRef.current !== null) {
-        cancelAnimationFrame(scrollFrameRef.current)
-        scrollFrameRef.current = null
-      }
-      observer.disconnect()
-    }
-  }, [isStreaming, keepProgressViewport, scrollToLatest])
-
-  React.useLayoutEffect(() => {
-    if (isStreaming && keepProgressViewport) scrollToLatest()
-  }, [stableProcessBlocks, isStreaming, keepProgressViewport, scrollToLatest])
-
-  const handleProgressScroll = React.useCallback((event: React.UIEvent<HTMLDivElement>): void => {
-    if (!isProgressViewportAtBottom(event.currentTarget)) return
-    followLatestRef.current = true
-    scrollToLatest()
-  }, [scrollToLatest])
-
-  const handleProgressScrollIntent = React.useCallback((): void => {
-    smoothScrollTargetRef.current = null
-    followLatestRef.current = false
-    if (scrollFrameRef.current !== null) {
-      cancelAnimationFrame(scrollFrameRef.current)
-      scrollFrameRef.current = null
-    }
-  }, [])
-
-  const handleProgressKeyDown = React.useCallback((event: React.KeyboardEvent<HTMLDivElement>): void => {
-    if (PROGRESS_SCROLL_KEYS.has(event.key)) handleProgressScrollIntent()
-  }, [handleProgressScrollIntent])
+  }, [clearAutoCollapseTimers, isStreaming, isTerminalOpen])
 
   // 折叠前测量实际高度，用于丝滑的 height 过渡（子元素不 reflow，只裁剪边界）
   React.useEffect(() => {
@@ -384,9 +390,36 @@ export function ProcessBlockGroup({ blocks, isStreaming, renderChildren, isMessa
     }
   }, [isContentExpanded])
 
+  const stepCount = steps ?? countProcessSteps(blocks)
+  const [liveDurationMs, setLiveDurationMs] = React.useState<number | undefined>(undefined)
+
+  React.useEffect(() => {
+    if (!isStreaming || turnOutcome !== 'running' || startedAt === undefined) {
+      setLiveDurationMs(undefined)
+      return
+    }
+    const update = (): void => setLiveDurationMs(Math.max(0, Date.now() - startedAt))
+    update()
+    const timer = window.setInterval(update, 1000)
+    return () => window.clearInterval(timer)
+  }, [isStreaming, startedAt, turnOutcome])
+
   const summary = React.useMemo(
-    () => buildProcessGroupSummary(blocks),
-    [blocks],
+    () => buildProcessSummaryText({
+      outcome: turnOutcome,
+      durationMs,
+      liveDurationMs,
+      steps: stepCount,
+    }),
+    [durationMs, liveDurationMs, stepCount, turnOutcome],
+  )
+  const summaryClassName = cn(
+    'min-w-0 truncate text-[14px]',
+    turnOutcome === 'failed'
+      ? 'text-red-600/80 dark:text-red-400/80'
+      : turnOutcome === 'stopped'
+        ? 'text-amber-600/80 dark:text-amber-400/80'
+        : 'text-muted-foreground',
   )
   const toolNames = React.useMemo(() => buildProcessGroupToolNames(blocks), [blocks])
   const visibleToolNames = toolNames.slice(0, MAX_PROCESS_GROUP_ICONS)
@@ -430,15 +463,16 @@ export function ProcessBlockGroup({ blocks, isStreaming, renderChildren, isMessa
     <div className="space-y-1.5">
       <button
         type="button"
+        disabled={isTerminalOpen}
         className={cn(
           'flex max-w-full items-center gap-2 py-0.5 text-left transition-opacity group',
-          'hover:opacity-70',
+          isTerminalOpen ? 'cursor-default' : 'hover:opacity-70',
         )}
         onClick={() => {
+          if (isTerminalOpen) return
           userToggledRef.current = true
           clearAutoCollapseTimers()
           setCollapseCountdown(null)
-          if (!isStreaming) setKeepProgressViewport(false)
           setDisplayMode((previous) => previous === 'collapsed' ? 'expanded' : 'collapsed')
         }}
       >
@@ -448,7 +482,18 @@ export function ProcessBlockGroup({ blocks, isStreaming, renderChildren, isMessa
             isContentExpanded && 'rotate-90',
           )}
         />
-        <span className="min-w-0 truncate text-[14px] text-muted-foreground">{summary}</span>
+        {turnOutcome === 'completed' && durationMs !== undefined ? (
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className={summaryClassName}>{summary}</span>
+            </TooltipTrigger>
+            <TooltipContent side="top">
+              <p className="whitespace-pre-line text-left">{buildUsageTooltip(durationMs, usage)}</p>
+            </TooltipContent>
+          </Tooltip>
+        ) : (
+          <span className={summaryClassName}>{summary}</span>
+        )}
         {collapseCountdown !== null && (
           <span className="shrink-0 text-[12px] tabular-nums text-muted-foreground/50">
             （{collapseCountdown}）
@@ -479,18 +524,8 @@ export function ProcessBlockGroup({ blocks, isStreaming, renderChildren, isMessa
         <div
           ref={contentRef}
           data-agent-history-selection-excluded={isContentExpanded ? undefined : 'true'}
-          className={cn(
-            'overflow-hidden focus:outline-none',
-            keepProgressViewport && 'overflow-y-auto overscroll-contain scrollbar-none',
-          )}
-          tabIndex={keepProgressViewport ? 0 : undefined}
-          onScroll={keepProgressViewport ? handleProgressScroll : undefined}
-          onPointerDown={keepProgressViewport ? handleProgressScrollIntent : undefined}
-          onWheel={keepProgressViewport ? handleProgressScrollIntent : undefined}
-          onTouchStart={keepProgressViewport ? handleProgressScrollIntent : undefined}
-          onKeyDown={keepProgressViewport ? handleProgressKeyDown : undefined}
+          className="overflow-hidden focus:outline-none"
           style={{
-            maxHeight: keepProgressViewport ? `${PROCESS_GROUP_VIEWPORT_HEIGHT}px` : undefined,
             height: measuredHeight !== undefined ? `${measuredHeight}px` : 'auto',
             opacity: isContentExpanded ? 1 : 0,
             transition: measuredHeight !== undefined
@@ -498,7 +533,8 @@ export function ProcessBlockGroup({ blocks, isStreaming, renderChildren, isMessa
               : `opacity ${PROCESS_GROUP_COLLAPSE_DURATION_MS}ms ease-in-out`,
           }}
         >
-          <div ref={contentInnerRef} className="space-y-2">
+          {/* 摘要下分隔线 + 平铺过程流：思考、工具、旁白按执行顺序连续展示，不再套限高滚动框。 */}
+          <div className="mt-2 space-y-2 border-t border-border/40 pt-2.5">
             {renderContentChildren()}
           </div>
         </div>

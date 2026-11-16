@@ -13,7 +13,6 @@
 import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from 'node:path'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { mkdir as mkdirAsync, writeFile as writeFileAsync } from 'node:fs/promises'
-import { BrowserWindow } from 'electron'
 import type { WebContents } from 'electron'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import { AGENT_IPC_CHANNELS, MAX_ATTACHMENT_SIZE } from '@proma/shared'
@@ -43,18 +42,26 @@ import { PiAgentAdapter } from './adapters/pi-agent-adapter'
 import { PiUtilityAdapter } from './adapters/pi-utility-adapter'
 import { AgentEventBus } from './agent-event-bus'
 import { AgentOrchestrator } from './agent-orchestrator'
+import { shouldStopBeforeAgentRun } from './agent-stop-policy'
+import { notePlanQuotaUsage } from './plan-quota-signal'
 import { getAgentSessionWorkspacePath } from './config-paths'
 import { getAgentWorkspaceBySlug, getProjectFilesPath } from './agent-workspace-manager'
 import { getLocalProjectRootStatus } from './project-root-health'
-import { getAgentSessionMeta, markAgentSessionDeleting, updateAgentSessionMeta } from './agent-session-manager'
+import { getAgentSessionMeta, isAgentSessionDeleting, markAgentSessionDeleting, updateAgentSessionMeta } from './agent-session-manager'
 import { setAgentStopper, setHeadlessAgentRunner } from './agent-headless-runner-registry'
 import { getHeadlessAgentRunTarget } from './agent-headless-run-target'
 import { sendAgentStreamComplete } from './agent-completion-payload'
 import { AgentStreamForwarder } from './agent-stream-forwarder'
 import { AgentStreamRouteRegistry } from './agent-stream-route-registry'
 import { AgentQueueCoordinator } from './agent-queue-coordinator'
+import { AgentRunDrainRegistry } from './agent-run-drain-registry'
+import { AgentQueryDrainError } from './agent-query-drain'
+import { configureWorkspaceKnowledgeAttribution } from './workspace-knowledge-mutation-runtime'
+import type { AgentRunDrainRecord } from './agent-run-drain-registry'
 import { isStaleActiveQueueError } from './agent-queue-routing'
-import { shouldStopBeforeAgentRun } from './agent-stop-policy'
+import { registerCollaborationEventBus, registerCollaborationLifecycle } from './agent-collaboration-tools'
+import type { HeadlessAgentRunCallbacks } from './agent-headless-runner-registry'
+import { getMainAgentRenderer as getMainRendererWebContents, assertMainAgentRendererTarget, isMainAgentRenderer } from './agent-renderer-access'
 
 // ===== 实例创建 =====
 
@@ -67,10 +74,21 @@ const orchestrator = new AgentOrchestrator(adapter, eventBus)
 /** 导出 EventBus 供飞书 Bridge 等外部服务订阅事件 */
 export { eventBus as agentEventBus }
 
-// 注册协作子会话 EventBus 阻塞事件监听
-import('./agent-collaboration-tools').then(({ registerCollaborationEventBus }) => {
-  registerCollaborationEventBus(eventBus)
-}).catch(() => { /* collaboration 模块可能未加载 */ })
+// 只把主进程已核验的 write/edit 提交变成会话来源事件；raw fs 刷新永远不带来源。
+configureWorkspaceKnowledgeAttribution({
+  isRunCurrent: (owner) => !isAgentSessionDeleting(owner.sessionId) && !!getAgentSessionMeta(owner.sessionId)
+    && orchestrator.listActiveSessionSnapshots().some(snapshot => snapshot.sessionId === owner.sessionId && snapshot.runGeneration === owner.runGeneration),
+  emit: (change) => {
+    eventBus.emit(change.source.sessionId, {
+      kind: 'proma_event',
+      event: { type: 'knowledge_file_changed', change },
+    })
+  },
+})
+
+// 生命周期必须在接受任何运行前同步订阅；阻塞问题继续通过 EventBus 上浮。
+registerCollaborationLifecycle()
+registerCollaborationEventBus(eventBus)
 
 /**
  * 会话 → renderer 的流事件投递路由。
@@ -82,6 +100,10 @@ const streamRoutes = new AgentStreamRouteRegistry<WebContents>()
 /** 每个 renderer 当前可见的 Agent 会话；仅该会话维持 20fps partial。 */
 const visibleAgentSessionByWebContents = new WeakMap<WebContents, string | null>()
 const streamForwarder = new AgentStreamForwarder()
+const runDrains = new AgentRunDrainRegistry()
+let shuttingDown = false
+/** 等待旧轮收尾的 headless 请求也不能覆盖在等待期间发生的新停止。 */
+const stopRevisions = new Map<string, number>()
 
 /**
  * 已挂载 destroyed 回收钩子的 webContents 集合。
@@ -106,11 +128,12 @@ function attachWebContentsCleanup(wc: WebContents): void {
   })
 }
 
-function registerWebContents(sessionId: string, wc: WebContents) {
+function registerWebContents(sessionId: string, wc: WebContents | null) {
+  if (wc) assertMainAgentRendererTarget(wc)
   const previousWebContents = streamRoutes.get(sessionId)?.target
   if (previousWebContents && previousWebContents !== wc) streamForwarder.clear(sessionId)
   const route = streamRoutes.bind(sessionId, wc)
-  attachWebContentsCleanup(wc)
+  if (wc) attachWebContentsCleanup(wc)
   return route
 }
 
@@ -121,61 +144,57 @@ function registerWebContents(sessionId: string, wc: WebContents) {
  * 不匹配而无法投递，renderer 会永久保留 running 状态。
  */
 function rebindWebContents(sessionId: string, wc: WebContents) {
+  assertMainAgentRendererTarget(wc)
   const previousWebContents = streamRoutes.get(sessionId)?.target
   if (previousWebContents && previousWebContents !== wc) streamForwarder.clear(sessionId)
   const route = streamRoutes.rebind(sessionId, wc)
   attachWebContentsCleanup(wc)
-  agentQueueCoordinator.onTargetAvailable(sessionId)
   return route
+}
+
+function getOwnedStreamTarget(sessionId: string, ownerId: number): WebContents | undefined {
+  const target = streamRoutes.getTargetIfOwner(sessionId, ownerId)
+  return isMainAgentRenderer(target) ? target : undefined
 }
 
 function getStreamRouteTargets(): Map<string, WebContents> {
   const targets = new Map<string, WebContents>()
   for (const snapshot of orchestrator.listActiveSessionSnapshots()) {
     const target = streamRoutes.get(snapshot.sessionId)?.target
-    if (target) targets.set(snapshot.sessionId, target)
+    if (isMainAgentRenderer(target)) targets.set(snapshot.sessionId, target)
   }
   return targets
 }
 
 export function rebindActiveAgentStreams(webContents: WebContents): AgentActiveSessionSnapshot[] {
+  assertMainAgentRendererTarget(webContents)
   const snapshots = orchestrator.listActiveSessionSnapshots()
-  for (const snapshot of snapshots) {
-    streamForwarder.clear(snapshot.sessionId)
-    streamRoutes.rebind(snapshot.sessionId, webContents)
+  // headless 无窗启动以及已发业务终态但尚未清理的 run 也保留 owner。
+  const sessionIds = new Set([...streamRoutes.sessionIds(), ...snapshots.map(item => item.sessionId)])
+  for (const sessionId of sessionIds) {
+    if (streamRoutes.get(sessionId)?.target !== webContents) streamForwarder.clear(sessionId)
+    streamRoutes.rebind(sessionId, webContents)
   }
   attachWebContentsCleanup(webContents)
   return snapshots
 }
 
-function isMainRendererWindow(win: BrowserWindow): boolean {
-  if (win.isDestroyed()) return false
-  const url = win.webContents.getURL()
-  if (!url) return false
-  if (url.startsWith('data:')) return false
-  return !url.includes('window=quick-task')
-    && !url.includes('window=voice-dictation')
-    && !url.includes('window=detached-preview')
-}
-
-function getMainRendererWebContents(): WebContents | null {
-  const win = BrowserWindow.getAllWindows().find(isMainRendererWindow)
-  return win && !win.webContents.isDestroyed() ? win.webContents : null
-}
-
 const agentQueueCoordinator = new AgentQueueCoordinator({
   isActive: (sessionId) => orchestrator.isActive(sessionId),
-  getWebContents: (sessionId) => streamRoutes.get(sessionId)?.target ?? getMainRendererWebContents(),
-  startRun: (input, webContents) => runAgent(input, webContents),
+  isStartBlocked: (sessionId) => shuttingDown || isAgentSessionDeleting(sessionId)
+    || orchestrator.isRunCleanupBlocked(sessionId) || startingAgentSessions.has(sessionId) || !!runDrains.get(sessionId),
+  getWebContents: () => getMainRendererWebContents(),
+  // started 已被接受后即使窗口销毁，也由原任务继续无窗运行，不静默丢弃消息。
+  startRun: (input) => startDesktopAgentRun(input),
   sendStarted: (webContents, status) => {
     if (!webContents.isDestroyed()) webContents.send(AGENT_IPC_CHANNELS.QUEUED_MESSAGE_STATUS, status)
   },
   reserveRunGeneration: (sessionId) => orchestrator.reserveRunGeneration(sessionId),
-  // 提升队列消息时，优先向活跃通道注入（可软中断）；通道刚拒绝（stale）则降级为直接启动 run。
+  // 优先向活跃通道注入；stale 仅回队列，必须等待完整收尾后才能启动新 run。
   inject: async (input, interrupt) => {
     try {
       // queueAgentMessage 的第二参数仅用于满足签名，路由目标仅供阅读时参考。
-      const target = streamRoutes.get(input.sessionId)?.target ?? getMainRendererWebContents()
+      const target = getMainRendererWebContents()
       await queueAgentMessage({
         sessionId: input.sessionId,
         userMessage: input.userMessage,
@@ -200,19 +219,38 @@ const agentQueueCoordinator = new AgentQueueCoordinator({
  * Renderer run 在创建飞书镜像卡片时尚未进入 orchestrator.activeSessions。
  * 在此期间保留启动槽位，避免会话迁移改变已接受请求的项目归属。
  */
-const startingAgentSessions = new Set<string>()
+interface AgentStartReservation { stopped: boolean; runGeneration: number }
+const startingAgentSessions = new Map<string, AgentStartReservation>()
+
+function assertCanStartAgentRun(sessionId: string, cancelled = false): void {
+  if (orchestrator.isRunCleanupBlocked(sessionId)) throw new AgentQueryDrainError(undefined)
+  if (!cancelled && (shuttingDown || isAgentSessionDeleting(sessionId))) throw new Error('会话正在删除或应用正在退出')
+  if (orchestrator.isActive(sessionId) || runDrains.get(sessionId)) {
+    throw new Error('会话仍在运行或收尾，请等待当前请求结束后再发送。')
+  }
+}
 
 export function reserveAgentSessionStart(sessionId: string): () => void {
-  if (startingAgentSessions.has(sessionId) || orchestrator.isActive(sessionId)) {
-    throw new Error('会话正在启动或运行中，请等待当前请求结束后再发送。')
+  assertCanStartAgentRun(sessionId)
+  if (startingAgentSessions.has(sessionId) || agentQueueCoordinator.isDispatching(sessionId) || agentQueueCoordinator.isPromoting(sessionId)) {
+    throw new Error('会话正在启动，请等待当前请求结束后再发送。')
   }
-  startingAgentSessions.add(sessionId)
-  return () => startingAgentSessions.delete(sessionId)
+  const reservation = { stopped: false, runGeneration: orchestrator.reserveRunGeneration(sessionId) }
+  startingAgentSessions.set(sessionId, reservation)
+  agentQueueCoordinator.resumeForExplicitInput(sessionId)
+  agentQueueCoordinator.onRunAccepted(sessionId, reservation.runGeneration)
+  return () => {
+    if (startingAgentSessions.get(sessionId) !== reservation) return
+    startingAgentSessions.delete(sessionId)
+    agentQueueCoordinator.onTargetAvailable(sessionId)
+  }
 }
 
 export function isAgentSessionBusy(sessionId: string): boolean {
   return startingAgentSessions.has(sessionId)
+    || !!runDrains.get(sessionId)
     || orchestrator.isActive(sessionId)
+    || orchestrator.isRunCleanupBlocked(sessionId)
     || agentQueueCoordinator.hasPending(sessionId)
 }
 
@@ -248,11 +286,11 @@ function getSessionMetaForRenderer(sessionId: string) {
 
 eventBus.use((sessionId, payload, next) => {
   const wc = streamRoutes.get(sessionId)?.target
-  if (wc && !wc.isDestroyed()) {
+  if (isMainAgentRenderer(wc)) {
     try {
       streamForwarder.forward(
         { sessionId, payload } as AgentStreamEvent,
-        (event) => wc.send(AGENT_IPC_CHANNELS.STREAM_EVENT, event),
+        (event) => { if (isMainAgentRenderer(wc)) wc.send(AGENT_IPC_CHANNELS.STREAM_EVENT, event) },
         visibleAgentSessionByWebContents.get(wc) === sessionId,
       )
     } catch (err) {
@@ -275,12 +313,14 @@ export function setVisibleAgentSession(webContents: WebContents, sessionId: stri
   }
   visibleAgentSessionByWebContents.set(webContents, sessionId)
   if (sessionId) streamForwarder.promote(sessionId)
+  // 重绑本身不派发，避免 submit/promote 事务开始前队首被提前抢走。
+  for (const waiting of agentQueueCoordinator.waitingSessionIds()) agentQueueCoordinator.onTargetAvailable(waiting)
 }
 
 // ===== IPC 薄包装函数 =====
 
 /** 仅主进程内部使用的单次运行扩展，绝不经 IPC 序列化。 */
-type AgentRunInput = AgentSendInput & { runGeneration?: number }
+type AgentRunInput = AgentSendInput & { runGeneration?: number; cancelledBeforeStart?: boolean }
 
 export interface AgentRunExtensions {
   piCustomTools?: ToolDefinition[]
@@ -291,11 +331,39 @@ export interface AgentRunExtensions {
  *
  * 注册 webContents 到 EventBus 映射，委托给 Orchestrator。
  */
-export async function runAgent(
-  input: AgentRunInput,
-  webContents: WebContents,
-): Promise<void> {
-  const route = registerWebContents(input.sessionId, webContents)
+export function runAgent(input: AgentRunInput, webContents: WebContents): Promise<void> {
+  assertMainAgentRendererTarget(webContents)
+  const reservation = startingAgentSessions.get(input.sessionId)
+  if (!reservation) assertCanStartAgentRun(input.sessionId)
+  return startDesktopAgentRun({
+    ...input,
+    ...(reservation ? { runGeneration: reservation.runGeneration } : {}),
+    cancelledBeforeStart: reservation?.stopped ?? false,
+  }, !reservation)
+}
+
+function acceptRunInput(input: AgentRunInput): AgentRunInput {
+  const accepted = { ...input, startedAt: input.startedAt ?? Date.now(), runGeneration: input.runGeneration ?? orchestrator.reserveRunGeneration(input.sessionId) }
+  agentQueueCoordinator.onRunAccepted(input.sessionId, accepted.runGeneration)
+  return accepted
+}
+
+function startDesktopAgentRun(input: AgentRunInput, resumeExplicit = false): Promise<void> {
+  const cancelled = input.cancelledBeforeStart === true || shuttingDown
+  assertCanStartAgentRun(input.sessionId, cancelled)
+  // 镜像准备之前已经接受的输入不能在 await 之后再次覆盖较新的停止意图。
+  if (resumeExplicit) agentQueueCoordinator.resumeForExplicitInput(input.sessionId)
+  const accepted = acceptRunInput(input)
+  return runDrains.track(input.sessionId,
+    run => {
+      run.stopped ||= cancelled
+      return runAgentBody(accepted, run)
+    },
+    () => agentQueueCoordinator.onRunDrained(input.sessionId))
+}
+
+async function runAgentBody(input: AgentRunInput, run: AgentRunDrainRecord): Promise<void> {
+  const route = registerWebContents(input.sessionId, getMainRendererWebContents())
   // deferred queue runs carry their queue id as an internal extension.
   const queueMessageId = (input as Partial<AgentDeferredQueueMessageInput>).queueMessageId
   // 开始新一轮执行时清除"完成未确认"与持久化草稿标记。
@@ -319,9 +387,9 @@ export async function runAgent(
     } catch { /* 新会话可能尚未写入索引 */ }
   }
   try {
-    await orchestrator.sendMessage(input, {
+    await orchestrator.sendMessage({ ...input, cancelledBeforeStart: run.stopped || shuttingDown }, {
       onError: (error, opts) => {
-        const target = streamRoutes.getTargetIfOwner(input.sessionId, route.ownerId)
+        const target = getOwnedStreamTarget(input.sessionId, route.ownerId)
         if (target) {
           target.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
             sessionId: input.sessionId,
@@ -331,6 +399,8 @@ export async function runAgent(
         }
       },
       onComplete: (messages, opts) => {
+        run.terminalObserved = true
+        notePlanQuotaUsage()
         publishRunStopped(input.sessionId, opts?.stoppedByUser, opts?.startedAt, opts?.runGeneration)
         eventBus.emit(input.sessionId, {
           kind: 'proma_event',
@@ -338,11 +408,15 @@ export async function runAgent(
             type: 'run_completed',
             source: 'desktop',
             stoppedByUser: opts?.stoppedByUser ?? false,
+            error: opts?.error,
+            resultSubtype: opts?.resultSubtype,
+            resultErrors: opts?.resultErrors,
+            finalAssistantUuid: opts?.finalAssistantUuid,
             ...(opts?.startedAt != null ? { startedAt: opts.startedAt } : {}),
             ...(opts?.runGeneration != null ? { runGeneration: opts.runGeneration } : {}),
           },
         })
-        const target = streamRoutes.getTargetIfOwner(input.sessionId, route.ownerId)
+        const target = getOwnedStreamTarget(input.sessionId, route.ownerId)
         if (target) {
           sendAgentStreamComplete(target, input, {
             messages,
@@ -361,9 +435,11 @@ export async function runAgent(
           queueMessageId,
           opts?.backgroundTasksPending === true,
           opts?.stoppedByUser === true,
+          opts?.runGeneration,
         )
       },
       onRunStarted: ({ startedAt, runGeneration }) => {
+        agentQueueCoordinator.onRunStarted(input.sessionId, runGeneration)
         eventBus.emit(input.sessionId, {
           kind: 'proma_event',
           event: { type: 'run_started', startedAt, runGeneration },
@@ -374,7 +450,7 @@ export async function runAgent(
           kind: 'proma_event',
           event: { type: 'title_updated', title },
         })
-        const target = streamRoutes.getTargetIfOwner(input.sessionId, route.ownerId)
+        const target = getOwnedStreamTarget(input.sessionId, route.ownerId)
         if (target) {
           target.send(AGENT_IPC_CHANNELS.TITLE_UPDATED, {
             sessionId: input.sessionId,
@@ -384,9 +460,10 @@ export async function runAgent(
       },
     })
   } catch (err) {
+    run.terminalObserved = true
     console.error('[Agent 服务] runAgent 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
-    const target = streamRoutes.getTargetIfOwner(input.sessionId, route.ownerId)
+    const target = getOwnedStreamTarget(input.sessionId, route.ownerId)
     if (target) {
       target.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
         sessionId: input.sessionId,
@@ -402,6 +479,9 @@ export async function runAgent(
     }
     agentQueueCoordinator.onRunComplete(input.sessionId, queueMessageId, false, false)
   } finally {
+    // 本轮已经收尾；预检前失败（如网络未就绪）走不到 sendMessage 的停止标记
+    // 消费点，这里兜底清理，避免该会话后续消息被永久当作已停止而静默丢弃。
+    orchestrator.clearStoppedBeforeRun(input.sessionId)
     if (streamRoutes.removeIfOwner(input.sessionId, route.ownerId)) {
       streamForwarder.clear(input.sessionId)
     }
@@ -416,16 +496,37 @@ export async function runAgent(
  */
 export async function runAgentHeadless(
   input: AgentSendInput,
-  callbacks: {
-    onError: (error: string) => void
-    onComplete: (messages?: AgentMessage[]) => void
-    onTitleUpdated: (title: string) => void
-    source?: AgentExternalRunSource
-    originSessionId?: string
-  },
+  callbacks: HeadlessAgentRunCallbacks,
   extensions?: AgentRunExtensions,
 ): Promise<void> {
-  // 委派子会话优先回到父会话所在 renderer，外部无界面运行才回退任意主窗口。
+  const acceptedStopRevision = stopRevisions.get(input.sessionId) ?? 0
+  const previous = runDrains.get(input.sessionId)
+  // 协作/Bridge 可在收到业务终态后立即续跑；只等待已终态或已停止的旧 run。
+  if (previous?.terminalObserved || previous?.stopped) await previous.promise.catch(() => {})
+  const stoppedWhileWaiting = acceptedStopRevision !== (stopRevisions.get(input.sessionId) ?? 0)
+  assertCanStartAgentRun(input.sessionId)
+  if (startingAgentSessions.has(input.sessionId) || agentQueueCoordinator.isDispatching(input.sessionId) || agentQueueCoordinator.isPromoting(input.sessionId)) {
+    throw new Error('会话正在启动，请稍后重试')
+  }
+  if (!stoppedWhileWaiting) agentQueueCoordinator.resumeForExplicitInput(input.sessionId)
+  // 公共 headless 输入不能指定内部身份；在接受时登记，而不是等展示性的 run_started。
+  const { runGeneration: _ignored, ...publicInput } = input as AgentSendInput & { runGeneration?: unknown }
+  const accepted = acceptRunInput(publicInput)
+  return runDrains.track(input.sessionId,
+    run => {
+      run.stopped ||= stoppedWhileWaiting
+      return runAgentHeadlessBody(accepted, callbacks, extensions, run)
+    },
+    () => agentQueueCoordinator.onRunDrained(input.sessionId))
+}
+
+async function runAgentHeadlessBody(
+  input: AgentRunInput,
+  callbacks: HeadlessAgentRunCallbacks,
+  extensions: AgentRunExtensions | undefined,
+  run: AgentRunDrainRecord,
+): Promise<void> {
+  // 委派可复用父会话的合法主窗路由；无窗不回退到辅助窗口。
   const wc = getHeadlessAgentRunTarget(
     getStreamRouteTargets(),
     callbacks.originSessionId,
@@ -435,22 +536,20 @@ export async function runAgentHeadless(
   // treat an omitted source as an interactive desktop-user run: custom tools may grant
   // local side effects that cannot be visibly supervised by an external sender.
   const inferredTriggeredBy = callbacks.source === 'delegation' ? 'delegation' : 'external'
-  // Headless callers are public service clients too; discard any forged runtime identity.
-  const { runGeneration: _ignoredRunGeneration, ...publicInput } = input as AgentSendInput & { runGeneration?: unknown }
   const runInput: AgentRunInput = {
-    ...publicInput,
+    ...input,
     ...(input.triggeredBy ? {} : { triggeredBy: inferredTriggeredBy }),
     ...(input.startedAt != null ? {} : { startedAt: Date.now() }),
   }
   const startedAt = runInput.startedAt!
-  const route = wc ? registerWebContents(runInput.sessionId, wc) : undefined
+  const route = registerWebContents(runInput.sessionId, wc)
 
   try {
-    await orchestrator.sendMessage(runInput, {
+    await orchestrator.sendMessage({ ...runInput, cancelledBeforeStart: run.stopped || shuttingDown }, {
       onError: (error, opts) => {
-        callbacks.onError(error)
+        callbacks.onError(error, opts)
         const target = route
-          ? streamRoutes.getTargetIfOwner(runInput.sessionId, route.ownerId)
+          ? getOwnedStreamTarget(runInput.sessionId, route.ownerId)
           : undefined
         if (target) {
           target.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
@@ -461,7 +560,9 @@ export async function runAgentHeadless(
         }
       },
       onComplete: (messages, opts) => {
-        callbacks.onComplete(messages)
+        run.terminalObserved = true
+        notePlanQuotaUsage()
+        callbacks.onComplete(messages, opts)
         publishRunStopped(runInput.sessionId, opts?.stoppedByUser, opts?.startedAt, opts?.runGeneration)
         eventBus.emit(runInput.sessionId, {
           kind: 'proma_event',
@@ -469,12 +570,16 @@ export async function runAgentHeadless(
             type: 'run_completed',
             source: callbacks.source ?? 'bridge',
             stoppedByUser: opts?.stoppedByUser ?? false,
+            error: opts?.error,
+            resultSubtype: opts?.resultSubtype,
+            resultErrors: opts?.resultErrors,
+            finalAssistantUuid: opts?.finalAssistantUuid,
             ...(opts?.startedAt != null ? { startedAt: opts.startedAt } : {}),
             ...(opts?.runGeneration != null ? { runGeneration: opts.runGeneration } : {}),
           },
         })
         const target = route
-          ? streamRoutes.getTargetIfOwner(runInput.sessionId, route.ownerId)
+          ? getOwnedStreamTarget(runInput.sessionId, route.ownerId)
           : undefined
         if (target) {
           sendAgentStreamComplete(target, runInput, {
@@ -494,6 +599,7 @@ export async function runAgentHeadless(
           undefined,
           opts?.backgroundTasksPending === true,
           opts?.stoppedByUser === true,
+          opts?.runGeneration,
         )
       },
       onTitleUpdated: (title) => {
@@ -503,7 +609,7 @@ export async function runAgentHeadless(
           event: { type: 'title_updated', title },
         })
         const target = route
-          ? streamRoutes.getTargetIfOwner(runInput.sessionId, route.ownerId)
+          ? getOwnedStreamTarget(runInput.sessionId, route.ownerId)
           : undefined
         if (target) {
           target.send(AGENT_IPC_CHANNELS.TITLE_UPDATED, {
@@ -513,6 +619,7 @@ export async function runAgentHeadless(
         }
       },
       onRunStarted: ({ startedAt: persistedStartedAt, runGeneration, userMessage, userMessageUuid }) => {
+        agentQueueCoordinator.onRunStarted(runInput.sessionId, runGeneration)
         const session = getAgentSessionMeta(runInput.sessionId)
         eventBus.emit(runInput.sessionId, {
           kind: 'proma_event',
@@ -533,6 +640,7 @@ export async function runAgentHeadless(
       },
     }, extensions)
   } catch (err) {
+    run.terminalObserved = true
     console.error('[Agent 服务] runAgentHeadless 未处理异常:', err)
     const errorMessage = err instanceof Error ? err.message : '未知错误'
     callbacks.onError(errorMessage)
@@ -542,7 +650,7 @@ export async function runAgentHeadless(
       event: { type: 'run_completed', source: callbacks.source ?? 'bridge', stoppedByUser: false, startedAt },
     })
     const target = route
-      ? streamRoutes.getTargetIfOwner(runInput.sessionId, route.ownerId)
+      ? getOwnedStreamTarget(runInput.sessionId, route.ownerId)
       : undefined
     if (target) {
       target.send(AGENT_IPC_CHANNELS.STREAM_ERROR, {
@@ -559,6 +667,8 @@ export async function runAgentHeadless(
     }
     agentQueueCoordinator.onRunComplete(runInput.sessionId, undefined, false, false)
   } finally {
+    // 与桌面路径一致：预检前失败不会经过停止标记消费点，收尾时兜底清理。
+    orchestrator.clearStoppedBeforeRun(runInput.sessionId)
     if (route && streamRoutes.removeIfOwner(runInput.sessionId, route.ownerId)) {
       streamForwarder.clear(runInput.sessionId)
     }
@@ -576,22 +686,31 @@ export async function generateAgentTitle(input: AgentGenerateTitleInput): Promis
  * 中止指定会话的 Agent 执行
  */
 export function stopAgent(sessionId: string): void {
-  // SEND_MESSAGE reserves this slot before the async bridge setup reaches the
-  // orchestrator. Remember a stop in that window so the later run is never
-  // allowed to create an uncancellable adapter query.
-  void orchestrator.stop(
-    sessionId,
-    shouldStopBeforeAgentRun(
-      startingAgentSessions.has(sessionId),
-      agentQueueCoordinator.isDispatching(sessionId),
-    ),
+  stopRevisions.set(sessionId, (stopRevisions.get(sessionId) ?? 0) + 1)
+  const run = runDrains.get(sessionId)
+  if (run) run.stopped = true
+  const reservation = startingAgentSessions.get(sessionId)
+  if (reservation) reservation.stopped = true
+  // 启动/派发窗口内到达的 stop 需要暂停队列；本地由 reservation/run 标记承接，
+  // 不再把 stop 前移到 orchestrator，否则会把取消标记留给后继轮。
+  const stopBeforeRun = shouldStopBeforeAgentRun(
+    Boolean(reservation),
+    agentQueueCoordinator.isDispatching(sessionId),
   )
+  if (run || stopBeforeRun) agentQueueCoordinator.pauseForStop(sessionId)
+  // 取消绑定 mirror/dispatch/run 各自的已接受身份，不能留下污染后继轮的 session 级标记。
+  void Promise.resolve(orchestrator.stop(sessionId)).catch(error => {
+    console.error('[Agent 服务] 停止请求失败，仍等待本轮清理:', error)
+  })
 }
 
 /** DELETE_SESSION 专用：先写入墓碑，再等待已有 utility abort 收束。 */
 export async function stopAgentAndDrain(sessionId: string): Promise<void> {
   markAgentSessionDeleting(sessionId)
+  agentQueueCoordinator.pauseForStop(sessionId)
   await orchestrator.stopAndDrain(sessionId)
+  await runDrains.get(sessionId)?.promise
+  if (orchestrator.isRunCleanupBlocked(sessionId)) throw new AgentQueryDrainError(undefined)
 }
 
 setHeadlessAgentRunner(runAgentHeadless)
@@ -616,7 +735,8 @@ export function isAgentSessionActive(sessionId: string): boolean {
 
 /** 是否存在任意运行中 Agent，供更新器等全局生命周期服务安全判断。 */
 export function hasActiveAgentSessions(): boolean {
-  return orchestrator.hasActiveSessions()
+  return orchestrator.hasActiveSessions() || runDrains.sessionIds().length > 0
+    || startingAgentSessions.size > 0 || agentQueueCoordinator.hasDispatching()
 }
 
 export function listActiveAgentSessionSnapshots(): AgentActiveSessionSnapshot[] {
@@ -629,6 +749,8 @@ export function listQueuedAgentMessages(sessionId: string): AgentQueuedMessageSn
 
 /** 中止所有活跃的 Agent 会话（应用退出时调用） */
 export function stopAllAgents(): void {
+  shuttingDown = true
+  agentQueueCoordinator.shutdown()
   orchestrator.stopAll()
 }
 
@@ -677,6 +799,7 @@ export async function submitOrEnqueueAgentMessage(
   webContents: WebContents,
 ): Promise<AgentSubmitOrEnqueueResult> {
   rebindWebContents(input.sessionId, webContents)
+  agentQueueCoordinator.resumeForExplicitInput(input.sessionId)
 
   if (input.dispatch === 'now' && orchestrator.isActive(input.sessionId)) {
     try {
@@ -708,6 +831,7 @@ export async function submitOrEnqueueAgentMessage(
 /** 兼容旧调用：仅将消息追加到主进程 deferred queue。 */
 export function enqueueAgentQueuedMessage(input: AgentDeferredQueueMessageInput, webContents: WebContents): void {
   rebindWebContents(input.sessionId, webContents)
+  agentQueueCoordinator.resumeForExplicitInput(input.sessionId)
   agentQueueCoordinator.enqueue(input)
 }
 

@@ -9,6 +9,7 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { safeStorage } from 'electron'
 import { getWeChatConfigPath } from './config-paths'
+import { writeJsonFileAtomic } from './safe-file'
 import { redactSensitiveLogValue } from './bridge-log-redaction'
 import type { WeChatConfig, WeChatCredentials } from '@proma/shared'
 
@@ -84,10 +85,12 @@ export function getDecryptedCredentials(): WeChatCredentials | null {
 }
 
 /** 仅更新默认工作区 ID（不修改凭证） */
-export function updateWeChatDefaultWorkspace(workspaceId: string): void {
+export function updateWeChatDefaultWorkspace(workspaceId: string | undefined): void {
   const configPath = getWeChatConfigPath()
-  const config = getWeChatConfig()
-  writeFileSync(configPath, JSON.stringify({ ...config, defaultWorkspaceId: workspaceId }, null, 2), 'utf-8')
+  // 更新不能使用会吞掉解析错误并返回空配置的展示型getter，以免覆盖既有凭据。
+  const config: unknown = JSON.parse(readFileSync(configPath, 'utf-8'))
+  if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('微信配置格式无效')
+  writeJsonFileAtomic(configPath, { ...config, defaultWorkspaceId: workspaceId })
 }
 
 /** 清除微信凭证（登出） */

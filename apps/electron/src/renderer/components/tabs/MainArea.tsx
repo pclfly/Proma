@@ -19,11 +19,14 @@ import { useTrackSessionView } from '@/hooks/useTrackSessionView'
 import { TabBar } from './TabBar'
 import { TabContent } from './TabContent'
 import { AutomationFormView } from '@/components/automation/AutomationFormView'
+import { AutomationsWelcomeView } from '@/components/automation/AutomationsWelcomeView'
 import { PlanningView } from '@/components/planning/PlanningView'
 import { AgentSkillsView } from '@/components/agent-skills/AgentSkillsView'
 import { VaultView } from '@/components/vault/VaultView'
+import { StarredSessionsView } from '@/components/starred/StarredSessionsView'
 import { automationFormAtom } from '@/atoms/automation-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
+import { planningTabAtom } from '@/atoms/planning-atoms'
 import { registerShortcut } from '@/lib/shortcut-registry'
 import {
   agentDiffPanelTabAtom,
@@ -47,6 +50,7 @@ export function MainArea(): React.ReactElement {
   const activeTab = useAtomValue(activeTabAtom)
   const automationFormOpen = useAtomValue(automationFormAtom).open
   const activeView = useAtomValue(activeViewAtom)
+  const planningTab = useAtomValue(planningTabAtom)
   const store = useStore()
 
   // TabBar 立即反馈，较重的中心内容可让出当前交互帧；Agent 历史则保持当前会话避免旧内容占屏。
@@ -151,11 +155,17 @@ export function MainArea(): React.ReactElement {
       <div className="flex flex-1 min-h-0 overflow-hidden">
         <div className="flex flex-1 flex-col min-w-0 h-full">
           {activeView === 'planning' ? (
-            automationFormOpen ? <AutomationFormView /> : <PlanningView />
+            automationFormOpen
+              ? <AutomationFormView />
+              : planningTab === 'automations'
+                ? <AutomationsWelcomeView />
+                : <PlanningView shellMode />
           ) : activeView === 'agent-skills' ? (
-            <AgentSkillsView />
+            <AgentSkillsView shellMode />
           ) : activeView === 'vault' ? (
-            <VaultView />
+            <VaultView shellMode />
+          ) : activeView === 'starred' ? (
+            <StarredSessionsView />
           ) : (
             <>
               {showCenterTabBar && <TabBar />}

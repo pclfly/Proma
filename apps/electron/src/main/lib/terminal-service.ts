@@ -23,6 +23,7 @@ import {
 } from './terminal-output-buffer'
 import { resolveAgentTerminalCwd } from './terminal-agent-policy'
 import { requireTerminalCwd, resolveTerminalCwd } from './terminal-cwd'
+import { assertPathsNotBeingRemoved } from './git-worktree-removal'
 import { terminalRuntimeClient } from './terminal-runtime-client'
 
 const terminals = new Map<string, TerminalState>()
@@ -77,6 +78,7 @@ export async function createTerminal(
   const pending = pendingTerminals.get(input.terminalId)
   if (pending) return pending
   const cwd = options.strictCwd ? requireTerminalCwd(input.cwd) : resolveTerminalCwd(input.cwd)
+  assertPathsNotBeingRemoved([cwd])
 
   // Record ownership before spawning so a concurrent session deletion can cancel it.
   terminalSessionOwners.set(input.terminalId, input.sessionId)
@@ -208,6 +210,14 @@ export async function executeAgentTerminal(input: {
 
 export function listAgentTerminals(sessionId: string): AgentTerminalRecord[] {
   return [...agentTerminals.values()].filter((record) => record.sessionId === sessionId)
+}
+
+/** 当前所有活跃内置终端的 cwd；Worktree 删除前用于占用检查。 */
+export function getTerminalWorkingDirectories(): string[] {
+  return [...new Set([
+    ...terminals.values(),
+    ...agentTerminals.values(),
+  ].map((record) => record.cwd))]
 }
 
 /** 读取当前 Agent 会话拥有的终端输出；只暴露有限内存回放缓冲，不读取其他会话或系统终端。 */

@@ -15,18 +15,9 @@ import * as React from 'react'
 import { Clock, GitBranch } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import {
-  SessionMiniMapPopover,
-  useSessionMiniMapHover,
-  type SessionMiniMapType,
-} from '@/components/session-preview/SessionMiniMapPopover'
+import { SessionMiniMapPopover, useSessionMiniMapHover, type SessionMiniMapType } from '@/components/session-preview/SessionMiniMapPopover'
 import { CollapsedDelegatedSessionsPopover } from '@/components/agent/CollapsedDelegatedSessionsPopover'
-import {
-  getCollapsedAgentRailVisibleItems,
-  getEffectiveCollapsedRailPopoverId,
-  reduceCollapsedRailPopoverState,
-  type CollapsedRailPopoverState,
-} from '@/lib/collapsed-agent-rail'
+import { getCollapsedAgentRailVisibleItems, getEffectiveCollapsedRailPopoverId, reduceCollapsedRailPopoverState, type CollapsedRailPopoverState } from '@/lib/collapsed-agent-rail'
 import type { AgentSessionMeta } from '@proma/shared'
 import type { SessionIndicatorStatus } from '@/atoms/agent-atoms'
 
@@ -82,7 +73,7 @@ function RailRecentButton({
     <button
       ref={preview.setAnchorRef}
       type="button"
-      aria-label={`打开${item.type === 'agent' ? 'Agent 会话' : 'Chat 对话'}：${item.title}`}
+      aria-label={`打开Agent 会话：${item.title}`}
       onClick={() => onSelect(item)}
       onMouseEnter={preview.handleMouseEnter}
       onMouseLeave={preview.handleMouseLeave}

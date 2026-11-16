@@ -1,7 +1,6 @@
 import * as React from 'react'
 import { useSetAtom } from 'jotai'
 import type { BrowserStateChange, BrowserViewState } from '@proma/shared'
-import { BROWSER_RISK_DISCLAIMER_VERSION } from '@/types/settings'
 import {
   browserFocusRequestMapAtom,
   browserPanelMinimizedMapAtom,
@@ -68,12 +67,6 @@ export function AgentBrowserLinkProvider({
   }, [setBrowserFocusRequestMap])
 
   const openLink = React.useCallback((url: string) => {
-    const openBrowser = (window.electronAPI as Partial<typeof window.electronAPI>).openAgentBrowser
-    if (typeof openBrowser !== 'function') {
-      void window.electronAPI.openExternal(url)
-      return
-    }
-
     const nextNavigation = (navigationQueues.get(sessionId) ?? Promise.resolve())
       .catch(() => undefined)
       .then(async () => {
@@ -83,24 +76,7 @@ export function AgentBrowserLinkProvider({
             next.delete(sessionId)
             return next
           })
-          const [settings, existingState] = await Promise.all([
-            window.electronAPI.getSettings(),
-            window.electronAPI.getAgentBrowserState(sessionId),
-          ])
-          const riskAcknowledged = (settings.browserRiskDisclaimerVersion ?? 0) >= BROWSER_RISK_DISCLAIMER_VERSION
-
-          if (!riskAcknowledged) {
-            // 风险告知尚未确认时，先打开空白浏览器展示确认弹窗，确认后再导航。
-            const state = existingState ?? await openBrowser(sessionId)
-            publishBrowserState(state)
-            requestBrowserFocus(state)
-            setPendingNavigationMap((previous) => {
-              const next = new Map(previous)
-              next.set(sessionId, url)
-              return next
-            })
-            return
-          }
+          const existingState = await window.electronAPI.getAgentBrowserState(sessionId)
 
           // 带目标 URL 的首次打开直接创建并导航 Agent 标签，避免 openAgentBrowser
           // 先将初始空白标签加载为 Google 后再额外创建一个目标标签。
@@ -117,7 +93,7 @@ export function AgentBrowserLinkProvider({
     void nextNavigation.finally(() => {
       if (navigationQueues.get(sessionId) === nextNavigation) navigationQueues.delete(sessionId)
     })
-  }, [publishBrowserState, requestBrowserFocus, sessionId, setBrowserMinimizedMap, setPendingNavigationMap])
+  }, [publishBrowserState, requestBrowserFocus, sessionId, setBrowserMinimizedMap])
 
   const value = React.useMemo(() => ({ openLink }), [openLink])
   return <AgentBrowserLinkContext.Provider value={value}>{children}</AgentBrowserLinkContext.Provider>

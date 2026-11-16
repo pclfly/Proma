@@ -21,7 +21,8 @@ export function shouldNotifyAutomationTarget(
   status: AutomationRun['status'],
 ): boolean {
   if (!target.enabled) return false
-  if (status === 'skipped') return false
+  // running 是进行中记录，interrupted 由启动恢复补写，都不是一次运行的真实结果，不触发通知
+  if (status === 'skipped' || status === 'running' || status === 'interrupted') return false
   if (target.trigger === 'always') return true
   return target.trigger === status
 }

@@ -32,16 +32,14 @@ import type {
 } from '@proma/shared'
 import { FEISHU_IPC_CHANNELS, AGENT_IPC_CHANNELS } from '@proma/shared'
 import { getDecryptedBotAppSecret } from './feishu-config'
+import { ConnectionStartup } from './network/connection-startup'
 import { agentEventBus, runAgentHeadless, stopAgent } from './agent-service'
 import { createAgentSession, listAgentSessions, getAgentSessionMeta } from './agent-session-manager'
-import {
-  listAgentWorkspacesByUpdatedAt,
-  getAgentWorkspace,
-  getProjectFilesPath,
-  getWorkspaceCapabilities,
-} from './agent-workspace-manager'
+import { describeBridgeWorkspaceFailure, resolveBridgeWorkspace } from './bridge-workspace-resolution'
+import { BridgeWorkspaceSwitchError, commitBridgeWorkspaceSwitch, createBridgeWorkspaceSwitchJournal, type BridgeWorkspaceSwitchJournal } from './bridge-workspace-switch'
+import { listAgentWorkspacesByUpdatedAt, getAgentWorkspace, getProjectFilesPath, getWorkspaceCapabilities } from './agent-workspace-manager'
 import { getFeishuBotBindingsPath, getFeishuBotMetadataPath } from './config-paths'
-import { writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { readFileSync, existsSync } from 'node:fs'
 import { readJsonFileSafe, writeJsonFileAtomic } from './safe-file'
 import {
   inferImageMediaType as inferImageMediaTypeShared,
@@ -76,7 +74,6 @@ import type { ToolSummary, FormattedAgentResult, WorkspaceListItem } from './fei
 import { CardStream } from './feishu/card-stream'
 import {
   createInitialState,
-  finalizeIfRunning,
   markError,
   markInterrupted,
   reduce as reduceRunState,
@@ -88,15 +85,11 @@ import { resolveGroupMessageAccess } from './feishu/group-message-policy'
 import { ScopedQueue } from './feishu/scoped-queue'
 import { RunCoordinator } from './feishu/run-coordinator'
 import { extractFinalAssistantText, isPartialSDKMessage } from './bridge-agent-message-utils'
-import {
-  buildAgentUserMessage,
-  fetchQuotedMessage,
-  type BridgeContext,
-  type QuotedMessage,
-} from './feishu/prompt-builder'
+import { buildAgentUserMessage, fetchQuotedMessage, type BridgeContext, type QuotedMessage } from './feishu/prompt-builder'
 
 import { redactSensitiveLogText, redactSensitiveLogValue } from './bridge-log-redaction'
 import { getFeishuApiBaseUrl, normalizeFeishuDomain } from './feishu-domain'
+import { buildFeishuChannelOptions, buildFeishuClientOptions } from './feishu-channel-options'
 
 // ===== 类型定义 =====
 
@@ -108,6 +101,10 @@ interface FeishuImageAttachment {
   data: Buffer
   /** MIME 类型 */
   mediaType: string
+  /** 首次进入缓冲的时间，用于保留原 TTL。 */
+  receivedAt?: number
+  /** 已成功落盘的结果；重试复用，不重复写盘。 */
+  prepared?: { sessionId: string; workspaceId: string; path: string; reference: string }
 }
 
 /** 飞书文件附件（已下载，待保存到 session 工作目录） */
@@ -118,7 +115,14 @@ interface FeishuFileAttachment {
   fileName: string
   /** 文件二进制数据 */
   data: Buffer
+  /** 首次进入缓冲的时间，用于保留原 TTL。 */
+  receivedAt?: number
+  /** 已成功落盘的结果；重试复用，不重复写盘。 */
+  prepared?: { sessionId: string; workspaceId: string; path: string; reference: string }
 }
+
+/** handleUserMessage 只报告“是否已交给 Agent 调度”，不代表 provider 或网络成功。 */
+type FeishuDispatchResult = 'dispatched' | 'not-dispatched'
 
 /** 会话累积缓冲 */
 interface SessionBuffer {
@@ -138,6 +142,10 @@ interface QueuedFeishuMessage {
 }
 
 const MESSAGE_DEBOUNCE_MS = 600
+/** 失败重试的附件保留上限，避免无界堆积。 */
+const PENDING_ATTACHMENT_TTL_MS = 10 * 60 * 1000
+const PENDING_IMAGE_MAX = 20
+const PENDING_FILE_MAX = 20
 const DEFAULT_MAX_CONCURRENT_RUNS = 3
 
 // ===== Bridge =====
@@ -159,6 +167,11 @@ class FeishuBridge {
 
   /** chatId → 绑定信息 */
   private chatBindings = new Map<string, FeishuChatBinding>()
+  private rejectedBindings = new Map<string, FeishuChatBinding>()
+  private readonly workspaceSwitchJournal: BridgeWorkspaceSwitchJournal
+  private workspaceSwitchPending = false
+  private workspaceSwitchBlocked = false
+  private readonly connectionStartup = new ConnectionStartup()
   /** sessionId → chatId（反向索引） */
   private sessionToChat = new Map<string, string>()
   /** sessionId → 文本累积缓冲（桌面通知场景仍依赖） */
@@ -212,6 +225,8 @@ class FeishuBridge {
 
   constructor(botConfig: FeishuBotConfig) {
     this.botConfig = botConfig
+    this.workspaceSwitchJournal = createBridgeWorkspaceSwitchJournal(getFeishuBotBindingsPath(botConfig.id))
+    this.workspaceSwitchBlocked = this.workspaceSwitchJournal.isPending()
   }
 
   /** 获取 Bot 配置 */
@@ -227,11 +242,12 @@ class FeishuBridge {
       throw new Error('请先配置 App ID 和 App Secret')
     }
 
+    const attempt = this.connectionStartup.begin()
     this.updateStatus({ status: 'connecting' })
 
     try {
       const plainSecret = getDecryptedBotAppSecret(this.botConfig.id)
-      const lark = await import('@larksuiteoapi/node-sdk')
+      const lark = await attempt.wait(import('@larksuiteoapi/node-sdk'))
       const domain = normalizeFeishuDomain(this.botConfig.domain)
       const apiBaseUrl = getFeishuApiBaseUrl(domain)
 
@@ -239,33 +255,21 @@ class FeishuBridge {
       // 关键收益：channel.on({cardAction}) 能拿到卡片按钮回调（老 WSClient.handleEventData
       // 只处理 MessageType.event 通道，会直接丢掉 MessageType.card 帧）
       // 其余调用通过 channel.rawClient 路由，所有现有 client.* API 零改动
-      this.channel = lark.createLarkChannel({
-        appId,
-        appSecret: plainSecret,
-        domain: domain === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu,
-        loggerLevel: lark.LoggerLevel.warn,
-        policy: {
-          dmMode: 'open',
-          requireMention: false,
-          respondToMentionAll: false,
-        },
-        // 关闭 SDK 内部 per-chat 串行（chatQueue），我们的并发模型自己控
-        safety: { chatQueue: { enabled: false } },
-        // 接 raw event 用于把 NormalizedMessage 反构成旧 handleFeishuMessage 形态
-        includeRawEvent: true,
-      })
+      this.channel = lark.createLarkChannel(
+        buildFeishuChannelOptions(this.botConfig, plainSecret, lark),
+      )
       this.client = this.channel.rawClient
 
       // 获取 Bot 自身的 open_id（用于群聊 @Bot 精确检测）
       try {
-        const botInfoResp = await this.client.request<{
+        const botInfoResp = await attempt.wait(this.client.request<{
           code?: number
           bot?: { open_id?: string; app_name?: string }
           data?: { bot?: { open_id?: string; app_name?: string } }
         }>({
           method: 'GET',
           url: `${apiBaseUrl}/open-apis/bot/v3/info/`,
-        })
+        }))
         console.log('[飞书 Bridge] Bot info 响应:', redactSensitiveLogValue(botInfoResp))
         // 飞书 API 返回 bot 在顶层，Lark SDK 可能包装在 data 下，兼容两种
         this.botOpenId = botInfoResp?.bot?.open_id ?? botInfoResp?.data?.bot?.open_id ?? null
@@ -292,7 +296,8 @@ class FeishuBridge {
         },
       })
 
-      await this.channel.connect()
+      await attempt.wait(this.channel.connect())
+      if (!attempt.isCurrent()) return
 
       // 注册 EventBus 监听器
       this.eventBusUnsubscribe = agentEventBus.on((sessionId, payload) => {
@@ -314,6 +319,7 @@ class FeishuBridge {
   }
 
   stop(): void {
+    this.connectionStartup.cancel()
     // 取消 EventBus 监听
     this.eventBusUnsubscribe?.()
     this.eventBusUnsubscribe = null
@@ -376,7 +382,8 @@ class FeishuBridge {
       for (const b of bindings) {
         // 验证对应会话仍然存在
         const session = getAgentSessionMeta(b.sessionId)
-        if (session) {
+        if (session?.workspaceId && getAgentWorkspace(session.workspaceId) && b.workspaceId === session.workspaceId) {
+          // 恢复要求归属一致；失效或不一致的旧chat保留为非活动路由墓碑。
           if (b.source === 'session-mirror' && session.archived) {
             b.archived = true
             b.archivedAt ??= session.updatedAt
@@ -392,6 +399,8 @@ class FeishuBridge {
           if (!b.archived) {
             this.sessionToChat.set(b.sessionId, b.chatId)
           }
+        } else {
+          this.rejectedBindings.set(b.chatId, b)
         }
       }
       if (this.chatBindings.size > 0) {
@@ -404,13 +413,16 @@ class FeishuBridge {
   }
 
   /** 持久化聊天绑定到磁盘 */
-  private saveBindings(): void {
+  private persistedBindings(): FeishuChatBinding[] {
+    return [...this.rejectedBindings.values(), ...this.chatBindings.values()]
+  }
+
+  private saveBindings(bindings = this.persistedBindings(), strict = false): void {
     try {
-      const bindings = Array.from(this.chatBindings.values())
-      const bindingsPath = getFeishuBotBindingsPath(this.botConfig.id)
-      writeFileSync(bindingsPath, JSON.stringify(bindings, null, 2), 'utf-8')
+      writeJsonFileAtomic(getFeishuBotBindingsPath(this.botConfig.id), bindings)
     } catch (error) {
       console.error('[飞书 Bridge] 保存绑定失败:', redactSensitiveLogValue(error))
+      if (strict) throw error
     }
   }
 
@@ -486,45 +498,56 @@ class FeishuBridge {
   /** 更新绑定的工作区/会话（从设置页调用） */
   updateBinding(input: FeishuUpdateBindingInput): FeishuChatBinding | null {
     const binding = this.chatBindings.get(input.chatId)
-    if (!binding) return null
-
-    if (input.workspaceId !== undefined) {
-      binding.workspaceId = input.workspaceId
-    }
-    if (input.sessionId !== undefined) {
-      // 清理旧反向索引，建立新的
-      this.sessionToChat.delete(binding.sessionId)
-      binding.sessionId = input.sessionId
-      if (!binding.archived) {
-        this.sessionToChat.set(input.sessionId, input.chatId)
-      }
+    if (!binding || this.workspaceSwitchPending || this.workspaceSwitchBlocked) return null
+    const next = { ...binding }
+    if (input.sessionId !== undefined || input.workspaceId !== undefined || input.archived === false) {
+      const session = getAgentSessionMeta(input.sessionId ?? binding.sessionId)
+      if (!session?.workspaceId || !getAgentWorkspace(session.workspaceId)
+        || (input.workspaceId !== undefined && input.workspaceId !== session.workspaceId)) return null
+      next.sessionId = session.id
+      next.workspaceId = session.workspaceId
     }
     if (input.archived !== undefined) {
-      binding.archived = input.archived
-      binding.archivedAt = input.archived ? Date.now() : undefined
-      if (input.archived) {
-        this.sessionToChat.delete(binding.sessionId)
-      } else {
-        this.sessionToChat.set(binding.sessionId, input.chatId)
-        binding.lastUsedAt ??= Date.now()
-      }
-      this.updateStatus({ activeBindings: this.getActiveBindingCount() })
+      next.archived = input.archived
+      next.archivedAt = input.archived ? Date.now() : undefined
+      if (!input.archived) next.lastUsedAt ??= Date.now()
     }
+    // 先落盘再变更映射；失败不破坏原绑定。纯归档允许收起已失效的镜像。
+    this.saveBindings(this.persistedBindings().map((item) => item === binding ? next : item), true)
+    if (this.sessionToChat.get(binding.sessionId) === input.chatId) this.sessionToChat.delete(binding.sessionId)
+    this.chatBindings.set(input.chatId, next)
+    if (!next.archived) this.sessionToChat.set(next.sessionId, input.chatId)
+    this.updateStatus({ activeBindings: this.getActiveBindingCount() })
+    return { ...next }
+  }
 
-    this.saveBindings()
-    return { ...binding }
+  /** 项目删除只停用路由，保留拒绝记录，不能在重启后把旧chat重建到其他项目。 */
+  quarantineBindingsForDeletedWorkspace(workspaceId: string, sessionIds: ReadonlySet<string>): number {
+    let removed = 0
+    for (const [chatId, binding] of this.chatBindings) {
+      if (binding.workspaceId !== workspaceId && !sessionIds.has(binding.sessionId)) continue
+      this.rejectedBindings.set(chatId, binding)
+      this.chatBindings.delete(chatId)
+      if (this.sessionToChat.get(binding.sessionId) === chatId) this.sessionToChat.delete(binding.sessionId)
+      removed += 1
+    }
+    if (removed) {
+      this.updateStatus({ activeBindings: this.getActiveBindingCount() })
+      this.saveBindings()
+    }
+    return removed
   }
 
   /** 移除绑定（从设置页调用） */
   removeBinding(chatId: string): boolean {
-    const binding = this.chatBindings.get(chatId)
+    const binding = this.chatBindings.get(chatId) ?? this.rejectedBindings.get(chatId)
     if (!binding) return false
-
-    this.sessionToChat.delete(binding.sessionId)
+    this.saveBindings(this.persistedBindings().filter((item) => item.chatId !== chatId), true)
+    if (this.sessionToChat.get(binding.sessionId) === chatId) this.sessionToChat.delete(binding.sessionId)
     this.streamingTerminalHandledSessions.delete(binding.sessionId)
     this.chatBindings.delete(chatId)
+    this.rejectedBindings.delete(chatId)
     this.updateStatus({ activeBindings: this.getActiveBindingCount() })
-    this.saveBindings()
     return true
   }
 
@@ -547,9 +570,9 @@ class FeishuBridge {
     }
 
     const appSettings = getSettings()
-    const workspaceId = session.workspaceId ?? this.botConfig.defaultWorkspaceId ?? appSettings.agentWorkspaceId
+    const workspaceId = session.workspaceId
     const channelId = session.channelId ?? this.botConfig.defaultChannelId ?? appSettings.agentChannelId
-    if (!workspaceId || !channelId) {
+    if (!workspaceId || !getAgentWorkspace(workspaceId) || !channelId) {
       console.warn('[飞书 Session 镜像] 缺少 workspaceId 或 channelId，跳过镜像群创建', {
         sessionId: session.id,
         workspaceId,
@@ -624,9 +647,7 @@ class FeishuBridge {
     try {
       const lark = await import('@larksuiteoapi/node-sdk')
       const client = new lark.Client({
-        appId,
-        appSecret,
-        domain: normalizeFeishuDomain(domain) === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu,
+        ...buildFeishuClientOptions({ appId, domain }, appSecret, lark),
         appType: lark.AppType.SelfBuild,
       })
 
@@ -874,15 +895,16 @@ class FeishuBridge {
 
     // 纯附件消息（无文本）：暂存，等待后续文本一起触发 Agent
     if (!text && hasAttachments) {
+      const now = Date.now()
+      const stamp = <T extends { receivedAt?: number }>(items: T[]): T[] =>
+        items.map((item) => ({ ...item, receivedAt: item.receivedAt ?? now }))
       if (imageAttachments.length > 0) {
         const existing = this.pendingImages.get(chatId) ?? []
-        existing.push(...imageAttachments)
-        this.pendingImages.set(chatId, existing)
+        this.pendingImages.set(chatId, [...existing, ...stamp(imageAttachments)].slice(-PENDING_IMAGE_MAX))
       }
       if (fileAttachments.length > 0) {
         const existing = this.pendingFiles.get(chatId) ?? []
-        existing.push(...fileAttachments)
-        this.pendingFiles.set(chatId, existing)
+        this.pendingFiles.set(chatId, [...existing, ...stamp(fileAttachments)].slice(-PENDING_FILE_MAX))
       }
       const parts: string[] = []
       const imgCount = this.pendingImages.get(chatId)?.length ?? 0
@@ -893,17 +915,21 @@ class FeishuBridge {
       return
     }
 
-    // 文本消息到达时，合并暂存的图片和文件
+    // 文本消息到达时，合并暂存的图片和文件；丢弃过期项，保留每项首次时间。
+    const now = Date.now()
     if (text && this.pendingImages.has(chatId)) {
       const pending = this.pendingImages.get(chatId)!
-      imageAttachments.unshift(...pending)
       this.pendingImages.delete(chatId)
+      imageAttachments.unshift(...pending.filter((item) => now - (item.receivedAt ?? now) < PENDING_ATTACHMENT_TTL_MS))
     }
     if (text && this.pendingFiles.has(chatId)) {
       const pending = this.pendingFiles.get(chatId)!
-      fileAttachments.unshift(...pending)
       this.pendingFiles.delete(chatId)
+      fileAttachments.unshift(...pending.filter((item) => now - (item.receivedAt ?? now) < PENDING_ATTACHMENT_TTL_MS))
     }
+    const arrivedAt = Date.now()
+    for (const item of imageAttachments) item.receivedAt ??= arrivedAt
+    for (const item of fileAttachments) item.receivedAt ??= arrivedAt
 
     // 获取群聊上下文
     let groupName: string | undefined
@@ -1010,14 +1036,19 @@ class FeishuBridge {
     this.messageQueue.block(scope)
     try {
       await this.handleUserMessage(msgCtx, mergedText, mergedImages, mergedFiles, parentMessageId)
-    } finally {
-      release()
+    } finally {      release()
       this.messageQueue.unblock(scope)
     }
   }
 
   private async handleCommand(msgCtx: FeishuMessageContext, text: string): Promise<void> {
     const { chatId } = msgCtx
+    const readOnlyCommand = /^\/(?:stop|now|help)(?:\s|$)/i.test(text.trim())
+    if ((this.workspaceSwitchPending && !readOnlyCommand)
+      || (this.workspaceSwitchBlocked && !readOnlyCommand && !/^\/(?:workspace|ws)(?:\s|$)/i.test(text.trim()))) {
+      await this.sendMessage(chatId, this.workspaceSwitchPending ? '项目切换仍在保存，请稍候。' : '上次项目切换未完成，请用 /workspace 重新选择项目。')
+      return
+    }
     const [command, ...args] = text.split(/\s+/)
     const arg = args.join(' ').trim()
 
@@ -1082,18 +1113,17 @@ class FeishuBridge {
     const { chatId } = msgCtx
     const appSettings = getSettings()
 
-    // 选择工作区：显式指定 > Bot 默认 > 应用设置 > 第一个工作区
-    let workspaceId = overrideWorkspaceId ?? this.botConfig.defaultWorkspaceId ?? appSettings.agentWorkspaceId
-    if (!workspaceId) {
-      const byTime = listAgentWorkspacesByUpdatedAt()
-      const def = byTime.find((w) => w.slug === 'default')
-      workspaceId = def?.id ?? byTime[0]?.id
-    }
-
-    if (!workspaceId) {
-      await this.sendMessage(chatId, '请先在 Proma 设置中创建项目。')
+    // 选择工作区：显式指定 > Bot 默认 > 应用设置；失效配置必须显式拒绝，不能静默换项目。
+    const resolution = resolveBridgeWorkspace({
+      candidates: [overrideWorkspaceId, this.botConfig.defaultWorkspaceId, appSettings.agentWorkspaceId],
+      exists: (id) => Boolean(getAgentWorkspace(id)),
+      list: () => listAgentWorkspacesByUpdatedAt(),
+    })
+    if (!resolution.ok) {
+      await this.sendMessage(chatId, describeBridgeWorkspaceFailure(resolution))
       return
     }
+    const workspaceId = resolution.workspaceId
 
     // 渠道/模型：Bot 配置 > 应用设置
     const channelId = this.botConfig.defaultChannelId ?? appSettings.agentChannelId
@@ -1102,8 +1132,18 @@ class FeishuBridge {
       return
     }
 
-    // 创建会话（使用默认标题，首次对话完成后会自动生成标题）
+    if (this.workspaceSwitchPending || this.workspaceSwitchBlocked) {
+      await this.sendMessage(chatId, '项目切换尚未完成，请用 /workspace 确认项目后再试。')
+      return
+    }
+    const previousBinding = this.chatBindings.get(chatId)
+    // 创建失败不破坏旧绑定；await期间发生切换也不能覆盖更新后的目标。
     const session = await createAgentSession(title, channelId, workspaceId)
+    if (this.workspaceSwitchPending || this.workspaceSwitchBlocked || !getAgentWorkspace(workspaceId)
+      || this.chatBindings.get(chatId) !== previousBinding) {
+      await this.sendMessage(chatId, '创建期间项目或会话已变化，请重新发送。')
+      return
+    }
 
     // 绑定
     const binding: FeishuChatBinding = {
@@ -1120,10 +1160,14 @@ class FeishuBridge {
       createdAt: Date.now(),
       lastUsedAt: Date.now(),
     }
+    this.saveBindings([...this.persistedBindings().filter((item) => item.chatId !== chatId), binding], true)
+    this.rejectedBindings.delete(chatId)
+    if (previousBinding && this.sessionToChat.get(previousBinding.sessionId) === chatId) {
+      this.sessionToChat.delete(previousBinding.sessionId)
+    }
     this.chatBindings.set(chatId, binding)
     this.sessionToChat.set(session.id, chatId)
     this.updateStatus({ activeBindings: this.getActiveBindingCount() })
-    this.saveBindings()
 
     // 通知渲染进程刷新会话列表（复用 TITLE_UPDATED 通道触发列表刷新）
     const mainWindow = getMainWindow()
@@ -1139,7 +1183,8 @@ class FeishuBridge {
 
   private findBindingBySessionId(sessionId: string): FeishuChatBinding | undefined {
     const chatId = this.sessionToChat.get(sessionId)
-    if (chatId) return this.chatBindings.get(chatId)
+    const indexed = chatId ? this.chatBindings.get(chatId) : undefined
+    if (indexed?.sessionId === sessionId) return indexed
     return Array.from(this.chatBindings.values()).find((binding) => binding.sessionId === sessionId)
   }
 
@@ -1277,9 +1322,22 @@ class FeishuBridge {
       return
     }
 
+    // 两个 chat 可经 /switch 共用同一 session：只能关闭本轮自己可证明的卡片，
+    // 并且如果卡片属于另一个 chat，必须告知对方，而不是静默关掉它的进度卡。
+    const ownedState = this.streamingRunStates.get(binding.sessionId)
+    const ownedCard = this.streamingCards.get(binding.sessionId)
+    const ownerChatId = this.sessionToChat.get(binding.sessionId)
     stopAgent(binding.sessionId)
-    this.markStreamingInterrupted(binding.sessionId)
-    await this.sendMessage(chatId, '已停止 Agent')
+    this.markStreamingInterrupted(binding.sessionId, ownedCard && ownedState ? { state: ownedState, card: ownedCard } : undefined)
+    const interruptedOthers = Boolean(ownerChatId && ownerChatId !== chatId)
+    if (interruptedOthers && ownerChatId) {
+      this.sendTextMessage(ownerChatId, `该会话已被另一个会话以 /stop 中断（发起方 chat: ${chatId.slice(0, 8)}...）`).catch((error) => {
+        console.warn('[飞书 Bridge] 通知中断归属失败:', redactSensitiveLogValue(error))
+      })
+    }
+    await this.sendMessage(chatId, interruptedOthers
+      ? '已停止 Agent（该会话同时属于另一个 chat，已通知对方）'
+      : '已停止 Agent')
   }
 
   private async handleSwitchCommand(msgCtx: FeishuMessageContext, arg: string): Promise<void> {
@@ -1297,19 +1355,20 @@ class FeishuBridge {
       return
     }
 
-    // 清理旧绑定的反向索引
-    const oldBinding = this.chatBindings.get(chatId)
-    if (oldBinding) {
-      this.sessionToChat.delete(oldBinding.sessionId)
+    // 选定会话必须保有自己的有效项目，不得回退成另一项目或空项目。
+    if (!match.workspaceId || !getAgentWorkspace(match.workspaceId)) {
+      await this.sendMessage(chatId, '该会话所属项目已不存在，请用 /workspace 选择项目并新建会话，或切换其他有效会话。')
+      return
     }
 
+    const oldBinding = this.chatBindings.get(chatId)
     const appSettings = getSettings()
     const binding: FeishuChatBinding = {
       chatId,
       botId: this.botConfig.id,
       userId: msgCtx.senderOpenId,
       sessionId: match.id,
-      workspaceId: match.workspaceId ?? this.botConfig.defaultWorkspaceId ?? appSettings.agentWorkspaceId ?? '',
+      workspaceId: match.workspaceId,
       channelId: match.channelId ?? appSettings.agentChannelId ?? '',
       modelId: this.botConfig.defaultModelId ?? appSettings.agentModelId ?? undefined,
       source: 'feishu',
@@ -1318,10 +1377,12 @@ class FeishuBridge {
       createdAt: Date.now(),
       lastUsedAt: Date.now(),
     }
+    this.saveBindings([...this.persistedBindings().filter((item) => item.chatId !== chatId), binding], true)
+    if (oldBinding && this.sessionToChat.get(oldBinding.sessionId) === chatId) this.sessionToChat.delete(oldBinding.sessionId)
     this.chatBindings.set(chatId, binding)
     this.sessionToChat.set(match.id, chatId)
+    this.rejectedBindings.delete(chatId)
     this.updateStatus({ activeBindings: this.getActiveBindingCount() })
-    this.saveBindings()
 
     await this.sendMessage(chatId, `已切换到会话: ${match.title} (${match.id.slice(0, 8)})`)
   }
@@ -1357,28 +1418,42 @@ class FeishuBridge {
       return
     }
 
-    // 清理旧绑定（切换工作区后需要用户选择或新建会话）
-    if (binding) {
-      this.sessionToChat.delete(binding.sessionId)
-      this.chatBindings.delete(chatId)
+    const previousBindings = new Map(this.chatBindings)
+    const previousRejected = new Map(this.rejectedBindings)
+    const previousPersisted = this.persistedBindings()
+    const previousIndex = new Map(this.sessionToChat)
+    const before = JSON.stringify(previousPersisted)
+    this.workspaceSwitchPending = true
+    try {
+      await commitBridgeWorkspaceSwitch({
+        workspaceId: match.id,
+        getDefaultWorkspaceId: () => this.botConfig.defaultWorkspaceId,
+        persistDefaultWorkspaceId: async (workspaceId) => {
+          const { updateFeishuDefaultWorkspace } = await import('./feishu-config')
+          updateFeishuDefaultWorkspace(this.botConfig.id, workspaceId)
+          this.botConfig = { ...this.botConfig, defaultWorkspaceId: workspaceId }
+        },
+        validate: () => Boolean(getAgentWorkspace(match.id))
+          && JSON.stringify(this.persistedBindings()) === before,
+        persistBindings: () => this.saveBindings(previousPersisted.filter((item) => item.chatId !== chatId), true),
+        restoreBindings: () => this.saveBindings(previousPersisted, true),
+        commitMemory: () => {
+          this.chatBindings.delete(chatId)
+          this.rejectedBindings.delete(chatId)
+          if (binding && this.sessionToChat.get(binding.sessionId) === chatId) this.sessionToChat.delete(binding.sessionId)
+        },
+        restoreMemory: () => { this.chatBindings = previousBindings; this.rejectedBindings = previousRejected; this.sessionToChat = previousIndex },
+        journal: this.workspaceSwitchJournal,
+      })
+      this.workspaceSwitchBlocked = false
       this.updateStatus({ activeBindings: this.getActiveBindingCount() })
-      this.saveBindings()
+    } catch (error) {
+      this.workspaceSwitchBlocked ||= error instanceof BridgeWorkspaceSwitchError && error.requiresRepair
+      await this.sendMessage(chatId, error instanceof BridgeWorkspaceSwitchError ? error.message : '项目切换失败，请重试。')
+      return
+    } finally {
+      this.workspaceSwitchPending = false
     }
-
-    // 更新 Bot 配置的默认工作区（下次自动创建会话时使用）
-    const { saveFeishuBotConfig } = await import('./feishu-config')
-    saveFeishuBotConfig({
-      id: this.botConfig.id,
-      name: this.botConfig.name,
-      enabled: this.botConfig.enabled,
-      appId: this.botConfig.appId,
-      appSecret: '', // 空字符串表示不修改
-      defaultWorkspaceId: match.id,
-      defaultChannelId: this.botConfig.defaultChannelId,
-      defaultModelId: this.botConfig.defaultModelId,
-    })
-    // 同步更新内存中的 botConfig，避免后续读到旧快照
-    this.botConfig = { ...this.botConfig, defaultWorkspaceId: match.id }
 
     // 列出该工作区下最近 10 条会话（序号为全局排序位置）
     const sessions = listAgentSessions()
@@ -1586,15 +1661,85 @@ class FeishuBridge {
     imageAttachments: FeishuImageAttachment[] = [],
     fileAttachments: FeishuFileAttachment[] = [],
     parentMessageId?: string,
-  ): Promise<void> {
+  ): Promise<FeishuDispatchResult> {
+    const result = await this.dispatchUserMessage(msgCtx, text, imageAttachments, fileAttachments, parentMessageId)
+    // 未交给调度的附件必须保留可重试；已落盘部分随对象缓存，不会重复写。
+    if (result === 'dispatched') this.pruneRestoredAttachments(msgCtx.chatId, imageAttachments, fileAttachments)
+    else this.restorePendingAttachments(msgCtx.chatId, imageAttachments, fileAttachments)
+    return result
+  }
+
+  /** 成功交付后移除本轮的失败重试副本，保留并发到达的其他媒体。 */
+  private pruneRestoredAttachments(
+    chatId: string,
+    images: FeishuImageAttachment[],
+    files: FeishuFileAttachment[],
+  ): void {
+    const usedImages = new Set(images)
+    const usedFiles = new Set(files)
+    const pendingImages = this.pendingImages.get(chatId)
+    if (pendingImages) {
+      const retained = pendingImages.filter((item) => !usedImages.has(item))
+      if (retained.length !== pendingImages.length) {
+        if (retained.length > 0) this.pendingImages.set(chatId, retained)
+        else this.pendingImages.delete(chatId)
+      }
+    }
+    const pendingFiles = this.pendingFiles.get(chatId)
+    if (pendingFiles) {
+      const retained = pendingFiles.filter((item) => !usedFiles.has(item))
+      if (retained.length !== pendingFiles.length) {
+        if (retained.length > 0) this.pendingFiles.set(chatId, retained)
+        else this.pendingFiles.delete(chatId)
+      }
+    }
+  }
+
+  /** 失败重试保留原 TT：不因重试延长，不被无界堆积；过期项直接丢弃。 */
+  private restorePendingAttachments(
+    chatId: string,
+    images: FeishuImageAttachment[],
+    files: FeishuFileAttachment[],
+  ): void {
+    const now = Date.now()
+    const fresh = <T extends { receivedAt?: number }>(items: T[]): T[] =>
+      items.filter((item) => now - (item.receivedAt ?? now) < PENDING_ATTACHMENT_TTL_MS)
+    const retainedImages = fresh(images)
+    const retainedFiles = fresh(files)
+    if (retainedImages.length > 0) {
+      // 本轮失败项置尾部，使超上限时先淘汰普通待合并项，保证“可重试”不被新附件挤出。
+      const existing = this.pendingImages.get(chatId) ?? []
+      this.pendingImages.set(chatId, [...existing, ...retainedImages].slice(-PENDING_IMAGE_MAX))
+    }
+    if (retainedFiles.length > 0) {
+      const existing = this.pendingFiles.get(chatId) ?? []
+      this.pendingFiles.set(chatId, [...existing, ...retainedFiles].slice(-PENDING_FILE_MAX))
+    }
+  }
+
+  private async dispatchUserMessage(
+    msgCtx: FeishuMessageContext,
+    text: string,
+    imageAttachments: FeishuImageAttachment[] = [],
+    fileAttachments: FeishuFileAttachment[] = [],
+    parentMessageId?: string,
+  ): Promise<FeishuDispatchResult> {
     const { chatId } = msgCtx
+    if (this.workspaceSwitchPending || this.workspaceSwitchBlocked) {
+      await this.sendMessage(chatId, '项目切换尚未完成，请用 /workspace 确认项目后再试。')
+      return 'not-dispatched'
+    }
+    if (this.rejectedBindings.has(chatId)) {
+      await this.sendMessage(chatId, '原会话所属项目不可用，请用 /workspace、/switch 或 /new 明确选择项目/会话。')
+      return 'not-dispatched'
+    }
     let binding = this.chatBindings.get(chatId)
 
     // 自动创建会话
     if (!binding) {
       await this.createNewSession(msgCtx)
       binding = this.chatBindings.get(chatId)
-      if (!binding) return
+      if (!binding) return 'not-dispatched'
     }
 
     // 注：之前在此处有 isAgentSessionActive silent skip 兜底，会在
@@ -1607,66 +1752,87 @@ class FeishuBridge {
     if (!session?.workspaceId) {
       console.error(`[飞书 Bridge] 绑定会话缺少有效项目: sessionId=${binding.sessionId}`)
       await this.sendCardMessage(chatId, buildErrorCard('当前会话项目不可用，请在 Proma 中重新选择会话。'))
-      return
+      return 'not-dispatched'
+    }
+    const workspace = getAgentWorkspace(session.workspaceId)
+    if (!workspace) {
+      await this.sendCardMessage(chatId, buildErrorCard('当前会话所属项目已不存在，请用 /workspace 选择项目并新建会话。'))
+      return 'not-dispatched'
     }
     if (binding.workspaceId !== session.workspaceId) {
-      binding.workspaceId = session.workspaceId
-      this.saveBindings()
+      await this.sendCardMessage(chatId, buildErrorCard('会话与项目绑定不一致，请用 /switch 重新选择会话。'))
+      return 'not-dispatched'
     }
+    const targetSessionId = binding.sessionId
+    const targetWorkspaceId = binding.workspaceId
 
     // 保存飞书图片和文件到会话所属项目的工作目录，构建文件引用
     const attachedRefs: string[] = []
-    const workspace = getAgentWorkspace(session.workspaceId)
-
-    // 诊断：附件应保存但 workspace 为空时立即报错（用户能在 Console 看到）
     const hasAnyAttachment = imageAttachments.length > 0 || fileAttachments.length > 0
-    if (hasAnyAttachment && !workspace) {
-      console.error(`[飞书 Bridge] 附件保存失败：binding.workspaceId=${binding.workspaceId} 找不到对应工作区！图片数=${imageAttachments.length}, 文件数=${fileAttachments.length}`)
-    }
-    if (hasAnyAttachment && workspace) {
+    let attachmentSaveFailed = false
+
+    if (hasAnyAttachment) {
       console.log(`[飞书 Bridge] 准备保存附件：工作区=${workspace.slug}, sessionId=${binding.sessionId.slice(-8)}, 图片数=${imageAttachments.length}, 文件数=${fileAttachments.length}`)
     }
 
-    if (workspace) {
-      for (const img of imageAttachments) {
-        try {
-          const savedPath = saveImageToSessionShared(
-            workspace.slug, binding.sessionId, `feishu-${img.imageKey}`, img.mediaType, img.data,
-          )
-          attachedRefs.push(`- feishu-${img.imageKey}.${inferExtension(img.mediaType)}: ${savedPath}`)
-          console.log(`[飞书 Bridge] 已保存图片: ${savedPath}`)
-        } catch (err) {
-          console.error(`[飞书 Bridge] 图片保存失败 imageKey=${img.imageKey}:`, redactSensitiveLogValue(err))
-        }
+    for (const img of imageAttachments) {
+      const cached = img.prepared
+      if (cached && cached.sessionId === binding.sessionId && cached.workspaceId === workspace.id && existsSync(cached.path)) {
+        attachedRefs.push(cached.reference)
+        continue
       }
-      for (const file of fileAttachments) {
-        try {
-          const savedPath = saveFileToSessionShared(
-            workspace.slug, binding.sessionId, file.fileName, file.data,
-          )
-          attachedRefs.push(`- ${file.fileName}: ${savedPath}`)
-          console.log(`[飞书 Bridge] 已保存文件: ${savedPath}`)
-        } catch (err) {
-          console.error(`[飞书 Bridge] 文件保存失败 fileName=${file.fileName}:`, redactSensitiveLogValue(err))
-        }
+      try {
+        const savedPath = saveImageToSessionShared(
+          workspace.slug, binding.sessionId, `feishu-${img.imageKey}`, img.mediaType, img.data,
+        )
+        const reference = `- feishu-${img.imageKey}.${inferExtension(img.mediaType)}: ${savedPath}`
+        img.prepared = { sessionId: binding.sessionId, workspaceId: workspace.id, path: savedPath, reference }
+        attachedRefs.push(reference)
+        console.log(`[飞书 Bridge] 已保存图片: ${savedPath}`)
+      } catch (err) {
+        attachmentSaveFailed = true
+        console.error(`[飞书 Bridge] 图片保存失败 imageKey=${img.imageKey}:`, redactSensitiveLogValue(err))
       }
+    }
+    for (const file of fileAttachments) {
+      const cached = file.prepared
+      if (cached && cached.sessionId === binding.sessionId && cached.workspaceId === workspace.id && existsSync(cached.path)) {
+        attachedRefs.push(cached.reference)
+        continue
+      }
+      try {
+        const savedPath = saveFileToSessionShared(
+          workspace.slug, binding.sessionId, file.fileName, file.data,
+        )
+        const reference = `- ${file.fileName}: ${savedPath}`
+        file.prepared = { sessionId: binding.sessionId, workspaceId: workspace.id, path: savedPath, reference }
+        attachedRefs.push(reference)
+        console.log(`[飞书 Bridge] 已保存文件: ${savedPath}`)
+      } catch (err) {
+        attachmentSaveFailed = true
+        console.error(`[飞书 Bridge] 文件保存失败 fileName=${file.fileName}:`, redactSensitiveLogValue(err))
+      }
+    }
+
+    // 任一附件丢失都不调度无附件文字：交回等待区后可重试，已保存部分不重复写盘。
+    if (attachmentSaveFailed) {
+      await this.sendTextMessage(chatId, '附件保存失败，原附件已暂存，请稍后重新发送文字消息重试。')
+      return 'not-dispatched'
     }
     const fileReferences = attachedRefs.length > 0
       ? `<attached_files>\n${attachedRefs.join('\n')}\n</attached_files>\n\n`
       : ''
 
     // 初始化缓冲（保留供桌面通知/降级路径使用）
-    this.sessionBuffers.set(binding.sessionId, {
-      text: '',
-      toolSummaries: new Map(),
-      startedAt: Date.now(),
-    })
+    const ownBuffer: SessionBuffer = { text: '', toolSummaries: new Map(), startedAt: Date.now() }
+    this.sessionBuffers.set(binding.sessionId, ownBuffer)
 
     // 初始化流式卡片：发送一张"思考中"骨架卡，后续 handleAgentPayload 持续 update
     const prefix = this.resolveContextPrefix(chatId)
     const headerTitle = prefix ? `${prefix.trim()} · Agent 处理中` : 'Agent 处理中'
     const initialState = createInitialState()
     this.streamingRunStates.set(binding.sessionId, initialState)
+    let openedCard: CardStream | undefined
     try {
       const cardStream = await CardStream.open(
         this.client!,
@@ -1681,8 +1847,11 @@ class FeishuBridge {
           replyToMessageId: msgCtx.chatType === 'group' ? msgCtx.messageId : undefined,
         },
       )
-      this.streamingCards.set(binding.sessionId, cardStream)
-      this.streamingCardsUsedSessions.add(binding.sessionId)
+      openedCard = cardStream
+      if (this.sessionBuffers.get(targetSessionId) === ownBuffer && this.streamingRunStates.get(targetSessionId) === initialState) {
+        this.streamingCards.set(binding.sessionId, cardStream)
+        this.streamingCardsUsedSessions.add(binding.sessionId)
+      }
     } catch (error) {
       console.error('[飞书 Bridge] 流式卡片创建失败，降级为文本进度提示:', redactSensitiveLogValue(error))
       // 降级：保留原"处理中..."提示，最终走 sendAgentReply 兜底
@@ -1745,6 +1914,23 @@ class FeishuBridge {
       ? [this.buildPiFeishuChatHistoryTool(chatId)]
       : undefined
 
+    // 所有卡片/引用/历史网络await之后，只核验原目标；不创建或修正为另一项目。
+    const latestSession = getAgentSessionMeta(targetSessionId)
+    if (this.workspaceSwitchPending || this.workspaceSwitchBlocked || this.chatBindings.get(chatId) !== binding
+      || binding.sessionId !== targetSessionId || binding.workspaceId !== targetWorkspaceId
+      || latestSession?.workspaceId !== targetWorkspaceId || !getAgentWorkspace(targetWorkspaceId)
+      || this.sessionBuffers.get(targetSessionId) !== ownBuffer || this.streamingRunStates.get(targetSessionId) !== initialState) {
+      if (openedCard && this.streamingCards.get(targetSessionId) === openedCard) {
+        this.streamingCards.delete(targetSessionId)
+        this.streamingCardsUsedSessions.delete(targetSessionId)
+      }
+      if (this.streamingRunStates.get(targetSessionId) === initialState) this.streamingRunStates.delete(targetSessionId)
+      if (this.sessionBuffers.get(targetSessionId) === ownBuffer) this.sessionBuffers.delete(targetSessionId)
+      try { await openedCard?.close() } catch (error) { console.warn('[飞书 Bridge] 关闭失效进度卡失败:', redactSensitiveLogValue(error)) }
+      await this.sendCardMessage(chatId, buildErrorCard('本条消息的会话或项目已变化，请确认项目后重新发送。'))
+      return 'not-dispatched'
+    }
+
     // 渠道/模型解析：binding（per-chat 用户在 IM 里切过的）优先，其次 Bot 配置、应用设置
     const latestSettings = getSettings()
     const channelId = binding.channelId || this.botConfig.defaultChannelId || latestSettings.agentChannelId || ''
@@ -1763,19 +1949,25 @@ class FeishuBridge {
     // 完整 await 结束（包含 finally { activeSessions.delete }）后才 resolve。
     // 这是消除并发守卫竞态的核心：上层 runMergedBatch 看到本 Promise resolve
     // 时，orchestrator 已经清理干净，下一个 batch 立刻调 sendMessage 不会撞守卫。
+    // 调度前拒绝（例如会话仍在运行）不经过 onError，必须显式收尾并归还媒体。
     try {
       await runAgentHeadless(input, {
         source: 'feishu',
         onError: (error) => {
           const errPrefix = this.resolveContextPrefix(chatId)
-          // 优先把错误显示到流式卡上；没有流式卡才发独立错误卡
-          if (this.streamingCards.has(binding!.sessionId)) {
-            this.markStreamingError(binding!.sessionId, error)
+          // 两个 chat 可经 /switch 共用同一 session，必须只清理本轮自己的资源。
+          if (openedCard && this.streamingCards.get(targetSessionId) === openedCard) {
+            this.markStreamingError(targetSessionId, error, { state: initialState, card: openedCard })
           } else {
             this.sendCardMessage(chatId, buildErrorCard(`${errPrefix}${error}`)).catch((sendError) => console.error('[飞书 Bridge] 发送错误卡片失败:', redactSensitiveLogValue(sendError)))
           }
-          this.sessionBuffers.delete(binding!.sessionId)
-          this.streamingCardsUsedSessions.delete(binding!.sessionId)
+          if (this.sessionBuffers.get(targetSessionId) === ownBuffer) this.sessionBuffers.delete(targetSessionId)
+          // “用过流式卡”标记属于本轮卡片；不是本轮的对象不能被迟到的错误清掉。
+          // 只有当本轮卡片仍是当前卡片、或该 session 已无可证实的活动卡片时才清标记。
+          const currentCard = this.streamingCards.get(targetSessionId)
+          if (currentCard === undefined || (openedCard !== undefined && currentCard === openedCard)) {
+            this.streamingCardsUsedSessions.delete(targetSessionId)
+          }
         },
         onComplete: () => {
           // complete 事件由 EventBus listener 处理
@@ -1786,7 +1978,18 @@ class FeishuBridge {
       }, piCustomTools ? { piCustomTools } : undefined)
     } catch (error) {
       console.error('[飞书 Bridge] Agent 运行异常:', redactSensitiveLogValue(error))
+      // 调度前拒绝：不谎报成功，关闭本轮卡片、清本轮缓冲并让上层归还媒体。
+      if (openedCard && this.streamingCards.get(targetSessionId) === openedCard) {
+        this.streamingCards.delete(targetSessionId)
+        this.streamingCardsUsedSessions.delete(targetSessionId)
+        try { await openedCard.close() } catch (closeError) { console.warn('[飞书 Bridge] 关闭失败轮卡片失败:', redactSensitiveLogValue(closeError)) }
+      }
+      if (this.streamingRunStates.get(targetSessionId) === initialState) this.streamingRunStates.delete(targetSessionId)
+      if (this.sessionBuffers.get(targetSessionId) === ownBuffer) this.sessionBuffers.delete(targetSessionId)
+      await this.sendTextMessage(chatId, 'Agent 未能接受本轮消息，原附件已暂存。请稍后重新发送。')
+      return 'not-dispatched'
     }
+    return 'dispatched'
   }
 
   // ===== EventBus 事件处理 =====
@@ -1885,10 +2088,12 @@ class FeishuBridge {
   }
 
   /** 给流式卡片打上 error 终态，立即 flush + close。 */
-  private markStreamingError(sessionId: string, message: string): void {
+  private markStreamingError(sessionId: string, message: string, expected?: { state: RunState; card: CardStream }): void {
     const runState = this.streamingRunStates.get(sessionId)
     const cardStream = this.streamingCards.get(sessionId)
     if (!runState || !cardStream) return
+    // 迟到的旧轮错误不得标记/关闭另一轮（同 session 多 chat）的卡片。
+    if (expected && (runState !== expected.state || cardStream !== expected.card)) return
     const nextState = markError(runState, message)
     const header = this.resolveContextPrefix(this.sessionToChat.get(sessionId) ?? '')
     const headerTitle = (header ? `${header.trim()} · ` : '') + 'Agent 出错'
@@ -1901,10 +2106,12 @@ class FeishuBridge {
   }
 
   /** 给流式卡片打上 interrupted 终态。用于用户主动 /stop 或终止按钮触发。 */
-  private markStreamingInterrupted(sessionId: string): void {
+  private markStreamingInterrupted(sessionId: string, expected?: { state: RunState; card: CardStream }): void {
     const runState = this.streamingRunStates.get(sessionId)
     const cardStream = this.streamingCards.get(sessionId)
     if (!runState || !cardStream) return
+    // 同 session 可能被多个 chat 绑定；不匹配就不是本轮可关闭的对象。
+    if (expected && (runState !== expected.state || cardStream !== expected.card)) return
     const nextState = markInterrupted(runState)
     const header = this.resolveContextPrefix(this.sessionToChat.get(sessionId) ?? '')
     const headerTitle = (header ? `${header.trim()} · ` : '') + 'Agent 已中断'

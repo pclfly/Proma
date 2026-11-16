@@ -17,7 +17,6 @@ import {
   themeModeAtom,
   themeStyleAtom,
   systemIsDarkAtom,
-  resolvedThemeAtom,
   applyThemeToDOM,
   initializeTheme,
 } from './atoms/theme'
@@ -42,14 +41,15 @@ import {
 } from './atoms/agent-atoms'
 import { updateStatusAtom, initializeUpdater } from './atoms/updater'
 import { automationsAtom } from './atoms/automation-atoms'
-import { calendarEventsAtom, calendarPlanningGroupsAtom, planningTagsAtom, todoPlanningGroupsAtom, todosAtom } from './atoms/planning-atoms'
-import { mergeTodoSnapshot, upsertTodo } from './lib/todo-state'
 import {
-  notificationsEnabledAtom,
-  notificationSoundEnabledAtom,
-  notificationSoundsAtom,
-  initializeNotifications,
-} from './atoms/notifications'
+  calendarEventsAtom,
+  calendarPlanningGroupsAtom,
+  planningTagsAtom,
+  todoPlanningGroupsAtom,
+  todosAtom,
+} from './atoms/planning-atoms'
+import { mergeTodoSnapshot, upsertTodo } from './lib/todo-state'
+import { notificationsEnabledAtom, notificationSoundEnabledAtom, notificationSoundsAtom, initializeNotifications } from './atoms/notifications'
 import {
   longTextPasteAsAttachmentEnabledAtom,
   richTextRenderingEnabledAtom,
@@ -57,19 +57,18 @@ import {
   productivityToolsAtom,
   initializeUiPreferences,
 } from './atoms/ui-preferences'
-import {
-  markdownFontSizeAtom,
-  initializeMarkdownFontSize,
-} from './atoms/markdown-font-size'
+import { markdownFontSizeAtom, initializeMarkdownFontSize } from './atoms/markdown-font-size'
+import { fontSizesAtom, initializeFontSizes } from './atoms/font-sizes'
 import { useGlobalAgentListeners } from './hooks/useGlobalAgentListeners'
-import { useGlobalChatListeners } from './hooks/useGlobalChatListeners'
+
 import { tabsAtom, activeTabIdAtom, getPersistableTabState } from './atoms/tab-atoms'
 import type { TabItem } from './atoms/tab-atoms'
-import { chatToolsAtom } from './atoms/chat-tool-atoms'
+
 import { feishuBotStatesAtom } from './atoms/feishu-atoms'
 import { dingtalkBotStatesAtom } from './atoms/dingtalk-atoms'
 import { slackBotStatesAtom } from './atoms/slack-atoms'
-import { currentConversationIdAtom, channelsAtom, channelsLoadedAtom, selectedModelAtom } from './atoms/chat-atoms'
+import { channelsAtom, channelsLoadedAtom } from './atoms/channel-atoms'
+
 import { appModeAtom } from './atoms/app-mode'
 import type { FeishuBotBridgeState, FeishuBridgeState, DingTalkBotBridgeState, DingTalkBridgeState } from '@proma/shared'
 import { Toaster } from './components/ui/sonner'
@@ -91,11 +90,11 @@ import 'katex/dist/katex.min.css'
 
 // ===== 窗口类型检测 =====
 const isQuickTaskWindow = new URLSearchParams(window.location.search).get('window') === 'quick-task'
+const isQuickCaptureTodoWindow = new URLSearchParams(window.location.search).get('window') === 'quick-capture-todo'
 const isVoiceDictationIndicatorWindow = new URLSearchParams(window.location.search).get('window') === 'voice-dictation-indicator'
 const isDetachedPreviewWindow = new URLSearchParams(window.location.search).get('window') === 'detached-preview'
 const isWorkspaceMemoryWindow = new URLSearchParams(window.location.search).get('window') === 'workspace-memory'
-const isAgentStatusHoverWindow = new URLSearchParams(window.location.search).get('window') === 'agent-status-hover'
-const isMainWindow = !isQuickTaskWindow && !isVoiceDictationIndicatorWindow && !isDetachedPreviewWindow && !isWorkspaceMemoryWindow && !isAgentStatusHoverWindow
+const isMainWindow = !isQuickTaskWindow && !isQuickCaptureTodoWindow && !isVoiceDictationIndicatorWindow && !isDetachedPreviewWindow && !isWorkspaceMemoryWindow
 
 initializePerformanceMonitor()
 
@@ -204,13 +203,7 @@ function AgentSettingsInitializer(): null {
       setChannelsLoaded(true)
 
       const channelIds = new Set(channels.map((c) => c.id))
-
-      // 验证 Chat 模式的全局默认模型（localStorage 持久化的可能指向已删除渠道）
-      const chatModel = store.get(selectedModelAtom)
-      if (chatModel && !channelIds.has(chatModel.channelId)) {
-        console.warn('[AgentSettings] Chat selectedModel 指向已删除的渠道，清除')
-        store.set(selectedModelAtom, null)
-      }
+      
 
       const selectedChannel = settings.agentChannelId
         ? channels.find((channel) => channel.id === settings.agentChannelId)
@@ -621,7 +614,6 @@ function DockBadgeInitializer(): null {
       if (!document.hasFocus() || !activeAgentSessionId) return
       // 以实际激活的 Agent/预览 Tab 为准。旧版 Scratch Pad 状态不参与恢复，
       // 不能仅据此把后台会话误判为已查看。
-      void window.electronAPI.agentIsland.markSessionViewed(activeAgentSessionId).catch(console.error)
       setUnviewedCompleted((prev) => {
         if (!prev.has(activeAgentSessionId)) return prev
         const next = new Set(prev)
@@ -673,21 +665,17 @@ function UiPreferencesInitializer(): null {
 function MarkdownFontSizeInitializer(): null {
   const setMarkdownFontSize = useSetAtom(markdownFontSizeAtom)
 
-  useEffect(() => {
-    initializeMarkdownFontSize(setMarkdownFontSize)
-  }, [setMarkdownFontSize])
+  useEffect(() => initializeMarkdownFontSize(setMarkdownFontSize), [setMarkdownFontSize])
 
   return null
 }
 
-/**
- * Chat IPC 监听器初始化组件
- *
- * 全局挂载，永不销毁。确保 Chat 流式事件
- * 在页面切换时不丢失。
- */
-function ChatListenersInitializer(): null {
-  useGlobalChatListeners()
+/** 全局字号初始化：首帧同步应用，之后跟随菜单快捷键广播。 */
+function FontSizeInitializer(): null {
+  const setFontSizes = useSetAtom(fontSizesAtom)
+
+  useEffect(() => initializeFontSizes(setFontSizes), [setFontSizes])
+
   return null
 }
 
@@ -699,35 +687,6 @@ function ChatListenersInitializer(): null {
  */
 function AgentListenersInitializer(): null {
   useGlobalAgentListeners()
-  return null
-}
-
-/**
- * Chat 工具初始化组件
- *
- * 启动时从主进程加载所有工具信息到 atom。
- * 订阅 chat-tools.json 文件变更通知，自动刷新工具列表。
- */
-function ChatToolInitializer(): null {
-  const setChatTools = useSetAtom(chatToolsAtom)
-
-  useEffect(() => {
-    window.electronAPI.getChatTools()
-      .then(setChatTools)
-      .catch((err: unknown) => console.error('[ChatToolInitializer] 加载工具列表失败:', err))
-  }, [setChatTools])
-
-  // 订阅自定义工具配置变更并静默刷新工具列表。
-  // 用户主动操作的反馈由各设置入口提供，避免文件监听产生重复 Toast。
-  useEffect(() => {
-    const cleanup = window.electronAPI.onCustomToolChanged(() => {
-      window.electronAPI.getChatTools()
-        .then(setChatTools)
-        .catch((err: unknown) => console.error('[ChatToolInitializer] 刷新工具列表失败:', err))
-    })
-    return cleanup
-  }, [setChatTools])
-
   return null
 }
 
@@ -770,7 +729,7 @@ function FeishuInitializer(): null {
 
     // 定期上报在场状态（5 秒间隔 + 焦点变化时即时上报）
     const reportPresence = (): void => {
-      const activeSessionId = store.get(currentAgentSessionIdAtom) ?? store.get(currentConversationIdAtom)
+      const activeSessionId = store.get(currentAgentSessionIdAtom)
       window.electronAPI.reportFeishuPresence({
         activeSessionId,
         lastInteractionAt: Date.now(),
@@ -886,9 +845,8 @@ function TabStatePersistenceInitializer(): null {
   // 启动恢复：读取 settings.tabState + 校验会话有效性
   useEffect(() => {
     const restore = async (): Promise<void> => {
-      const [settings, conversations, activeAgentSessions] = await Promise.all([
+      const [settings, activeAgentSessions] = await Promise.all([
         window.electronAPI.getSettings(),
-        window.electronAPI.listConversations(),
         window.electronAPI.listActiveAgentSessions(),
       ])
       const tabState = settings.tabState
@@ -906,7 +864,6 @@ function TabStatePersistenceInitializer(): null {
 
       // 构建有效 sessionId 集合
       const validSessionIds = new Set([
-        ...conversations.map((c) => c.id),
         ...agentSessions.map((s) => s.id),
       ])
 
@@ -919,7 +876,7 @@ function TabStatePersistenceInitializer(): null {
           'sessionId' in t &&
           'type' in t &&
           'title' in t &&
-          (t.type === 'chat' || t.type === 'agent') &&
+          t.type === 'agent' &&
           validSessionIds.has(t.sessionId),
       )
       if (validTabs.length === 0) return
@@ -946,10 +903,7 @@ function TabStatePersistenceInitializer(): null {
 
       // 同步 appMode 和 currentSessionId
       if (activeTab) {
-        if (activeTab.type === 'chat') {
-          store.set(appModeAtom, 'chat')
-          store.set(currentConversationIdAtom, activeTab.sessionId)
-        } else {
+        {
           store.set(appModeAtom, 'agent')
           store.set(currentAgentSessionIdAtom, activeTab.sessionId)
         }
@@ -1031,7 +985,19 @@ if (isQuickTaskWindow) {
     ReactDOM.createRoot(document.getElementById('root')!).render(
       <React.StrictMode>
         <ThemeInitializer />
+        <MarkdownFontSizeInitializer />
+        <FontSizeInitializer />
         <QuickTaskApp />
+      </React.StrictMode>
+    )
+  })
+} else if (isQuickCaptureTodoWindow) {
+  import('./components/quick-task/QuickCaptureTodoApp').then(({ QuickCaptureTodoApp }) => {
+    ReactDOM.createRoot(document.getElementById('root')!).render(
+      <React.StrictMode>
+        <ThemeInitializer />
+        <FontSizeInitializer />
+        <QuickCaptureTodoApp />
       </React.StrictMode>
     )
   })
@@ -1050,6 +1016,7 @@ if (isQuickTaskWindow) {
       <React.StrictMode>
         <ThemeInitializer />
         <MarkdownFontSizeInitializer />
+        <FontSizeInitializer />
         <DetachedPreviewApp />
         <Toaster position="top-right" offset={{ top: 58, right: 12 }} />
       </React.StrictMode>
@@ -1060,17 +1027,10 @@ if (isQuickTaskWindow) {
     ReactDOM.createRoot(document.getElementById('root')!).render(
       <React.StrictMode>
         <ThemeInitializer />
+        <MarkdownFontSizeInitializer />
+        <FontSizeInitializer />
         <WorkspaceMemoryWindowApp />
         <Toaster position="top-right" offset={{ top: 58, right: 12 }} />
-      </React.StrictMode>
-    )
-  })
-} else if (isAgentStatusHoverWindow) {
-  import('./components/agent-status-hover/HoverPanel').then(({ HoverPanel }) => {
-    ReactDOM.createRoot(document.getElementById('root')!).render(
-      <React.StrictMode>
-        <ThemeInitializer />
-        <HoverPanel />
       </React.StrictMode>
     )
   })
@@ -1084,9 +1044,8 @@ if (isQuickTaskWindow) {
       <DockBadgeInitializer />
       <UiPreferencesInitializer />
       <MarkdownFontSizeInitializer />
-      <ChatListenersInitializer />
+      <FontSizeInitializer />
       <AgentListenersInitializer />
-      <ChatToolInitializer />
       <UpdaterInitializer />
       <AutomationInitializer />
       <PlanningInitializer />

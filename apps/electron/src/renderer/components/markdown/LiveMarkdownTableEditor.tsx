@@ -39,6 +39,8 @@ interface LiveMarkdownTableEditorProps {
   sourceRange?: { from: number; to: number }
   /** 原始 GFM 表格源码，用于将当前搜索结果精确映射回单元格。 */
   source?: string
+  /** 仅 Vault 提供：单元格内 [[双链]] 可点击打开对应笔记。 */
+  onOpenWikiLink?: (target: string) => void
 }
 
 const EMPTY_FIND_STATE: LiveMarkdownFindState = {
@@ -110,6 +112,7 @@ export function LiveMarkdownTableEditor({
   findController,
   sourceRange,
   source,
+  onOpenWikiLink,
 }: LiveMarkdownTableEditorProps): React.ReactElement {
   const [activeCell, setActiveCell] = useState<LiveMarkdownTableCell | null>(autoFocusCell)
   const [findState, setFindState] = useState<LiveMarkdownFindState>(() => findController?.getState() ?? EMPTY_FIND_STATE)
@@ -259,6 +262,24 @@ export function LiveMarkdownTableEditor({
     dispatchTableDelete()
   }
 
+  // 单元格在可编辑态本身就是 button：双链用 span + 事件委托，避免嵌套交互元素。
+  const wikiLinkTargetAt = (event: React.SyntheticEvent): string | null => {
+    if (!onOpenWikiLink || !(event.target instanceof Element)) return null
+    return event.target.closest<HTMLElement>('[data-vault-wikilink-target]')?.dataset.vaultWikilinkTarget ?? null
+  }
+  const handleWikiLinkMouseDown = (event: React.MouseEvent): void => {
+    if (!wikiLinkTargetAt(event) || event.altKey) return
+    event.preventDefault()
+    event.stopPropagation()
+  }
+  const handleWikiLinkClick = (event: React.MouseEvent): void => {
+    const note = wikiLinkTargetAt(event)
+    if (!note || event.altKey) return
+    event.preventDefault()
+    event.stopPropagation()
+    onOpenWikiLink?.(note)
+  }
+
   const renderCell = (row: number, column: number, header: boolean) => {
     const cell = { row, column }
     const value = cellValue(table, cell)
@@ -317,7 +338,7 @@ export function LiveMarkdownTableEditor({
             }}
           />
         ) : readOnly ? (
-          <span className="live-markdown-table-value" dangerouslySetInnerHTML={{ __html: renderLiveMarkdownTableInline(value) }} />
+          <span className="live-markdown-table-value" dangerouslySetInnerHTML={{ __html: renderLiveMarkdownTableInline(value, { vaultWikiLinks: onOpenWikiLink !== undefined }) }} />
         ) : (
           <button
             type="button"
@@ -333,7 +354,7 @@ export function LiveMarkdownTableEditor({
               if (event.detail === 0) activate(cell, event.currentTarget)
             }}
           >
-            <span className="live-markdown-table-value" dangerouslySetInnerHTML={{ __html: renderLiveMarkdownTableInline(value) }} />
+            <span className="live-markdown-table-value" dangerouslySetInnerHTML={{ __html: renderLiveMarkdownTableInline(value, { vaultWikiLinks: onOpenWikiLink !== undefined }) }} />
           </button>
         )}
       </Cell>
@@ -419,7 +440,7 @@ export function LiveMarkdownTableEditor({
   return (
     <div className="vault-markdown-table live-markdown-table-editor">
       {!readOnly && <div className="live-markdown-table-editor-hint" aria-hidden="true">点击编辑、右键操作更多</div>}
-      <table aria-label="Markdown 表格">
+      <table aria-label="Markdown 表格" onMouseDownCapture={handleWikiLinkMouseDown} onClickCapture={handleWikiLinkClick}>
         <thead><tr>{table.header.map((_, column) => renderCell(0, column, true))}</tr></thead>
         {table.rows.length > 0 && <tbody>{table.rows.map((_, row) => <tr key={row}>{table.header.map((_, column) => renderCell(row + 1, column, false))}</tr>)}</tbody>}
       </table>

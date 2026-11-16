@@ -3,7 +3,7 @@ export interface StreamRouteTarget {
 }
 
 export interface AgentStreamRoute<T extends StreamRouteTarget> {
-  target: T
+  target: T | null
   ownerId: number
 }
 
@@ -18,7 +18,7 @@ export class AgentStreamRouteRegistry<T extends StreamRouteTarget> {
   private readonly routes = new Map<string, AgentStreamRoute<T>>()
   private nextOwnerId = 0
 
-  bind(sessionId: string, target: T): AgentStreamRoute<T> {
+  bind(sessionId: string, target: T | null): AgentStreamRoute<T> {
     const route = { target, ownerId: ++this.nextOwnerId }
     this.routes.set(sessionId, route)
     return route
@@ -33,15 +33,21 @@ export class AgentStreamRouteRegistry<T extends StreamRouteTarget> {
   }
 
   /** 已销毁 target 不可投递，但 route 会保留到活跃 run 的 finally 或后续 rebind 收束。 */
-  get(sessionId: string): AgentStreamRoute<T> | undefined {
+  get(sessionId: string): (AgentStreamRoute<T> & { target: T }) | undefined {
     const route = this.routes.get(sessionId)
-    return route?.target.isDestroyed() ? undefined : route
+    if (!route?.target || route.target.isDestroyed()) return undefined
+    return { ...route, target: route.target }
+  }
+
+  /** 包含尚无 renderer 的运行；主窗口恢复时仍由原 owner 负责收尾。 */
+  sessionIds(): string[] {
+    return [...this.routes.keys()]
   }
 
   /** 当前 route 仍属于指定 owner 时返回其目标。 */
   getTargetIfOwner(sessionId: string, ownerId: number): T | undefined {
     const route = this.routes.get(sessionId)
-    if (!route || route.ownerId !== ownerId || route.target.isDestroyed()) return undefined
+    if (!route?.target || route.ownerId !== ownerId || route.target.isDestroyed()) return undefined
     return route.target
   }
 

@@ -8,6 +8,7 @@
  */
 
 import { getGeminiModelCapability } from './gemini-model-capabilities'
+import { getKimiContextWindow } from './kimi-model-capabilities'
 import { isGpt6AstraFamily, isGpt6LunaFamily, isGpt6SolFamily } from './model-family'
 
 /** 默认上下文窗口（无法识别模型时使用） */
@@ -20,8 +21,17 @@ export const ONE_MILLION_CONTEXT_WINDOW = 1_000_000
 export const CODEX_GPT_54_55_CONTEXT_WINDOW = 272_000
 export const CODEX_GPT_54_MINI_CONTEXT_WINDOW = 400_000
 export const CODEX_GPT_56_CONTEXT_WINDOW = 372_000
-/** ChatGPT Codex 订阅中的 GPT-6 Astra、Sol 与 Luna 上下文窗口。 */
+/** 原 GPT-6 Sol/Luna 保持原窗口；Astra 与 6.1 Sol 独立定义，避免误改不同 SKU。 */
 export const CODEX_GPT_6_CONTEXT_WINDOW = 372_000
+export const GPT_6_ASTRA_CONTEXT_WINDOW = 272_000
+export const GPT_61_SOL_CONTEXT_WINDOW = 500_000
+
+/** 显式修正优先于旧内置目录；不影响用户 contextWindow 覆盖。 */
+export function inferCorrectedGPTContextWindow(modelId: string | undefined): number | undefined {
+  if (isGpt6AstraFamily(modelId)) return GPT_6_ASTRA_CONTEXT_WINDOW
+  if (modelId?.trim().toLowerCase().replace(/\[1m\]$/i, '') === 'gpt-6.1-sol') return GPT_61_SOL_CONTEXT_WINDOW
+  return undefined
+}
 
 /**
  * 为 ChatGPT Codex 中的 GPT-5.x / GPT-6 模型返回统一上下文窗口。
@@ -30,7 +40,9 @@ export const CODEX_GPT_6_CONTEXT_WINDOW = 372_000
  * provider catalog 决定，避免把不同 SKU 误写成同一窗口。
  */
 export function inferCodexAlignedGPT5ContextWindow(modelId: string | undefined): number | undefined {
-  if (isGpt6AstraFamily(modelId) || isGpt6SolFamily(modelId) || isGpt6LunaFamily(modelId)) {
+  const corrected = inferCorrectedGPTContextWindow(modelId)
+  if (corrected !== undefined) return corrected
+  if (isGpt6SolFamily(modelId) || isGpt6LunaFamily(modelId)) {
     return CODEX_GPT_6_CONTEXT_WINDOW
   }
 
@@ -138,7 +150,9 @@ const CONTEXT_WINDOW_CONFIG = {
  */
 export function supports1MContext(modelId: string): boolean {
   if (!modelId) return false
-  const m = modelId.toLowerCase()
+  const kimiWindow = getKimiContextWindow(modelId)
+  if (kimiWindow !== undefined) return kimiWindow >= ONE_MILLION_CONTEXT_WINDOW
+  const m = modelId.trim().toLowerCase()
   if (CONTEXT_WINDOW_CONFIG.exclude.some((p) => m.includes(p))) return false
   return CONTEXT_WINDOW_CONFIG.rules.some((p) => matchesContextRule(m, p))
 }
@@ -149,12 +163,22 @@ export function supports1MContext(modelId: string): boolean {
  * SDK 流式过程中不返回此字段，只有 result 消息的 modelUsage 才带（且部分渠道不返回）。
  * 本函数提供一个按模型家族的 fallback，保证进度环永远有分母可用。
  */
-export function inferContextWindow(model?: string): number | undefined {
+export function inferKnownContextWindow(model?: string): number | undefined {
   if (!model) return undefined
+  // Kimi 目录窗口必须先于通用 1M 规则：K3 256K / Coding Highspeed 只有 262,144，
+  // 不能被 kimi 家族的 1M 规则误放大。
+  const kimiWindow = getKimiContextWindow(model)
+  if (kimiWindow !== undefined) return kimiWindow
   const codexAlignedWindow = inferCodexAlignedGPT5ContextWindow(model)
   if (codexAlignedWindow !== undefined) return codexAlignedWindow
   const geminiCapability = getGeminiModelCapability(model)
   if (geminiCapability) return geminiCapability.contextWindow
   if (supports1MContext(model)) return ONE_MILLION_CONTEXT_WINDOW
-  return DEFAULT_CONTEXT_WINDOW
+  return undefined
+}
+
+/** 用量显示/运行时兜底保持原行为；设置页用 inferKnownContextWindow，不把兜底当能力。 */
+export function inferContextWindow(model?: string): number | undefined {
+  if (!model) return undefined
+  return inferKnownContextWindow(model) ?? DEFAULT_CONTEXT_WINDOW
 }

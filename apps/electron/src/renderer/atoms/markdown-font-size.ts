@@ -1,63 +1,52 @@
-/**
- * Markdown 预览字号状态原子
- *
- * 三档字号偏好（小/中/大），通过 CSS 变量 --md-preview-font-size 驱动
- * AI 回复（react-markdown）和文件预览（TipTap）的根字号。
- * 持久化到 ~/.proma/settings.json。
- */
-
+/** 统一阅读字号：会话列表、输入区和 Markdown 使用同一个 CSS 变量。 */
 import { atom } from 'jotai'
-import { DEFAULT_MARKDOWN_FONT_SIZE } from '../../types'
+import { DEFAULT_MARKDOWN_FONT_SIZE, isMarkdownFontSize } from '../../types'
 import type { MarkdownFontSize } from '../../types'
 
-/** 各档位对应的根字号（px） */
-const FONT_SIZE_PX: Record<MarkdownFontSize, number> = {
-  small: 13,
-  medium: 15,
-  large: 17,
-}
-
-/** Markdown 字号档位 */
+const FONT_SIZE_PX: Record<MarkdownFontSize, number> = { small: 13, medium: 15, large: 17 }
 export const markdownFontSizeAtom = atom<MarkdownFontSize>(DEFAULT_MARKDOWN_FONT_SIZE)
 
-/**
- * 将字号档位写入 :root CSS 变量
- *
- * 渲染组件通过 var(--md-preview-font-size) 读取，inline code / 代码块用
- * em 相对单位跟随缩放。
- */
+// 保护异步初始化：用户在首个读取返回前选择字号时，旧快照不能覆盖本地选择。
+let localPreferenceRevision = 0
+
 export function applyMarkdownFontSizeToDOM(size: MarkdownFontSize): void {
-  const px = FONT_SIZE_PX[size]
-  document.documentElement.style.setProperty('--md-preview-font-size', `${px}px`)
+  const validSize = isMarkdownFontSize(size) ? size : DEFAULT_MARKDOWN_FONT_SIZE
+  document.documentElement.style.setProperty('--md-preview-font-size', `${FONT_SIZE_PX[validSize]}px`)
 }
 
-/**
- * 初始化 Markdown 字号
- *
- * 从主进程加载持久化设置并写入 atom + DOM。
- */
-export async function initializeMarkdownFontSize(
-  setSize: (size: MarkdownFontSize) => void,
-): Promise<void> {
-  try {
-    const settings = await window.electronAPI.getSettings()
-    const size = settings.markdownFontSize ?? DEFAULT_MARKDOWN_FONT_SIZE
-    setSize(size)
-    applyMarkdownFontSizeToDOM(size)
-  } catch (error) {
-    console.error('[Markdown字号] 初始化失败:', error)
-    applyMarkdownFontSizeToDOM(DEFAULT_MARKDOWN_FONT_SIZE)
+/** 先订阅再读取；同步返回清理函数，StrictMode/卸载无需等待 IPC 返回。 */
+export function initializeMarkdownFontSize(setSize: (size: MarkdownFontSize) => void): () => void {
+  let active = true
+  let receivedUpdate = false
+  const revision = localPreferenceRevision
+  const apply = (size: MarkdownFontSize) => { setSize(size); applyMarkdownFontSizeToDOM(size) }
+  const unsubscribe = window.electronAPI.onReadingSettingsChanged((event) => {
+    if (!active || !isMarkdownFontSize(event.markdownFontSize)) return
+    receivedUpdate = true
+    apply(event.markdownFontSize)
+  })
+  const canApplyInitial = () => active && !receivedUpdate && revision === localPreferenceRevision
+  void window.electronAPI.getSettings().then((settings) => {
+    if (canApplyInitial()) apply(isMarkdownFontSize(settings.markdownFontSize) ? settings.markdownFontSize : DEFAULT_MARKDOWN_FONT_SIZE)
+  }).catch((error: unknown) => {
+    console.error('[阅读字号] 初始化失败:', error)
+    if (canApplyInitial()) apply(DEFAULT_MARKDOWN_FONT_SIZE)
+  })
+  return () => {
+    if (!active) return
+    active = false
+    unsubscribe()
   }
 }
 
-/**
- * 更新 Markdown 字号档位并持久化
- */
+/** 本地即时预览；保存成功后的广播同步 atom 和其它已打开窗口。 */
 export async function updateMarkdownFontSize(size: MarkdownFontSize): Promise<void> {
+  if (!isMarkdownFontSize(size)) return
+  localPreferenceRevision += 1
   applyMarkdownFontSizeToDOM(size)
   try {
     await window.electronAPI.updateSettings({ markdownFontSize: size })
   } catch (error) {
-    console.error('[Markdown字号] 持久化失败:', error)
+    console.error('[阅读字号] 持久化失败:', error)
   }
 }

@@ -44,6 +44,8 @@ export interface AgentRuntimeClientOptions {
   env?: NodeJS.ProcessEnv
   startupTimeoutMs?: number
   requestTimeoutMs?: number
+  /** kill 之后等待真实 exit 的上限；超时不是退出证据，只用于把失败限定在有界时间内。 */
+  exitConfirmTimeoutMs?: number
 }
 
 export interface AgentRuntimeRequestOptions {
@@ -54,6 +56,51 @@ export interface AgentRuntimeRequestOptions {
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000
 const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
+const DEFAULT_EXIT_CONFIRM_TIMEOUT_MS = 5_000
+
+export const AGENT_RUNTIME_EXIT_UNCONFIRMED_CODE = 'AGENT_RUNTIME_EXIT_UNCONFIRMED'
+
+export function isAgentRuntimeExitUnconfirmedError(error: unknown): boolean {
+  return !!error && typeof error === 'object'
+    && (error as { code?: unknown }).code === AGENT_RUNTIME_EXIT_UNCONFIRMED_CODE
+}
+
+function createExitUnconfirmedError(sessionId: string): Error & { code: string } {
+  const error = new Error('无法确认 Agent 运行时进程已退出；该会话已停止续发，请重启应用后重试。') as Error & { code: string }
+  error.code = AGENT_RUNTIME_EXIT_UNCONFIRMED_CODE
+  error.cause = { sessionId }
+  return error
+}
+
+interface ProcessExitEvidence {
+  promise: Promise<void>
+  dispose: () => void
+}
+
+/** 先监听 exit 再发 shutdown/kill，才能把“已请求停止”与“进程已退出”分开。 */
+function observeProcessExit(runtimeProcess: UtilityProcess): ProcessExitEvidence {
+  const events = runtimeProcess as unknown as {
+    once?: (event: 'exit', listener: (code: number) => void) => void
+    on?: (event: 'exit', listener: (code: number) => void) => void
+    removeListener?: (event: 'exit', listener: (code: number) => void) => void
+  }
+  let resolveExit: () => void = () => {}
+  const promise = new Promise<void>((resolve) => { resolveExit = resolve })
+  const onExit = (): void => resolveExit()
+  if (typeof events.once === 'function') events.once('exit', onExit)
+  else events.on?.('exit', onExit)
+  return { promise, dispose: () => events.removeListener?.('exit', onExit) }
+}
+
+async function waitForExitEvidence(evidence: ProcessExitEvidence, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), timeoutMs)
+  })
+  const confirmed = await Promise.race([evidence.promise.then(() => true), timeout])
+  if (timer) clearTimeout(timer)
+  return confirmed
+}
 
 /**
  * One client owns exactly one Pi utility process. Keeping this unit per session
@@ -65,11 +112,14 @@ export class AgentRuntimeClient {
   private readonly env: NodeJS.ProcessEnv | undefined
   private readonly startupTimeoutMs: number
   private readonly requestTimeoutMs: number
+  private readonly exitConfirmTimeoutMs: number
   private runtimeProcess: UtilityProcess | undefined
   private port: RuntimePort | undefined
   private generation = 0
   private startPromise: Promise<AgentRuntimeState> | undefined
   private stopPromise: Promise<void> | undefined
+  /** 一旦无法证明旧子进程已退出，不能靠后续重复 stop 悄悄恢复成可续发。 */
+  private exitUnconfirmed = false
   private bootId = AGENT_RUNTIME_BOOTSTRAP_ID
   private state: AgentRuntimeState = {
     status: 'stopped',
@@ -88,6 +138,7 @@ export class AgentRuntimeClient {
     this.env = options.env
     this.startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
+    this.exitConfirmTimeoutMs = options.exitConfirmTimeoutMs ?? DEFAULT_EXIT_CONFIRM_TIMEOUT_MS
   }
 
   get currentState(): AgentRuntimeState {
@@ -107,21 +158,32 @@ export class AgentRuntimeClient {
     return () => this.eventListeners.delete(listener)
   }
 
-  async start(): Promise<AgentRuntimeState> {
-    if (this.isReady) return this.currentState
-    if (this.stopPromise || this.state.status === 'stopping') throw new Error('Agent runtime is shutting down')
+  start(): Promise<AgentRuntimeState> {
+    if (this.isReady) return Promise.resolve(this.currentState)
+    if (this.stopPromise || this.state.status === 'stopping') return Promise.reject(new Error('Agent runtime is shutting down'))
     if (this.startPromise) return this.startPromise
+    // 启动 Promise 必须包含失败清理：否则 stop 只等到原始拒绝就以为可以安全收尾。
+    const starting = this.startInternal()
+    this.startPromise = starting
+    const settle = (): void => {
+      if (this.startPromise === starting) this.startPromise = undefined
+    }
+    void starting.then(settle, settle)
+    return starting
+  }
 
-    this.startPromise = this.spawnAndHandshake()
+  private async startInternal(): Promise<AgentRuntimeState> {
     try {
-      return await this.startPromise
+      return await this.spawnAndHandshake()
     } catch (error) {
       const stoppedDuringStart = this.stopPromise !== undefined
         || this.state.status === 'stopped'
       this.port?.close()
       this.port = undefined
-      this.runtimeProcess?.kill()
+      const abandonedChild = this.runtimeProcess
       this.runtimeProcess = undefined
+      // 启动失败/取消也要等真实 exit：kill 请求不等于子进程已停止写盘。
+      if (abandonedChild) this.exitUnconfirmed ||= !(await this.terminateProcess(abandonedChild))
       this.rejectPending(error instanceof Error ? error : new Error(String(error)))
       if (!stoppedDuringStart) {
         this.state = {
@@ -134,8 +196,6 @@ export class AgentRuntimeClient {
         }
       }
       throw error
-    } finally {
-      this.startPromise = undefined
     }
   }
 
@@ -148,41 +208,69 @@ export class AgentRuntimeClient {
     return this.sendRequest<Result>(method, payload, options)
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise
-    if (!this.runtimeProcess && !this.startPromise) return
+    if (this.exitUnconfirmed) return Promise.reject(createExitUnconfirmedError(this.sessionId))
+    if (!this.runtimeProcess && !this.startPromise) return Promise.resolve()
 
+    const runtimeProcess = this.runtimeProcess
     const pendingStart = this.startPromise
-    this.stopPromise = (async () => {
-      const currentGeneration = this.generation
-      this.state = { ...this.state, status: 'stopping' }
-      try {
-        if (this.port && this.state.status === 'stopping') {
-          await this.sendRequest(AGENT_RUNTIME_METHODS.SHUTDOWN, undefined, { timeoutMs: 5_000 }).catch(() => {})
-        }
-      } finally {
-        if (currentGeneration === this.generation) this.generation++
-        this.port?.close()
-        this.port = undefined
-        this.runtimeProcess?.kill()
-        this.runtimeProcess = undefined
-        this.rejectPending(new Error('Agent runtime stopped'))
-        this.state = {
-          status: 'stopped',
-          bootId: AGENT_RUNTIME_BOOTSTRAP_ID,
-          pid: null,
-          active: false,
-          pendingRequests: 0,
-        }
-        await pendingStart?.catch(() => {})
-      }
-    })()
-
-    try {
-      await this.stopPromise
-    } finally {
-      this.stopPromise = undefined
+    const exitEvidence = runtimeProcess ? observeProcessExit(runtimeProcess) : undefined
+    const stopPromise = this.stopRuntime(runtimeProcess, exitEvidence, pendingStart)
+    this.stopPromise = stopPromise
+    const settle = (): void => {
+      if (this.stopPromise === stopPromise) this.stopPromise = undefined
     }
+    // 同时处理成功与失败，避免派生的 unhandled rejection。
+    void stopPromise.then(settle, settle)
+    return stopPromise
+  }
+
+  private async stopRuntime(
+    runtimeProcess: UtilityProcess | undefined,
+    exitEvidence: ProcessExitEvidence | undefined,
+    pendingStart: Promise<AgentRuntimeState> | undefined,
+  ): Promise<void> {
+    const currentGeneration = this.generation
+    this.state = { ...this.state, status: 'stopping' }
+    try {
+      if (this.port) {
+        await this.sendRequest(AGENT_RUNTIME_METHODS.SHUTDOWN, undefined, { timeoutMs: 5_000 }).catch(() => {})
+      }
+    } finally {
+      if (currentGeneration === this.generation) this.generation++
+      this.port?.close()
+      this.port = undefined
+      runtimeProcess?.kill()
+      this.runtimeProcess = undefined
+      this.rejectPending(new Error('Agent runtime stopped'))
+      this.state = {
+        status: 'stopped',
+        bootId: AGENT_RUNTIME_BOOTSTRAP_ID,
+        pid: null,
+        active: false,
+        pendingRequests: 0,
+      }
+      // 关闭 port / 清理 pending 只阻止迟到 IPC，不等于旧进程已停止执行与写盘。
+      const exitConfirmed = exitEvidence
+        ? await waitForExitEvidence(exitEvidence, this.exitConfirmTimeoutMs)
+        : true
+      exitEvidence?.dispose()
+      await pendingStart?.catch(() => {})
+      if (!exitConfirmed || (!exitEvidence && this.exitUnconfirmed)) {
+        this.exitUnconfirmed = true
+        throw createExitUnconfirmedError(this.sessionId)
+      }
+    }
+  }
+
+  /** kill 一个确定身份的子进程，并返回是否得到真实退出证据。 */
+  private async terminateProcess(child: UtilityProcess): Promise<boolean> {
+    const evidence = observeProcessExit(child)
+    try { child.kill() } catch { /* 子进程可能已在退出 */ }
+    const exited = await waitForExitEvidence(evidence, this.exitConfirmTimeoutMs)
+    evidence.dispose()
+    return exited
   }
 
   private async spawnAndHandshake(): Promise<AgentRuntimeState> {
@@ -200,7 +288,8 @@ export class AgentRuntimeClient {
       { shouldContinue: shouldContinueStartup },
     )
     if (!shouldContinueStartup()) {
-      try { runtimeProcess.kill() } catch { /* utility process may already be exiting */ }
+      // fork 已返回 child 但 stop 可能发生在本赋值之前；此时也必须等真实 exit。
+      this.exitUnconfirmed ||= !(await this.terminateProcess(runtimeProcess))
       throw new Error('Agent runtime startup cancelled')
     }
     this.runtimeProcess = runtimeProcess

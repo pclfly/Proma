@@ -44,12 +44,12 @@ export function BashResultRenderer({ result, isError, input }: BashResultRendere
       )}>
         {/* 命令回显 */}
         {command && (
-          <div className="text-zinc-500 mb-2 select-none">
+          <div className="text-zinc-400 mb-2 whitespace-pre-wrap break-all select-text">
             <span className="text-green-400">$</span> {command}
           </div>
         )}
         {/* 输出行 */}
-        {lines.map((line, i) => {
+        {text && lines.map((line, i) => {
           const type = isError ? 'stderr' : classifyLine(line)
           return (
             <div

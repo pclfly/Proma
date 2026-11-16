@@ -41,13 +41,8 @@ export function createWindowsPackageSteps(repoRoot: string): PackageStep[] {
       name: '运行测试',
       cwd: repoRoot,
       command: 'bun',
-      args: [
-        'test',
-        '--path-ignore-patterns=**/agent-session-manager.test.ts',
-        '--path-ignore-patterns=**/agent-workspace-manager.test.ts',
-        '--path-ignore-patterns=**/planning-manager.test.ts',
-        '--path-ignore-patterns=**/pi-image-generation-tool.test.ts',
-      ],
+      // 复用根脚本的 --isolate，避免跨文件模块mock污染；不另设测试排除名单。
+      args: ['run', 'test'],
     },
     {
       name: '生成 Windows 安装包',

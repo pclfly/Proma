@@ -20,7 +20,7 @@ import type {
   ToolDefinition,
   ContinuationMessage,
 } from './types.ts'
-import { getGeminiModelCapability, normalizeGeminiThinkingLevel } from '@proma/shared'
+import { getGeminiModelCapability, normalizeGeminiThinkingLevel, type GeminiThinkingLevel } from '@proma/shared'
 import { normalizeBaseUrl } from './url-utils.ts'
 
 // ===== Google 特有类型 =====
@@ -204,14 +204,16 @@ export class GoogleAdapter implements ProviderAdapter {
     const generationConfig: Record<string, unknown> = {}
 
     // Gemini 3 使用 thinkingLevel 而非旧版 thinkingBudget。未知/旧模型保留预算模式，
-    // 已知 Gemini 3 文本模型则按其官方合法档位归一化，避免 3.7/3.8 收到 minimal 后 400。
+    // 已知 Gemini 文本模型则按其官方合法档位归一化，避免 3.7/3.8 收到 minimal、
+    // Gemini 4 Argon 收到 minimal/max 后 400（官方 0.21.92 修复）。
     if (input.thinkingEnabled) {
       const geminiCapability = getGeminiModelCapability(input.modelId)
       if (geminiCapability) {
+        // 命中能力表即代表归一结果必定是合法 Gemini 档位，可安全大写化。
         const selectedLevel = normalizeGeminiThinkingLevel(
           input.modelId,
-          input.thinkingLevel as 'minimal' | 'low' | 'medium' | 'high' | undefined,
-        )!
+          input.thinkingLevel,
+        ) as GeminiThinkingLevel
         generationConfig.thinkingConfig = {
           includeThoughts: true,
           thinkingLevel: selectedLevel.toUpperCase(),

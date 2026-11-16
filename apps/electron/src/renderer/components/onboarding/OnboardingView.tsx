@@ -430,17 +430,11 @@ function AgentChatGuidePage({ onNext, onBack }: { onNext: () => void; onBack: ()
         magnifierOffsetX: 70,
         magnifierImageOffset: { x: 0.09, y: 0.33 },
         highlight: '入门篇 · 第 1 步',
-        title: 'Agent 和 Chat 模式的区别',
+        title: '使用 Agent 完成任务',
         paragraphs: [
-          <>左边栏顶部是 Proma 的<b className="font-medium text-neutral-900">模式切换</b>：Agent 与 Chat。</>,
-          <>
-            <b className="font-medium text-neutral-900">Chat</b> 是一问一答的对话——快速提问、不涉及任何对电脑的操作，
-            核心偏向满足好奇心和完成简单的文字工作。
-          </>,
-          <>
-            <b className="font-medium text-neutral-900">Agent</b> 则能自主规划做调研、操作电脑、写代码、PPT 和文档，
-            为你的想法赋形。
-          </>,
+          <>Proma以<b className="font-medium text-neutral-900">Agent会话</b>为入口，既能回答问题，也能在已授权项目中完成工作。</>,
+          <>你可以提出调研、代码、文档或文件整理需求；涉及目录授权、外部发送或破坏性操作时，按实际权限流程确认。</>,
+          <>下方问答截图来自旧界面，仅展示提问方式，不代表当前仍提供Chat模式切换。</>,
         ],
       }}
       nextLabel="下一个"

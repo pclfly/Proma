@@ -9,6 +9,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { EventEmitter } from 'node:events'
 import {
+  Agent,
   Client,
   EnvHttpProxyAgent,
   Pool,
@@ -66,14 +67,40 @@ export interface PiRequestProxyOptions {
   httpIdleTimeoutMs?: number
 }
 
+function normalizeIdleTimeoutMs(timeoutMs: number | undefined): number | undefined {
+  if (timeoutMs === undefined || !Number.isFinite(timeoutMs) || timeoutMs < 0) return undefined
+  // 0 表示禁用超时（与 Pi SDK 的 httpIdleTimeoutMs=0 语义一致），undici 接受 0 并停用该计时器。
+  return Math.floor(timeoutMs)
+}
+
+/**
+ * 直连场景的 dispatcher：只承载超时配置，不引入任何代理。
+ *
+ * 必须显式创建，不能依赖 undici 全局默认值：Node 内置 fetch 的
+ * headersTimeout/bodyTimeout 默认是 300 秒，直连时它会悄悄成为用户配置的天花板。
+ */
+function createDirectDispatcher(timeoutMs: number): Dispatcher {
+  return withUndiciErrorListener(new Agent({
+    allowH2: false,
+    headersTimeout: timeoutMs,
+    bodyTimeout: timeoutMs,
+    factory: createUndiciOriginDispatcher,
+  }))
+}
+
 /**
  * 为单个 Pi 请求创建 dispatcher。调用者必须在请求结束时 close()，以释放连接池。
+ *
+ * 返回 undefined 表示沿用运行时的默认网络栈：仅在既没有代理、也没有显式超时配置时如此。
  */
 export function createPiRequestProxyDispatcher(options: PiRequestProxyOptions): Dispatcher | undefined {
   const proxyUrl = options.proxyUrl?.trim()
-  if (!proxyUrl) return undefined
+  const configuredTimeoutMs = normalizeIdleTimeoutMs(options.httpIdleTimeoutMs)
+  if (!proxyUrl) {
+    return configuredTimeoutMs === undefined ? undefined : createDirectDispatcher(configuredTimeoutMs)
+  }
 
-  const timeoutMs = options.httpIdleTimeoutMs ?? DEFAULT_HTTP_IDLE_TIMEOUT_MS
+  const timeoutMs = configuredTimeoutMs ?? DEFAULT_HTTP_IDLE_TIMEOUT_MS
   const normalizedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 0
   return withUndiciErrorListener(new EnvHttpProxyAgent({
     httpProxy: proxyUrl,
@@ -123,9 +150,13 @@ export function getPiRequestProxyDispatcher(): Dispatcher | undefined {
   return requestDispatcherStorage.getStore()
 }
 
-export async function closePiRequestProxyDispatcher(dispatcher: Dispatcher | undefined): Promise<void> {
+export async function closePiRequestProxyDispatcher(
+  dispatcher: Dispatcher | undefined,
+  options: { strict?: boolean } = {},
+): Promise<void> {
   const close = (dispatcher as (Dispatcher & { close?: () => Promise<void> }) | undefined)?.close
   if (!close) return
+  if (options.strict) { await close.call(dispatcher); return }
   await close.call(dispatcher).catch((error: unknown) => {
     console.warn('[Pi SDK] 关闭请求级代理 dispatcher 失败:', error)
   })

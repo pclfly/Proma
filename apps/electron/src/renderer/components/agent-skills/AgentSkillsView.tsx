@@ -14,6 +14,7 @@ import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
 import { toast } from 'sonner'
 import { Blocks, ChevronDown, ChevronRight, Search, Plus, Store, FolderOpen, Check, Sparkles, Loader2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { Button } from '@/components/ui/button'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   Popover,
@@ -22,21 +23,22 @@ import {
 } from '@/components/ui/popover'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { agentPendingPromptAtom, agentSessionDraftHtmlAtom, agentSessionDraftsAtom, agentSessionDraftSyncVersionsAtom, currentAgentSessionIdAtom, skillDetailNavigationAtomFamily, workspaceCapabilitiesVersionAtom } from '@/atoms/agent-atoms'
-import { agentSkillsTabAtom } from '@/atoms/active-view'
+import { agentSkillsSectionCountsAtom, agentSkillsTabAtom } from '@/atoms/active-view'
 import { useProjectActions } from '@/hooks/useProjectActions'
 import { useCreateSession } from '@/hooks/useCreateSession'
 import { McpServerForm } from '@/components/settings/McpServerForm'
 import { LocalProjectBadge } from '@/components/agent/LocalProjectBadge'
 import { AgentActionHint } from '@/components/agent/AgentActionHint'
 import { queuedTextToParagraphHtml } from '@/lib/agent-message-queue'
-import type { McpServerEntry, SkillMeta } from '@proma/shared'
+import type { AgentWorkspace, McpServerEntry, SkillMeta } from '@proma/shared'
 import { useAgentSkillsData } from './useAgentSkillsData'
 import { SkillCard } from './SkillCard'
 import { McpCard } from './McpCard'
 import { SkillDetailView } from './SkillDetailView'
 import { McpDetailView } from './McpDetailView'
 import { ImportSkillDialog } from './ImportSkillDialog'
-import { WorkspaceMemoryTab } from './WorkspaceMemoryTab'
+import { EnterpriseSkillsSection } from './EnterpriseSkillsSection'
+import { MemoryPage } from './MemoryPage'
 import { groupSkills } from './skillGrouping'
 import { EMBEDDED_CATALOG_TWO_COLUMN_MIN_WIDTH, IntegrationCatalog } from './IntegrationCatalog'
 import { CredentialDialog } from './CredentialDialog'
@@ -99,13 +101,100 @@ version: "1.0.0"
 - 是否有需要用户确认或后续合并同类项的建议`
 }
 
+/** Skills/MCP 项目切换器：默认显示宿主对话的项目，可临时切到其他项目查看其配置。 */
+function ProjectSkillsSwitcher({
+  workspaces,
+  selectedWorkspaceId,
+  selectedWorkspace,
+  displayName,
+  onSelect,
+  triggerClassName,
+}: {
+  workspaces: readonly AgentWorkspace[]
+  selectedWorkspaceId?: string | null
+  selectedWorkspace?: AgentWorkspace
+  displayName?: string
+  onSelect: (workspace: AgentWorkspace) => void
+  triggerClassName?: string
+}): React.ReactElement {
+  const [open, setOpen] = React.useState(false)
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <button
+          type="button"
+          className={cn(
+            'titlebar-no-drag flex min-w-0 max-w-full items-center gap-2 rounded-lg border border-border/60 bg-content-area px-3 py-1.5 text-[13px] font-medium text-foreground/80 transition-colors hover:bg-foreground/[0.04]',
+            triggerClassName,
+          )}
+        >
+          <FolderOpen size={14} className="shrink-0 text-foreground/45" />
+          <span className="min-w-0 max-w-[180px] truncate">{selectedWorkspace?.name ?? displayName ?? '选择项目'}</span>
+          <LocalProjectBadge
+            projectRootPath={selectedWorkspace?.projectRootPath}
+            projectRootStatus={selectedWorkspace?.projectRootStatus}
+          />
+          <ChevronDown size={14} className="shrink-0 text-foreground/45" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent align="end" className="max-h-[320px] w-56 overflow-y-auto scrollbar-thin p-1">
+        {workspaces.map((workspace) => (
+          <button
+            key={workspace.id}
+            type="button"
+            onClick={() => {
+              onSelect(workspace)
+              setOpen(false)
+            }}
+            className={cn(
+              'flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-[13px] transition-colors',
+              workspace.id === selectedWorkspaceId
+                ? 'bg-accent text-accent-foreground'
+                : 'text-foreground/80 hover:bg-accent/50',
+            )}
+          >
+            <span className="min-w-0 flex-1 truncate">{workspace.name}</span>
+            <LocalProjectBadge
+              projectRootPath={workspace.projectRootPath}
+              projectRootStatus={workspace.projectRootStatus}
+            />
+            {workspace.id === selectedWorkspaceId && <Check size={14} className="shrink-0 text-primary" />}
+          </button>
+        ))}
+      </PopoverContent>
+    </Popover>
+  )
+}
+
 export function AgentSkillsView({
   embedded = false,
   componentTab,
   workspaceId,
   sessionId,
-}: { embedded?: boolean; componentTab?: 'skills' | 'mcp'; workspaceId?: string; sessionId?: string } = {}): React.ReactElement {
-  const data = useAgentSkillsData(workspaceId)
+  shellMode = false,
+}: {
+  embedded?: boolean
+  componentTab?: 'skills' | 'mcp'
+  workspaceId?: string
+  sessionId?: string
+  /** 官方 0.22.0：分区侧栏承载标题与 Skills/MCP 导航，主区不再重复。 */
+  shellMode?: boolean
+} = {}): React.ReactElement {
+  const { workspaces, currentWorkspaceId: selectedWorkspaceId, selectProject } = useProjectActions()
+  /** 对话内右侧面板与分区视图默认锁定当前对话项目，允许临时查看其他项目的 Skills/MCP。 */
+  const scopedByConversation = embedded || shellMode
+  const [pickedWorkspaceId, setPickedWorkspaceId] = React.useState<string | undefined>(
+    workspaceId ?? selectedWorkspaceId ?? undefined,
+  )
+  React.useEffect(() => {
+    // 切换会话后重新回到该会话的项目；手动选择只在当前挂载期内有效。
+    setPickedWorkspaceId(workspaceId ?? selectedWorkspaceId ?? undefined)
+  }, [workspaceId, selectedWorkspaceId])
+  const settingsWorkspaceId = scopedByConversation
+    ? pickedWorkspaceId ?? workspaceId ?? selectedWorkspaceId ?? undefined
+    : selectedWorkspaceId ?? undefined
+  const data = useAgentSkillsData(settingsWorkspaceId)
   const bumpCapabilities = useSetAtom(workspaceCapabilitiesVersionAtom)
   const store = useStore()
   const setDrafts = useSetAtom(agentSessionDraftsAtom)
@@ -115,9 +204,8 @@ export function AgentSkillsView({
   const currentAgentSessionId = useAtomValue(currentAgentSessionIdAtom)
   const skillDetailNavigation = useAtomValue(skillDetailNavigationAtomFamily(sessionId ?? ''))
   const setSkillDetailNavigation = useSetAtom(skillDetailNavigationAtomFamily(sessionId ?? ''))
-  const { workspaces, currentWorkspaceId: selectedWorkspaceId, selectProject } = useProjectActions()
   const { createAgent } = useCreateSession()
-  const currentWorkspace = workspaces.find((workspace) => workspace.id === (workspaceId ?? selectedWorkspaceId))
+  const currentWorkspace = workspaces.find((workspace) => workspace.id === settingsWorkspaceId)
 
   const fillCurrentAgentPrompt = React.useCallback((message: string): boolean => {
     const targetSessionId = sessionId ?? currentAgentSessionId
@@ -166,7 +254,6 @@ export function AgentSkillsView({
   const [showCreateMcp, setShowCreateMcp] = React.useState(false)
   const [selectedMcpName, setSelectedMcpName] = React.useState<string | null>(null)
   const [showImport, setShowImport] = React.useState(false)
-  const [wsPopoverOpen, setWsPopoverOpen] = React.useState(false)
   const [pendingDeleteSkill, setPendingDeleteSkill] = React.useState<SkillMeta | null>(null)
   const [pendingDeleteMcpName, setPendingDeleteMcpName] = React.useState<string | null>(null)
   const [isDeletingSkill, setIsDeletingSkill] = React.useState(false)
@@ -176,6 +263,25 @@ export function AgentSkillsView({
   const [pendingCredentialIntegration, setPendingCredentialIntegration] = React.useState<CatalogCredentialIntegration | null>(null)
   const [pendingOAuthClientSecret, setPendingOAuthClientSecret] = React.useState<{ name: string; entry: McpServerEntry } | null>(null)
   const savedOAuthClientSecretsRef = React.useRef(new Set<string>())
+
+  // 切换项目后不保留上一个项目的详情/新建状态，避免同名 Skill/MCP 串数据。
+  React.useEffect(() => {
+    setSelectedSkillSlug(null)
+    setSelectedSkillWorkspaceSlug(null)
+    setSelectedMcpName(null)
+    setShowCreateMcp(false)
+  }, [settingsWorkspaceId])
+
+  const handleSelectSettingsWorkspace = React.useCallback((workspace: AgentWorkspace): void => {
+    if (scopedByConversation) {
+      setPickedWorkspaceId(workspace.id)
+    } else if (workspace.id !== selectedWorkspaceId) {
+      selectProject(workspace.id, { resetView: false })
+    }
+    if (workspace.id !== settingsWorkspaceId) {
+      toast.success(`已切换到项目「${workspace.name}」`)
+    }
+  }, [scopedByConversation, selectedWorkspaceId, settingsWorkspaceId, selectProject])
 
   const selectSkill = React.useCallback((slug: string): void => {
     setSelectedSkillSlug(slug)
@@ -240,6 +346,10 @@ export function AgentSkillsView({
     [data.mcpConfig],
   )
   const memoryCount = (data.capabilities?.memory.agentsMd.exists ? 1 : 0) + (data.capabilities?.memory.autoMemory.fileCount ?? 0)
+  const setSectionCounts = useSetAtom(agentSkillsSectionCountsAtom)
+  React.useEffect(() => {
+    setSectionCounts({ skills: data.skills.length, mcp: mcpCount, memory: memoryCount })
+  }, [data.skills.length, memoryCount, mcpCount, setSectionCounts])
 
   const selectedSkill = selectedSkillWorkspaceSlug === data.workspaceSlug
     && data.loadedWorkspaceSlug === data.workspaceSlug
@@ -496,7 +606,7 @@ export function AgentSkillsView({
 
   if (!data.hasWorkspace) {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
+      <div className="agent-skills-content flex h-full flex-col items-center justify-center gap-3 text-center">
         <div className="flex size-16 items-center justify-center rounded-2xl bg-foreground/[0.04]">
           <Blocks className="size-8 text-foreground/30" />
         </div>
@@ -510,7 +620,7 @@ export function AgentSkillsView({
 
   if (selectedSkill) {
     return (
-      <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="agent-skills-content flex h-full min-h-0 flex-col overflow-hidden">
         <SkillDetailView
           key={`${data.workspaceSlug}:${selectedSkill.slug}`}
           skill={selectedSkill}
@@ -531,7 +641,7 @@ export function AgentSkillsView({
 
   if (showCreateMcp) {
     return (
-      <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="agent-skills-content flex h-full min-h-0 flex-col overflow-hidden">
         <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
           <div className="mx-auto w-full max-w-3xl p-5">
             <McpServerForm
@@ -553,7 +663,7 @@ export function AgentSkillsView({
 
   if (selectedMcpName && selectedMcp) {
     return (
-      <div className="flex h-full min-h-0 flex-col overflow-hidden">
+      <div className="agent-skills-content flex h-full min-h-0 flex-col overflow-hidden">
         <McpDetailView
           key={selectedMcpName}
           name={selectedMcpName}
@@ -571,7 +681,7 @@ export function AgentSkillsView({
 
   return (
     <div
-      className={cn('flex h-full flex-col overflow-hidden', embedded && 'skills-embedded-container')}
+      className={cn('agent-skills-content flex h-full flex-col overflow-hidden', embedded && 'skills-embedded-container')}
       // Container query keeps the catalog responsive to this resizable SidePanel.
       style={embedded ? { containerType: 'inline-size' } : undefined}
     >
@@ -579,57 +689,50 @@ export function AgentSkillsView({
       {/* 不加 titlebar-drag-region：与 DropdownMenu 嵌套时 drag/no-drag 会让 Radix 拿不到
           pointerdown，下拉打不开。窗口拖拽由 AppShell 顶部 0–50px 的全局 drag 层兜底。
           pt-14 让按钮整体位于全局 drag 层（0–50px, z-50）下方，避免被吃掉点击。 */}
+      {!shellMode && (
       <div className={cn('titlebar-no-drag mx-auto flex w-full max-w-6xl shrink-0 items-center justify-between', embedded ? 'px-4 py-3' : 'px-8 pt-14 pb-4')}>
         <div className="flex items-center gap-2.5">
           <Blocks className="size-6 text-foreground/70" />
           <h1 className={cn('font-semibold text-foreground', embedded ? 'text-lg' : 'text-2xl')}>{embedded ? (tab === 'mcp' ? 'MCP' : 'Skills') : 'Agent 技能'}</h1>
         </div>
 
-        {!embedded && <Popover open={wsPopoverOpen} onOpenChange={setWsPopoverOpen}>
-          <PopoverTrigger asChild>
-            <button
-              type="button"
-              className="titlebar-no-drag flex items-center gap-2 rounded-lg border border-border/60 bg-content-area px-3 py-1.5 text-[13px] font-medium text-foreground/80 transition-colors hover:bg-foreground/[0.04]"
-            >
-              <FolderOpen size={14} className="text-foreground/45" />
-              <span className="max-w-[180px] truncate">{data.workspaceName}</span>
-              <LocalProjectBadge
-                projectRootPath={currentWorkspace?.projectRootPath}
-                projectRootStatus={currentWorkspace?.projectRootStatus}
-              />
-              <ChevronDown size={14} className="text-foreground/45" />
-            </button>
-          </PopoverTrigger>
-          <PopoverContent align="end" className="max-h-[320px] w-56 overflow-y-auto scrollbar-thin p-1">
-            {workspaces.map((w) => (
-              <button
-                key={w.id}
-                type="button"
-                onClick={() => {
-                  if (w.id !== selectedWorkspaceId) {
-                    selectProject(w.id, { resetView: false })
-                    toast.success(`已切换到项目「${w.name}」`)
-                  }
-                  setWsPopoverOpen(false)
-                }}
-                className={cn(
-                  'flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-[13px] transition-colors',
-                  w.id === selectedWorkspaceId
-                    ? 'bg-accent text-accent-foreground'
-                    : 'text-foreground/80 hover:bg-accent/50',
-                )}
-              >
-                <span className="min-w-0 flex-1 truncate">{w.name}</span>
-                <LocalProjectBadge
-                  projectRootPath={w.projectRootPath}
-                  projectRootStatus={w.projectRootStatus}
-                />
-                {w.id === selectedWorkspaceId && <Check size={14} className="shrink-0 text-primary" />}
-              </button>
-            ))}
-          </PopoverContent>
-        </Popover>}
+        <ProjectSkillsSwitcher
+          workspaces={workspaces}
+          selectedWorkspaceId={settingsWorkspaceId}
+          selectedWorkspace={currentWorkspace}
+          displayName={data.workspaceName}
+          onSelect={handleSelectSettingsWorkspace}
+        />
       </div>
+      )}
+
+      {shellMode && (
+        <div className={cn(
+          'titlebar-no-drag flex w-full shrink-0 items-baseline gap-2 px-4 pt-4',
+          // 记忆页按截图使用通栏布局：只留页面标题，不叠加计数与项目切换器。
+          tab === 'memory' ? '' : 'mx-auto max-w-6xl',
+        )}>
+          <h1 className="text-lg font-semibold text-foreground">
+            {tab === 'mcp' ? 'MCP' : tab === 'memory' ? '记忆' : 'Skills'}
+          </h1>
+          {tab !== 'memory' && (
+            <span className="text-xs text-muted-foreground">
+              {tab === 'skills' ? `${data.skills.length} 个 Skills` : `${mcpCount} 个 MCP`}
+            </span>
+          )}
+          {tab !== 'memory' && (
+            <div className="ml-auto self-center">
+              <ProjectSkillsSwitcher
+                workspaces={workspaces}
+                selectedWorkspaceId={settingsWorkspaceId}
+                selectedWorkspace={currentWorkspace}
+                displayName={data.workspaceName}
+                onSelect={handleSelectSettingsWorkspace}
+              />
+            </div>
+          )}
+        </div>
+      )}
 
       {embedded && (
         <div className="titlebar-no-drag mx-auto w-full max-w-6xl shrink-0 px-3 pb-3">
@@ -638,9 +741,9 @@ export function AgentSkillsView({
       )}
 
       {/* 工具条 */}
-      <div className={cn('titlebar-no-drag mx-auto flex w-full max-w-6xl shrink-0 items-center gap-3', embedded ? 'px-3 pb-3' : 'px-8 pb-4')}>
-        {/* 全屏能力中心保留总览切换；右侧组件由顶栏独占一个能力域。 */}
-        {!embedded && <div className="relative flex h-8 items-stretch rounded-xl bg-muted p-0.5">
+      <div className={cn('titlebar-no-drag mx-auto flex w-full max-w-6xl shrink-0 items-center gap-3', embedded ? 'px-3 pb-3' : shellMode ? 'px-4 pb-4' : 'px-8 pb-4')}>
+        {/* 全屏能力中心保留总览切换；右侧组件与 shell 分区侧栏独占能力域导航。 */}
+        {!embedded && !shellMode && <div className="relative flex h-8 items-stretch rounded-xl bg-muted p-0.5">
           <div
             className={cn(
               'absolute bottom-0.5 top-0.5 w-[calc(33.333%-3px)] rounded-lg bg-background shadow-sm transition-transform duration-300 ease-in-out',
@@ -668,7 +771,8 @@ export function AgentSkillsView({
           ))}
         </div>}
 
-        {/* 搜索框 */}
+        {/* 搜索框；记忆页使用自己的双 Tab，不叠加全能力搜索。 */}
+        {!(shellMode && tab === 'memory') && (
         <div className="flex h-8 flex-1 items-center gap-2 rounded-lg border border-border/60 bg-content-area px-3 transition-colors focus-within:border-primary/40">
           <Search size={14} className="shrink-0 text-foreground/40" />
           <input
@@ -678,6 +782,7 @@ export function AgentSkillsView({
             className="w-full bg-transparent text-[13px] text-foreground placeholder:text-foreground/35 focus:outline-none"
           />
         </div>
+        )}
 
         {/* 社区市场（占位） */}
         {tab === 'skills' && (
@@ -740,22 +845,34 @@ export function AgentSkillsView({
 
       {/* 内容 */}
       <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
-        <div className={cn('mx-auto w-full max-w-6xl', embedded ? 'px-3 pb-4' : 'px-8 pb-10')}>
+        <div className={cn(
+          'mx-auto w-full',
+          // 记忆页通栏展示；Skills/MCP 仍保持内容最大宽度。
+          tab === 'memory' ? 'h-full max-w-none' : 'max-w-6xl',
+          embedded ? 'px-3 pb-4' : tab === 'memory' ? 'px-4 pb-6' : 'px-8 pb-10',
+        )}>
           {data.loading ? (
             <div className="py-20 text-center text-sm text-muted-foreground">加载中...</div>
           ) : tab === 'skills' ? (
-            <SkillsTab
-              customSkills={customSkills}
-              builtinSkills={builtinSkills}
-              embedded={embedded}
-              total={data.skills.length}
-              updateCount={updateCount}
-              updatingSkill={data.updatingSkill}
-              isBuiltin={(slug) => data.defaultSkillSlugs.has(slug)}
-              onOpen={selectSkill}
-              onToggle={data.toggleSkill}
-              onUpdate={data.updateSkill}
-            />
+            <div className="flex flex-col gap-8">
+              <EnterpriseSkillsSection
+                workspaceSlug={data.workspaceSlug}
+                installedSkills={data.skills}
+                onChanged={() => bumpCapabilities((value) => value + 1)}
+              />
+              <SkillsTab
+                customSkills={customSkills}
+                builtinSkills={builtinSkills}
+                embedded={embedded}
+                total={data.skills.length}
+                updateCount={updateCount}
+                updatingSkill={data.updatingSkill}
+                isBuiltin={(slug) => data.defaultSkillSlugs.has(slug)}
+                onOpen={selectSkill}
+                onToggle={data.toggleSkill}
+                onUpdate={data.updateSkill}
+              />
+            </div>
           ) : tab === 'mcp' ? (
             <McpTab
               userEntries={userMcpEntries}
@@ -785,7 +902,7 @@ export function AgentSkillsView({
               onRequestCredential={setPendingCredentialIntegration}
             />
           ) : (
-            <WorkspaceMemoryTab workspaceSlug={data.workspaceSlug} search={search} />
+            <MemoryPage workspaceSlug={data.workspaceSlug} search={search} />
           )}
         </div>
       </div>

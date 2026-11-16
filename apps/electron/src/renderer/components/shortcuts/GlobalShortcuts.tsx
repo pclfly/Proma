@@ -9,18 +9,14 @@
  * 4. 监听菜单 IPC 事件（Cmd+W 关闭标签）
  */
 
+import { effectiveSidebarCollapsedAtom } from '@/atoms/preview-sidebar-atoms'
 import { useEffect, useCallback } from 'react'
 import { useAtomValue, useSetAtom, useAtom, useStore } from 'jotai'
+import { toast } from 'sonner'
 import { appModeAtom } from '@/atoms/app-mode'
 import { settingsOpenAtom, channelFormDirtyAtom, settingsCloseRequestedAtom } from '@/atoms/settings-tab'
 import { searchDialogOpenAtom } from '@/atoms/search-atoms'
-import {
-  tabsAtom,
-  activeTabIdAtom,
-  activeTabAtom,
-  sidebarCollapsedAtom,
-  openTab,
-} from '@/atoms/tab-atoms'
+import { tabsAtom, activeTabIdAtom, activeTabAtom, openTab } from '@/atoms/tab-atoms'
 import { shortcutOverridesAtom, sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { shortcutGuideOpenAtom } from '@/atoms/shortcut-guide'
 import {
@@ -41,31 +37,17 @@ import {
   currentSessionSidePanelOpenAtom,
   isWorkspaceComponentTab,
 } from '@/atoms/agent-atoms'
-import {
-  chatPendingMessageAtom,
-  conversationDraftsAtom,
-  conversationDraftSyncVersionsAtom,
-  conversationsAtom,
-  currentConversationIdAtom,
-  selectedModelAtom,
-} from '@/atoms/chat-atoms'
+
 import { activeViewAtom } from '@/atoms/active-view'
 import { useCreateSession } from '@/hooks/useCreateSession'
 import { useShortcut } from '@/hooks/useShortcut'
 import { useCloseTab } from '@/hooks/useCloseTab'
-import {
-  initShortcutRegistry,
-  updateShortcutOverrides,
-} from '@/lib/shortcut-registry'
+import { initShortcutRegistry, updateShortcutOverrides } from '@/lib/shortcut-registry'
 import { getFileParentPath } from '@/lib/file-utils'
 import { isDelegationObservationVisible } from '@/lib/agent-session-list'
 import { getLastInteractedStopTarget, resolveStopGenerationTarget } from '@/lib/stop-generation-target'
 import { CLOSE_ACTIVE_RIGHT_WORKSPACE_TAB_EVENT } from '@/lib/right-workspace-events'
-import {
-  shouldFallbackVoiceDictationToActiveTab,
-  VOICE_DICTATION_CLEAR_PREVIEW_EVENT,
-  VOICE_DICTATION_PREVIEW_EVENT,
-} from '@/lib/voice-input-focus'
+import { shouldFallbackVoiceDictationToActiveTab, VOICE_DICTATION_CLEAR_PREVIEW_EVENT, VOICE_DICTATION_PREVIEW_EVENT } from '@/lib/voice-input-focus'
 
 /**
  * 快捷键初始化 + 全局 Handler 注册
@@ -79,11 +61,11 @@ export function GlobalShortcuts(): null {
   const setSettingsCloseRequested = useSetAtom(settingsCloseRequestedAtom)
   const [searchOpen, setSearchOpen] = useAtom(searchDialogOpenAtom)
   const [shortcutGuideOpen, setShortcutGuideOpen] = useAtom(shortcutGuideOpenAtom)
-  const [sidebarCollapsed, setSidebarCollapsed] = useAtom(sidebarCollapsedAtom)
+  const [sidebarCollapsed, setSidebarCollapsed] = useAtom(effectiveSidebarCollapsedAtom)
   const setShortcutOverrides = useSetAtom(shortcutOverridesAtom)
   const shortcutOverrides = useAtomValue(shortcutOverridesAtom)
   const setSendWithCmdEnter = useSetAtom(sendWithCmdEnterAtom)
-  const { createChat, createAgent } = useCreateSession()
+  const { createAgent } = useCreateSession()
 
   // Tab 管理（用于关闭标签页）
   const activeTabId = useAtomValue(activeTabIdAtom)
@@ -184,12 +166,10 @@ export function GlobalShortcuts(): null {
   useShortcut(
     'new-session',
     useCallback(() => {
-      if (appMode === 'agent') {
+      {
         createAgent({ draft: true })
-      } else {
-        createChat({ draft: true })
       }
-    }, [appMode, createAgent, createChat]),
+    }, [appMode, createAgent]),
   )
 
   // Cmd+B → 切换侧边栏
@@ -199,23 +179,6 @@ export function GlobalShortcuts(): null {
       () => setSidebarCollapsed(!sidebarCollapsed),
       [sidebarCollapsed, setSidebarCollapsed],
     ),
-  )
-
-  // Cmd+Shift+M → 切换模式
-  useShortcut(
-    'toggle-mode',
-    useCallback(
-      () => setAppMode(appMode === 'chat' ? 'agent' : 'chat'),
-      [appMode, setAppMode],
-    ),
-  )
-
-  // Cmd+K → 清除上下文（通过 CustomEvent 分发到 ChatInput）
-  useShortcut(
-    'clear-context',
-    useCallback(() => {
-      window.dispatchEvent(new CustomEvent('proma:clear-context'))
-    }, []),
   )
 
   // Cmd+L → 聚焦输入框（通过 CustomEvent 分发到 ChatInput/AgentView）
@@ -262,70 +225,93 @@ export function GlobalShortcuts(): null {
   useEffect(() => {
     const cleanup = window.electronAPI.onQuickTaskOpenSession(async (data) => {
       try {
-        // 切换到对应模式
-        store.set(appModeAtom, data.mode)
+        // Chat 模式已移除：快速任务固定走 Agent。
+        store.set(appModeAtom, 'agent')
         store.set(activeViewAtom, 'conversations')
 
-        if (data.mode === 'agent') {
+        {
           // Agent 模式：创建会话 + 保存附件到 session 目录
           const channelId = store.get(agentChannelIdAtom) || undefined
           const modelId = store.get(agentModelIdAtom) || undefined
           const workspaceId = store.get(currentAgentWorkspaceIdAtom) || undefined
+          const hasFiles = Boolean(data.files && data.files.length > 0)
+
+          // 有附件却没有可保存的项目时不得降级为自动发送纯文字。
+          // 明确回报未接收，让快速任务窗口保留输入与附件。
+          if (hasFiles && !workspaceId) {
+            await window.electronAPI.ackQuickTaskOpenSession({
+              requestId: data.requestId, accepted: false, reason: '请先选择项目后再发送附件',
+            })
+            toast.error('请先选择项目后再发送附件，内容已保留在快速任务窗口')
+            return
+          }
+
           const meta = await window.electronAPI.createAgentSession(
             undefined,
             channelId,
             workspaceId,
             modelId,
           )
-          // 更新 atom 状态
           store.set(agentSessionsAtom, (prev) => [meta, ...prev])
           store.set(currentAgentSessionIdAtom, meta.id)
 
           // 处理附件：保存到 session 目录，构建 file references
           let fileReferences = ''
           const additionalDirectories = new Set<string>()
-          if (data.files && data.files.length > 0 && workspaceId) {
+          if (hasFiles && workspaceId) {
             const workspaces = store.get(agentWorkspacesAtom)
             const workspace = workspaces.find((w) => w.id === workspaceId)
-            if (workspace) {
-              try {
-                const allRefs: Array<{ filename: string; targetPath: string }> = []
-                for (const file of data.files) {
-                  if (!file.sourcePath) continue
-                  const attachedFiles = await window.electronAPI.attachFile({
-                    sessionId: meta.id,
-                    filePath: file.sourcePath,
-                  })
-                  store.set(agentAttachedFilesMapAtom, (prev) => {
-                    const map = new Map(prev)
-                    map.set(meta.id, attachedFiles)
-                    return map
-                  })
-                  allRefs.push({ filename: file.filename, targetPath: file.sourcePath })
-                  const parentPath = getFileParentPath(file.sourcePath)
-                  if (parentPath) additionalDirectories.add(parentPath)
-                }
-
-                const filesToSave = data.files.filter((f) => f.base64).map((f) => ({
-                  filename: f.filename,
-                  data: f.base64!,
-                }))
-                if (filesToSave.length > 0) {
-                  const saved = await window.electronAPI.saveFilesToAgentSession({
-                    workspaceSlug: workspace.slug,
-                    sessionId: meta.id,
-                    files: filesToSave,
-                  })
-                  allRefs.push(...saved)
-                }
-
-                if (allRefs.length > 0) {
-                  const refs = allRefs.map((f) => `- ${f.filename}: ${f.targetPath}`).join('\n')
-                  fileReferences = `<attached_files>\n${refs}\n</attached_files>\n\n`
-                }
-              } catch (error) {
-                console.error('[快速任务] 保存 Agent 附件失败:', error)
+            if (!workspace) {
+              await window.electronAPI.ackQuickTaskOpenSession({
+                requestId: data.requestId, accepted: false, reason: '当前项目不可用',
+              })
+              toast.error('当前项目不可用，附件未发送，内容已保留在快速任务窗口')
+              return
+            }
+            try {
+              const allRefs: Array<{ filename: string; targetPath: string }> = []
+              for (const file of data.files ?? []) {
+                if (!file.sourcePath) continue
+                const attachedFiles = await window.electronAPI.attachFile({
+                  sessionId: meta.id,
+                  filePath: file.sourcePath,
+                })
+                store.set(agentAttachedFilesMapAtom, (prev) => {
+                  const map = new Map(prev)
+                  map.set(meta.id, attachedFiles)
+                  return map
+                })
+                allRefs.push({ filename: file.filename, targetPath: file.sourcePath })
+                const parentPath = getFileParentPath(file.sourcePath)
+                if (parentPath) additionalDirectories.add(parentPath)
               }
+
+              const filesToSave = (data.files ?? []).filter((f) => f.base64).map((f) => ({
+                filename: f.filename,
+                data: f.base64!,
+              }))
+              if (filesToSave.length > 0) {
+                const saved = await window.electronAPI.saveFilesToAgentSession({
+                  workspaceSlug: workspace.slug,
+                  sessionId: meta.id,
+                  files: filesToSave,
+                })
+                allRefs.push(...saved)
+              }
+
+              if (allRefs.length > 0) {
+                const newline = String.fromCharCode(10)
+                const refs = allRefs.map((f) => `- ${f.filename}: ${f.targetPath}`).join(newline)
+                fileReferences = ['<attached_files>', refs, '</attached_files>', '', ''].join(newline)
+              }
+            } catch (error) {
+              // 附件保存失败绝不可降级成纯文字自动发送。
+              console.error('[快速任务] 保存 Agent 附件失败:', error)
+              await window.electronAPI.ackQuickTaskOpenSession({
+                requestId: data.requestId, accepted: false, reason: '附件保存失败',
+              })
+              toast.error('附件保存失败，未发送；请稍后重试')
+              return
             }
           }
 
@@ -345,59 +331,14 @@ export function GlobalShortcuts(): null {
             message: fileReferences + data.text,
             ...(additionalDirectories.size > 0 && { additionalDirectories: Array.from(additionalDirectories) }),
           })
-        } else {
-          // Chat 模式：创建对话 + 保存附件到磁盘
-          const chatModel = store.get(selectedModelAtom)
-          const meta = await window.electronAPI.createConversation(
-            undefined,
-            chatModel?.modelId,
-            chatModel?.channelId,
-          )
-          // 更新 atom 状态
-          store.set(conversationsAtom, (prev) => [meta, ...prev])
-          store.set(currentConversationIdAtom, meta.id)
-
-          // 处理附件：保存到磁盘，收集 FileAttachment[]
-          const savedAttachments: import('@proma/shared').FileAttachment[] = []
-          if (data.files && data.files.length > 0) {
-            for (const file of data.files) {
-              if (!file.base64) {
-                console.warn('[快速任务] Chat 附件缺少 base64，已跳过:', file.filename)
-                continue
-              }
-              try {
-                const result = await window.electronAPI.saveAttachment({
-                  conversationId: meta.id,
-                  filename: file.filename,
-                  mediaType: file.mediaType,
-                  data: file.base64,
-                })
-                savedAttachments.push(result.attachment)
-              } catch (error) {
-                console.error('[快速任务] 保存 Chat 附件失败:', error)
-              }
-            }
-          }
-
-          // 打开新标签页
-          const currentTabs = store.get(tabsAtom)
-          const tabResult = openTab(currentTabs, {
-            type: 'chat',
-            sessionId: meta.id,
-            title: data.text.slice(0, 30),
-          })
-          store.set(tabsAtom, tabResult.tabs)
-          store.set(activeTabIdAtom, tabResult.activeTabId)
-
-          // 设置待发送消息（含已保存的附件）
-          store.set(chatPendingMessageAtom, {
-            conversationId: meta.id,
-            message: data.text,
-            attachments: savedAttachments.length > 0 ? savedAttachments : undefined,
-          })
+          // 已接管并进入发送流程，允许快速任务清空输入。
+          await window.electronAPI.ackQuickTaskOpenSession({ requestId: data.requestId, accepted: true })
         }
       } catch (error) {
         console.error('[快速任务] 创建会话失败:', error)
+        await window.electronAPI.ackQuickTaskOpenSession({
+          requestId: data.requestId, accepted: false, reason: '创建会话失败，请重试',
+        }).catch(() => {})
       }
     })
     return cleanup
@@ -445,11 +386,8 @@ export function GlobalShortcuts(): null {
       const tabs = store.get(tabsAtom)
       const activeTabId = store.get(activeTabIdAtom)
       const activeTab = tabs.find((tab) => tab.id === activeTabId)
-      const currentMode = store.get(appModeAtom)
-      const fallbackTarget =
-        currentMode === 'agent'
-          ? { type: 'agent' as const, sessionId: store.get(currentAgentSessionIdAtom) }
-          : { type: 'chat' as const, sessionId: store.get(currentConversationIdAtom) }
+      // Chat 已退役：语音输入只回落到当前 Agent 会话。
+      const fallbackTarget = { type: 'agent' as const, sessionId: store.get(currentAgentSessionIdAtom) }
       const target = activeTab ?? fallbackTarget
 
       if (!target.sessionId) {
@@ -484,25 +422,7 @@ export function GlobalShortcuts(): null {
         return
       }
 
-      if (target.type === 'chat') {
-        const conversationId = target.sessionId
-        store.set(appModeAtom, 'chat')
-        store.set(currentConversationIdAtom, conversationId)
-        store.set(conversationDraftsAtom, (prev) => {
-          const map = new Map(prev)
-          const current = map.get(conversationId) ?? ''
-          map.set(conversationId, current ? `${current}\n${trimmed}` : trimmed)
-          return map
-        })
-        store.set(conversationDraftSyncVersionsAtom, (prev) => {
-          const map = new Map(prev)
-          map.set(conversationId, (map.get(conversationId) ?? 0) + 1)
-          return map
-        })
-        window.dispatchEvent(new CustomEvent('proma:focus-input'))
-        acknowledgeDelivery(true)
-        return
-      }
+      
 
       acknowledgeDelivery(false)
     })
@@ -548,12 +468,10 @@ export function GlobalShortcuts(): null {
     })
 
     const cleanupCreate = window.electronAPI.onTrayCreateSession(async (data) => {
-      store.set(appModeAtom, data.mode)
+      store.set(appModeAtom, 'agent')
       store.set(activeViewAtom, 'conversations')
-      if (data.mode === 'agent') {
+      {
         await createAgent()
-      } else {
-        await createChat()
       }
     })
 
@@ -561,6 +479,6 @@ export function GlobalShortcuts(): null {
       cleanupOpen()
       cleanupCreate()
     }
-  }, [store, createAgent, createChat])
+  }, [store, createAgent])
   return null
 }

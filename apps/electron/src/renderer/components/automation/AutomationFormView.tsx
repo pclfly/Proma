@@ -11,7 +11,18 @@
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
 import { toast } from 'sonner'
-import { AlertTriangle, ArrowLeft, Bell, Check, Clock, Loader2, Pencil, Play, Settings, X } from 'lucide-react'
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Bell,
+  Check,
+  Clock,
+  Loader2,
+  Pencil,
+  Play,
+  Settings,
+  X,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
@@ -24,11 +35,10 @@ import {
 } from '@/components/ui/select'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover'
-import { ModelSelector } from '@/components/chat/ModelSelector'
+import { ModelSelector } from '@/components/session-shared/ModelSelector'
 import {
   automationFormAtom,
   automationsAtom,
-  AUTOMATION_INTERVAL_OPTIONS,
   AUTOMATION_WEEKDAY_OPTIONS,
   automationToDraft,
   type AutomationDraft,
@@ -88,6 +98,8 @@ function getWeekdaysFromPreset(value: string, current?: number[]): number[] {
 function formatRunStatus(status: AutomationRun['status']): string {
   if (status === 'success') return '完成'
   if (status === 'error') return '失败'
+  if (status === 'running') return '运行中'
+  if (status === 'interrupted') return '已中断'
   return '跳过'
 }
 
@@ -513,13 +525,18 @@ export function AutomationFormView({ embedded = false }: { embedded?: boolean } 
     }
 
     setRunningNow(true)
-    toast.success('已开始运行定时任务', {
-      description: '本次任务会创建新的 Agent 会话，可在左侧会话列表查看',
-    })
     try {
       const automationId = await persistDraft(latest)
       if (!automationId) throw new Error('任务尚未创建')
-      await window.electronAPI.runAutomationNow(automationId)
+      // 主进程在会话创建后立即返回启动摘要，不等待任务执行完成
+      const result = await window.electronAPI.runAutomationNow(automationId)
+      if (!result.started) {
+        toast.warning(result.reason ?? '定时任务未能启动')
+        return
+      }
+      toast.success('已开始运行定时任务', {
+        description: result.note ?? '任务在后台执行，可在运行历史里打开本次会话',
+      })
       await refreshAutomations()
       const sessions = await window.electronAPI.listActiveAgentSessions()
       setAgentSessions(sessions)
@@ -1202,7 +1219,9 @@ export function AutomationFormView({ embedded = false }: { embedded?: boolean } 
                             <span className="shrink-0 text-foreground/45">{formatRunStatus(run.status)}</span>
                             <span className="text-foreground/35 truncate">
                               {run.status === 'success' && run.durationMs ? `${(run.durationMs / 1000).toFixed(1)}s` : ''}
+                              {run.status === 'running' ? '执行中…' : ''}
                               {run.status === 'error' ? (run.error ?? '失败') : ''}
+                              {run.status === 'interrupted' ? (run.error ?? '运行被中断') : ''}
                               {run.status === 'skipped' ? (run.skipReason ?? '跳过') : ''}
                             </span>
                           </button>

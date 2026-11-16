@@ -7,21 +7,21 @@
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import * as DialogPrimitive from '@radix-ui/react-dialog'
-import { AppWindow, Compass, Globe2, Keyboard, PencilLine, X } from 'lucide-react'
+import {
+  AppWindow,
+  Compass,
+  Globe2,
+  Keyboard,
+  PencilLine,
+  X,
+} from 'lucide-react'
 import { shortcutGuideOpenAtom } from '@/atoms/shortcut-guide'
 import { shortcutOverridesAtom, sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { cn } from '@/lib/utils'
 import { iconButtonNoRingFocusClass } from '@/components/ui/icon-button-styles'
-import {
-  DEFAULT_SHORTCUTS,
-  SHORTCUT_CATEGORY_LABELS,
-} from '@/lib/shortcut-defaults'
+import { DEFAULT_SHORTCUTS, SHORTCUT_CATEGORY_LABELS } from '@/lib/shortcut-defaults'
 import type { ShortcutCategory } from '@/lib/shortcut-defaults'
-import {
-  getAcceleratorDisplay,
-  getActiveAccelerator,
-  isMac,
-} from '@/lib/shortcut-registry'
+import { getAcceleratorDisplay, getActiveAccelerator, isMac } from '@/lib/shortcut-registry'
 
 interface ShortcutGuideItem {
   id: string
@@ -42,7 +42,6 @@ const SHORTCUT_DISPLAY_ORDER: Record<ShortcutCategory, readonly string[]> = {
     'zoom-out',
     'reset-zoom',
     'open-settings',
-    'toggle-mode',
     'close-tab',
     'toggle-right-panel',
   ],
@@ -55,14 +54,13 @@ const SHORTCUT_DISPLAY_ORDER: Record<ShortcutCategory, readonly string[]> = {
     'toggle-preview-panel',
   ],
   edit: [
-    'clear-context',
     'stop-generation',
     'send-message',
     'insert-line-break',
     'editor-bold',
     'editor-strikethrough',
   ],
-  global: ['quick-task', 'show-main-window', 'voice-dictation'],
+  global: ['quick-task', 'quick-capture-todo', 'show-main-window', 'voice-dictation'],
 }
 
 const CATEGORY_ICONS: Record<ShortcutCategory, React.ComponentType<{ className?: string }>> = {

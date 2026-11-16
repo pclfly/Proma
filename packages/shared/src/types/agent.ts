@@ -1,5 +1,6 @@
-import { isGpt6AstraFamily, isGpt6LunaFamily, isGpt6SolFamily } from '../utils/model-family'
+import { isGpt61SolFamily, isGpt61TerraFamily, isGpt6AstraFamily, isGpt6LunaFamily, isGpt6SolFamily } from '../utils/model-family'
 import type { ProviderType } from './channel'
+import type { EnterpriseSkillSource } from './enterprise-skills'
 
 /**
  * Agent 相关类型定义
@@ -27,6 +28,11 @@ export interface AgentWorkspace {
   projectRootPath?: string
   /** 本地项目根目录的运行时状态；Proma 托管项目不设置此字段。 */
   projectRootStatus?: LocalProjectRootStatus
+  /**
+   * 项目是否已归档收起。
+   * 归档只改变侧边栏展示分组，不删除会话、不移动项目目录，可一键恢复。
+   */
+  archived?: boolean
   /** 创建时间戳 */
   createdAt: number
   /** 更新时间戳 */
@@ -78,6 +84,14 @@ export type AgentThinkingLevel = 'off' | 'minimal' | 'low' | 'medium' | 'high' |
 
 // Model-specific reasoning profiles and level normalization live in reasoning-profile.ts.
 
+/** Codex 请求速度档位；与官方 0.21.88 对齐，standard 表示不注入 service tier。 */
+export const CODEX_SPEEDS = ['standard', 'fast', 'ultrafast'] as const
+export type CodexSpeed = typeof CODEX_SPEEDS[number]
+
+export function isCodexSpeed(value: unknown): value is CodexSpeed {
+  return value === 'standard' || value === 'fast' || value === 'ultrafast'
+}
+
 /** 支持 ChatGPT Codex Fast Mode（priority service tier）的模型。 */
 export const CODEX_FAST_MODE_MODEL_IDS = [
   'gpt-5.4',
@@ -88,14 +102,44 @@ export const CODEX_FAST_MODE_MODEL_IDS = [
   'gpt-6-astra',
   'gpt-6-sol',
   'gpt-6-luna',
+  'gpt-6.1-terra',
+  'gpt-6.1-sol',
 ] as const
 
 /** 模型 ID 是否可通过 ChatGPT Codex OAuth 使用 Fast Mode。 */
 export function isCodexFastModeSupportedModel(modelId: string | undefined): boolean {
-  return isGpt6AstraFamily(modelId)
+  return isGpt61TerraFamily(modelId)
+    || isGpt6AstraFamily(modelId)
     || isGpt6SolFamily(modelId)
     || isGpt6LunaFamily(modelId)
+    || isGpt61SolFamily(modelId)
     || (modelId !== undefined && (CODEX_FAST_MODE_MODEL_IDS as readonly string[]).includes(modelId.toLowerCase()))
+}
+
+/** 某模型可选的速度档位；ultrafast 仅 Astra 与 6.1 Sol 支持。 */
+export function getCodexSpeeds(modelId: string | undefined): CodexSpeed[] {
+  if (isGpt6AstraFamily(modelId) || isGpt61SolFamily(modelId)) return ['standard', 'fast', 'ultrafast']
+  return isCodexFastModeSupportedModel(modelId) ? ['standard', 'fast'] : ['standard']
+}
+
+/** 该模型在该速度下是否真的会注入 service tier。 */
+export function isCodexSpeedSupportedModel(speed: CodexSpeed, modelId: string | undefined): boolean {
+  return getCodexSpeeds(modelId).includes(speed)
+}
+
+/**
+ * 解析实际生效的速度。
+ * 优先级：显式 codexSpeed > 旧 codexFastMode=true（等价 fast）> standard。
+ * 模型不支持该档位时回退 standard，避免发送无效 service_tier。
+ */
+export function resolveCodexSpeed(
+  settings: { codexSpeed?: unknown; codexFastMode?: boolean } | undefined,
+  modelId: string | undefined,
+): CodexSpeed {
+  const speed: CodexSpeed = isCodexSpeed(settings?.codexSpeed)
+    ? settings.codexSpeed
+    : settings?.codexFastMode === true ? 'fast' : 'standard'
+  return isCodexSpeedSupportedModel(speed, modelId) ? speed : 'standard'
 }
 
 /**
@@ -175,6 +219,11 @@ export interface JsonSchemaOutputFormat {
 export interface SDKTextBlock {
   type: 'text'
   text: string
+  /**
+   * OpenAI Responses 的文本阶段。`final_answer` 表示该块是本轮最终回复，
+   * 渲染层必须把它放在折叠的过程组之外；`commentary` 属于过程。
+   */
+  phase?: 'commentary' | 'final_answer'
 }
 
 /** SDK 工具调用内容块 */
@@ -236,6 +285,22 @@ export interface SDKAssistantMessage {
   _channelModelId?: string
   /** 渠道 provider，用于按 Agent SDK 实际运行窗口计算压缩阈值 */
   _channelProvider?: ProviderType
+  /**
+   * 首 token 延迟（ms）：请求发出到第一个内容增量到达。
+   * 由 Pi 适配器实测，缺失时状态栏不展示 TTFT。
+   */
+  _ttftMs?: number
+  /**
+   * 解码耗时（ms）：首 token 到消息结束。输出速度按 output_tokens / _decodeMs 计算，
+   * 把首 token 等待排除在分母之外，避免长 prompt 把速度拉低。
+   */
+  _decodeMs?: number
+  /**
+   * 本轮墙钟耗时（ms）：仅在「没有 result 结算」的轮次（用户停止、TypedError 中断）
+   * 挂到最后一条 assistant 上。状态栏工具用时 = 轮次墙钟 − 模型解码耗时。
+   * 有 result 的轮次用 result._durationMs 结算，不会写该字段，避免重复计时。
+   */
+  _turnDurationMs?: number
 }
 
 /** SDK user 消息 */
@@ -293,12 +358,22 @@ export interface SDKResultMessage {
   background_tasks?: SDKBackgroundTaskSummary[]
   session_crons?: SDKSessionCronSummary[]
   session_id?: string
+  /**
+   * SDK 消息唯一标识。result 也有，用于实时流与落盘快照按 uuid 去重，
+   * 避免同一轮的计时/token 被折叠两遍。
+   */
+  uuid?: string
   /** Skills successfully loaded during this result's turn. */
   skill_activations?: SkillActivation[]
   /** 渠道配置的模型 ID，用于缺失 modelUsage.contextWindow 时按 Agent SDK 运行窗口兜底 */
   _channelModelId?: string
   /** 渠道 provider，用于按 Agent SDK 实际运行窗口计算压缩阈值 */
   _channelProvider?: ProviderType
+  /**
+   * 本轮墙钟耗时（ms）：prompt 发出到 result 到达。编排器在 result 到达时立刻结算，
+   * 实时流与落盘共用同一个值；状态栏工具用时 = 各轮墙钟合计 − 模型解码耗时。
+   */
+  _durationMs?: number
 }
 
 /** SDK system 消息（init / compact_boundary / permission_denied / task_started / task_progress / task_notification） */
@@ -518,6 +593,8 @@ export interface RetryAttempt {
   timestamp: number
   /** 错误原因（简短描述，如"SDK 响应超时"） */
   reason: string
+  /** 稳定性原因分类（connection / rate_limited / service 等，供 UI 与日志使用） */
+  reasonKind?: string
   /** 完整错误消息 */
   errorMessage: string
   /** stderr 输出（可选） */
@@ -642,7 +719,7 @@ export type PromaEvent =
   /** 普通桌面会话已开始执行；startedAt 用于展示，runGeneration 是主进程单调递增的可靠代际。 */
   | { type: 'run_started'; startedAt: number; runGeneration?: number }
   /** 普通桌面会话已结束；供已显式配置的外部通知通道发送摘要。 */
-  | { type: 'run_completed'; source: AgentExternalRunSource | 'desktop'; stoppedByUser: boolean; startedAt?: number; runGeneration?: number }
+  | { type: 'run_completed'; source: AgentExternalRunSource | 'desktop'; stoppedByUser: boolean; startedAt?: number; runGeneration?: number; error?: string; resultSubtype?: string; resultErrors?: string[]; finalAssistantUuid?: string }
   | { type: 'run_resumed'; sessionId: string }
   /** 用户主动停止当前执行；startedAt 防止旧运行的终态覆盖新一轮执行。 */
   | { type: 'run_stopped'; startedAt?: number; runGeneration?: number }
@@ -650,6 +727,10 @@ export type PromaEvent =
   | { type: 'delegation_blocked'; delegationId: string; blockedEvent: unknown }
   // 自动任务会话被用户接管（毕业）
   | { type: 'automation_graduated' }
+  /** 仅由受控 write/edit 提交凭据产生；fs.watch 刷新事件永远不带此类型。 */
+  | { type: 'knowledge_file_changed'; change: import('./knowledge-change').AttributedKnowledgeChange }
+  /** 同步记忆/项目规则工具执行前后真实文件变化；不表示工作区知识提交凭据。 */
+  | { type: 'knowledge_changed'; changes: import('./knowledge-change').TrackedKnowledgeChange[] }
 
 /** 外部入口触发 Agent 运行的来源 */
 export type AgentExternalRunSource = 'feishu' | 'dingtalk' | 'wechat' | 'slack' | 'bridge' | 'delegation'
@@ -727,6 +808,20 @@ export interface SetAgentSessionActiveWorktreeInput {
  * 存储在 ~/.proma/agent-sessions.json 中，
  * 类似 ConversationMeta，独立存储。
  */
+/** 会话检出历史：记录用户显式选择过的 linked worktree，移除后可据此恢复。 */
+export interface SessionCheckoutHistoryEntry {
+  /** 当时可用的 worktree 绝对路径 */
+  path: string
+  /** worktree 所属主仓库根目录 */
+  repositoryRoot?: string
+  /** 分支名 */
+  branch?: string
+  /** 选择时的 HEAD commit，恢复时用于核对 */
+  baseCommit?: string
+  /** 记录时间 */
+  recordedAt: number
+}
+
 export interface AgentSessionMeta {
   /** 会话唯一标识 */
   id: string
@@ -747,7 +842,12 @@ export interface AgentSessionMeta {
     sourceRuntime: 'claude'
     continuationRequired: true
   }
-  /** ChatGPT Codex Fast Mode 开关；仅 Pi + ChatGPT OAuth 的受支持模型实际生效。 */
+  /**
+   * ChatGPT Codex 速度档；仅 Pi + ChatGPT OAuth 的受支持模型实际生效。
+   * 官方 0.21.67-12：取代旧 codexFastMode 布尔值并跨重启保留。
+   */
+  codexSpeed?: CodexSpeed
+  /** @deprecated 使用 codexSpeed；保留以读取历史会话数据。 */
   codexFastMode?: boolean
   /** 本会话的推理深度；未设置时兼容旧版全局思考设置。 */
   reasoningLevel?: AgentThinkingLevel
@@ -765,6 +865,8 @@ export interface AgentSessionMeta {
    * worktree 失效时主进程会主动清除，不会猜测切换到其它分支。
    */
   activeWorktree?: AgentActiveWorktree
+  /** 有界检出历史（最多 20 条，最近一次在末尾）；用于找回被移除的 worktree。 */
+  checkoutHistory?: SessionCheckoutHistoryEntry[]
   /**
    * 会话私有工作台的文件布局。新会话在 workbench 根目录直接存放计划、handoff
    * 等私有资料；缺失字段的历史会话保留 `.context/` 路径以兼容工具历史。
@@ -774,6 +876,8 @@ export interface AgentSessionMeta {
   pinned?: boolean
   /** 是否已星标（仅用于侧栏快速识别，不影响排序或置顶） */
   starred?: boolean
+  /** 收藏时间；用于“按收藏时间”排序。旧数据缺失时回退到更新时间。 */
+  starredAt?: number
   /** 是否已归档 */
   archived?: boolean
   /**
@@ -802,6 +906,15 @@ export interface AgentSessionMeta {
   stoppedByUser?: boolean
   /** 该会话当前的权限模式（持久化到磁盘，重启后恢复）。未设置时新会话默认 auto */
   permissionMode?: PromaPermissionMode
+  /**
+   * 该会话是否启用破甲。会话级，不继承全局设置。
+   *
+   * - 未设置 = 关闭。新建会话永远不会自动继承开启状态，用户必须显式开启。
+   * - 与 `settings.personalDirective.enabled` 的关系：后者只提供正文与技能根
+   *   （即「破甲装了什么」），本字段决定「本会话用不用」。两者都开才注入。
+   * - 关闭本字段不会卸载技能根与 MCP 配置，只是不再注入提示词。
+   */
+  armorEnabled?: boolean
   /** 来源定时任务 ID（该会话由定时任务自动创建/复用时标记，用于侧栏显示钟表图标 + 跳转设置） */
   sourceAutomationId?: string
   /**
@@ -819,12 +932,30 @@ export interface AgentSessionMeta {
   delegationRole?: AgentDelegationRole
   /** 委派任务当前状态 */
   delegationStatus?: AgentDelegationStatus
+  /** 最新接受运行的主进程代际（跨重启从此值继续递增）。 */
+  delegationRunGeneration?: number
+  delegationStartedAt?: number
+  delegationCompletedAt?: number
+  delegationError?: string
+  /** 最新一轮最终正文引用；空字符串表示该轮没有正文，不回退旧历史。 */
+  delegationResultUuid?: string
+  /** 当前 delegation attempt；续跑会生成新的 attemptId。 */
+  delegationAttemptId?: string
+  /** 当前协作 scope；用于跨轮次收口、截止时间和凭据去重。 */
+  collaborationScope?: AgentCollaborationScopeSnapshot
   /** 委派深度；手动会话为 undefined，首层子会话为 1 */
   delegationDepth?: number
   /** 委派目标摘要，便于 UI 展示和追溯 */
   delegationGoal?: string
   /** 创建时间戳 */
   createdAt: number
+  /**
+   * 最近一次真实对话活动时间戳。
+   *
+   * 官方 0.22.0：侧栏排序只认活动时间。标题、模型、思考档位等元数据更新
+   * 只推进 `updatedAt`，不能把会话顶到列表最前面。缺失时回退到 `updatedAt`。
+   */
+  lastActivityAt?: number
   /** 更新时间戳 */
   updatedAt: number
 }
@@ -834,6 +965,41 @@ export type AgentDelegationRole = 'explore' | 'research' | 'implement' | 'review
 
 /** Agent 委派子会话的运行状态（interrupted：应用退出时仍在运行，重启后无法续跑） */
 export type AgentDelegationStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
+
+/** 协作 attempt 的不可变身份快照；用于续跑后仍能识别旧 attempt 已被替代。 */
+export interface AgentCollaborationAttemptSnapshot {
+  parentSessionId?: string
+  childSessionId?: string
+  channelId?: string
+  modelId?: string
+  thinkingLevel?: AgentThinkingLevel
+  thinkingLevelSemantics?: string
+  title?: string
+  role?: AgentDelegationRole
+  goal?: string
+  startedAt?: number
+}
+
+/** 当前协作 scope 引用的一次 delegation attempt。 */
+export interface AgentCollaborationDependency {
+  delegationId: string
+  attemptId: string
+  attemptSnapshot?: AgentCollaborationAttemptSnapshot
+}
+
+/**
+ * 父会话持久化的协作 scope。
+ * deadline/rounds 防止自动续跑无限进行；delivered 记录已投递凭据，避免重复回填。
+ */
+export interface AgentCollaborationScopeSnapshot {
+  scopeId: string
+  deadline: number
+  rounds: number
+  dependencies: AgentCollaborationDependency[]
+  delivered: string[]
+  closed: boolean
+  cancelled?: boolean
+}
 
 /**
  * Agent 持久化消息
@@ -1122,6 +1288,8 @@ export interface SkillMeta {
   enabled: boolean
   /** 如果此 Skill 是从其他工作区导入的，则携带来源信息 */
   importSource?: SkillImportSource
+  /** 如果此 Skill 来自企业 Skills 库，则携带企业来源信息 */
+  enterpriseSource?: EnterpriseSkillSource
   /** 是否有可用更新（源 Skill 版本 > importSource.sourceVersion） */
   hasUpdate?: boolean
 }
@@ -1181,6 +1349,26 @@ export interface SkillFileNode {
   children?: SkillFileNode[]
 }
 
+/** 知识链接权限状态；不包含未授权目标的正文或元数据。 */
+export interface WorkspaceKnowledgeAccessState {
+  isSymbolicLink?: boolean
+  linkState?: 'authorized' | 'unauthorized' | 'broken' | 'cycle'
+  blockedReason?: string
+}
+
+/** 记忆专用树节点；普通 Skill 树不改变语义。 */
+export interface WorkspaceMemoryFileNode extends SkillFileNode, WorkspaceKnowledgeAccessState {
+  children?: WorkspaceMemoryFileNode[]
+}
+
+/** 知识文件保存结果：成功后可直接用于下一次保存的票据。 */
+export interface WorkspaceKnowledgeWriteResult {
+  /** 与实际提交目标绑定的后继票据；未签发表示目标已变化，必须重新打开。 */
+  revision?: string
+  requiresReopen?: boolean
+  physicalPath?: string
+}
+
 /** 读取 Skill 子文件的响应 */
 export interface SkillFileContent {
   relativePath: string
@@ -1190,6 +1378,12 @@ export interface SkillFileContent {
   isText: boolean
   /** 文件大小（字节） */
   size: number
+  /** 是否为已授权的符号链接（知识文件才可能设置） */
+  isSymbolicLink?: boolean
+  /** 链接权限状态；已授权时才会返回正文 */
+  linkState?: WorkspaceKnowledgeAccessState['linkState']
+  /** 保存票据：绑定本次打开时的物理目标、授权边界与内容，换向/撤销后拒绝保存 */
+  revision?: string
 }
 
 /** 当前 Memory 页面订阅到的单个文件更新；仅携带受限的局部文本 diff。 */
@@ -1199,6 +1393,8 @@ export interface WorkspaceMemoryFileChange {
   changedAt: number
   /** 超大或二进制文件仍会通知更新，但不传内容或 diff。 */
   diffAvailable: boolean
+  /** 权限变更只发无正文刷新；接收方须清空此前正文和目录缓存。 */
+  accessChanged?: boolean
   preview?: string
   diff?: {
     context: string[]
@@ -1209,7 +1405,7 @@ export interface WorkspaceMemoryFileChange {
 }
 
 /** 工作区记忆文件摘要 */
-export interface WorkspaceMemoryFileSummary {
+export interface WorkspaceMemoryFileSummary extends WorkspaceKnowledgeAccessState {
   /** 文件是否存在 */
   exists: boolean
   /** 绝对路径 */
@@ -1218,6 +1414,39 @@ export interface WorkspaceMemoryFileSummary {
   size: number
   /** 最近修改时间戳 */
   updatedAt?: number
+}
+
+/** 附件读取必须绑定到发起请求的 Agent 会话。 */
+export interface AgentAttachmentReadContext {
+  kind: 'agent'
+  sessionId: string
+}
+
+/** 全局用户画像（所有项目共享）。 */
+export interface GlobalUserProfile {
+  path: string
+  revision: string
+  content: string | null
+  modifiedAt?: number
+  checkedAt?: number
+  /** 发现的旧画像来源数量。 */
+  legacyCount: number
+  /** 未完成的旧画像迁移数量。 */
+  pendingCount: number
+  migrationIssues: Array<{ path: string; message: string }>
+}
+
+export interface GlobalProfileHistoryEntry {
+  revision: string
+  savedAt?: number
+  summary?: string
+  chars: number
+  current: boolean
+}
+
+export interface GlobalProfileHistoryVersion {
+  revision: string
+  content: string
 }
 
 /** 工作区记忆摘要 */
@@ -1240,7 +1469,11 @@ export interface WorkspaceMemorySummary {
     symbolicLinkPath?: string
   }
   /** Proma 工作区长期记忆目录。 */
+  /** 工作区级附加目录，同时授权该工作区的 Agent；撤销不是删除。 */
+  authorizedDirectories?: string[]
   autoMemory: {
+    access?: WorkspaceKnowledgeAccessState
+    truncated?: boolean
     /** 绝对目录路径 */
     directory: string
     /** MEMORY.md 是否存在 */
@@ -1371,7 +1604,7 @@ export interface AgentQueuedMessageControlInput {
   messageId: string
 }
 
-/** 提升队列消息为立即发送的输入（主进程原子执行：出队 → 尽力注入 → 否则直接启动 run） */
+/** 提升队列消息为立即发送的输入（优先同轮注入，否则移到队首等待安全启动） */
 export interface AgentPromoteQueuedMessageInput extends AgentQueuedMessageControlInput {
   /** 注入活跃通道时是否软中断当前 turn */
   interrupt?: boolean
@@ -1382,9 +1615,10 @@ export interface AgentPromoteQueuedMessageResult {
   /**
    * injected：已注入当前活跃 Agent；
    * dispatched：已作为新一轮 run 启动（started 事件已推送）；
+   * queued：消息保留在队首，等待旧轮收尾、背景任务或可用主窗口；
    * not_found：消息已不在队列中（已开始发送或已被取消）。
    */
-  disposition: 'injected' | 'dispatched' | 'not_found'
+  disposition: 'injected' | 'dispatched' | 'queued' | 'not_found'
 }
 
 export interface AgentMoveQueuedMessageInput {
@@ -1838,12 +2072,14 @@ export const AGENT_IPC_CHANNELS = {
   UPDATE_SESSION_MODEL: 'agent:update-session-model',
   /** 选择或清除当前会话的活动 worktree */
   SET_ACTIVE_WORKTREE: 'agent:set-active-worktree',
+  /** 列出可从检出历史恢复的 worktree */
+  GET_RESTORABLE_WORKTREES: 'agent:get-restorable-worktrees',
+  /** 按检出历史重建被移除的 worktree */
+  RESTORE_WORKTREE: 'agent:restore-worktree',
   /** 主进程通知 Renderer：Agent 主动切换了会话的活动 worktree */
   ACTIVE_WORKTREE_UPDATED: 'agent:active-worktree-updated',
   /** 删除会话 */
   DELETE_SESSION: 'agent:delete-session',
-  /** 迁移 Chat 对话记录到 Agent 会话 */
-  MIGRATE_CHAT_TO_AGENT: 'agent:migrate-chat-to-agent',
   /** 切换会话置顶状态 */
   TOGGLE_PIN: 'agent:toggle-pin',
   /** 切换会话星标状态 */
@@ -1898,6 +2134,7 @@ export const AGENT_IPC_CHANNELS = {
   SELECT_BROWSER_TAB: 'agent:select-browser-tab',
   CLOSE_BROWSER_TAB: 'agent:close-browser-tab',
   GET_BROWSER_STATE: 'agent:get-browser-state',
+  GET_BROWSER_PREVIEW: 'agent:get-browser-preview',
   SET_BROWSER_LAYOUT: 'agent:set-browser-layout',
   MINIMIZE_BROWSER: 'agent:minimize-browser',
   NAVIGATE_BROWSER: 'agent:navigate-browser',
@@ -1907,6 +2144,13 @@ export const AGENT_IPC_CHANNELS = {
   CLOSE_BROWSER: 'agent:close-browser',
   BROWSER_STATE_CHANGED: 'agent:browser-state-changed',
   BROWSER_TAB_FOCUSED: 'agent:browser-tab-focused',
+
+  // 全局用户画像（所有项目共享）
+  READ_GLOBAL_PROFILE: 'agent:read-global-profile',
+  WRITE_GLOBAL_PROFILE: 'agent:write-global-profile',
+  READ_GLOBAL_PROFILE_HISTORY: 'agent:read-global-profile-history',
+  READ_GLOBAL_PROFILE_HISTORY_VERSION: 'agent:read-global-profile-history-version',
+  RESTORE_GLOBAL_PROFILE_HISTORY: 'agent:restore-global-profile-history',
 
   // 工作区能力（MCP + Skill）
   /** 获取工作区能力摘要 */
@@ -2001,6 +2245,10 @@ export const AGENT_IPC_CHANNELS = {
   /** 当前 workspace memory/ 文件发生变化。 */
   WORKSPACE_MEMORY_FILE_CHANGED: 'agent:workspace-memory-file-changed',
   APPROVE_WORKSPACE_PROJECT_KNOWLEDGE_MAINTENANCE: 'agent:approve-workspace-project-knowledge-maintenance',
+  /** 用户经系统文件夹选择器显式授权外置知识目录；不接受 renderer 传入路径。 */
+  AUTHORIZE_WORKSPACE_KNOWLEDGE_DIRECTORY: 'agent:authorize-workspace-knowledge-directory',
+  /** 撤销工作区附加目录授权（不删除任何文件）。 */
+  REVOKE_WORKSPACE_KNOWLEDGE_DIRECTORY: 'agent:revoke-workspace-knowledge-directory',
 
   // 流式事件（主进程 → 渲染进程推送）
   /** Agent 流式事件 */
@@ -2099,9 +2347,18 @@ export const AGENT_IPC_CHANNELS = {
   PERMISSION_RESPOND: 'agent:permission:respond',
   /** 热切换指定会话的权限模式（运行中生效，不广播到其他会话） */
   UPDATE_SESSION_PERMISSION_MODE: 'agent:update-session-permission-mode',
+  /**
+   * 切换指定会话的破甲开关（下一次请求生效，不广播到其他会话）。
+   *
+   * 与全局 `personalDirective.enabled` 的关系：那个决定「装了什么」，
+   * 这个决定「本会话用不用」。新建会话默认关闭。
+   */
+  UPDATE_SESSION_ARMOR: 'agent:update-session-armor',
   /** 切换指定会话的 Agent runtime（下一轮生效，跨 runtime 时清空 SDK resume ID） */
-  /** 切换指定会话的 ChatGPT Codex Fast Mode（下一轮 Pi 请求生效） */
+  /** @deprecated 使用 UPDATE_SESSION_CODEX_SPEED；保留以兼容旧调用方。 */
   UPDATE_SESSION_CODEX_FAST_MODE: 'agent:update-session-codex-fast-mode',
+  /** 切换指定会话的 ChatGPT Codex 速度档（下一轮 Pi 请求生效） */
+  UPDATE_SESSION_CODEX_SPEED: 'agent:update-session-codex-speed',
   /** 查询 Pi catalog 或专属 profile 支持的会话级推理档位 */
   GET_PI_REASONING_CAPABILITY: 'agent:get-pi-reasoning-capability',
   /** 更新指定会话的推理深度（下一轮 Pi 请求生效） */

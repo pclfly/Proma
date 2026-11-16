@@ -25,18 +25,17 @@ export function WelcomeView(): React.ReactElement {
   const draftSessionIds = useAtomValue(draftSessionIdsAtom)
   const [tabs, setTabs] = useAtom(tabsAtom)
   const setActiveTabId = useSetAtom(activeTabIdAtom)
-  const { createChat, createAgent } = useCreateSession()
+  const { createAgent } = useCreateSession()
   const initRef = React.useRef<string | null>(null)
 
   // 将高频变化的值收集到 ref 中，避免污染 useEffect 依赖数组（否则 tabs/draftSessionIds
-  // 引用变化会导致重复触发，而 createChat/createAgent 每次渲染都是新引用）
+  // 引用变化会导致重复触发，而 createAgent 每次渲染都是新引用）
   const latestRef = React.useRef({
     tabs,
     draftSessionIds,
     currentWorkspaceId,
     setTabs,
     setActiveTabId,
-    createChat,
     createAgent,
   })
   latestRef.current = {
@@ -45,7 +44,6 @@ export function WelcomeView(): React.ReactElement {
     currentWorkspaceId,
     setTabs,
     setActiveTabId,
-    createChat,
     createAgent,
   }
 
@@ -59,52 +57,8 @@ export function WelcomeView(): React.ReactElement {
     const currentMode = mode
     initRef.current = mode
 
-    // 从后端 IPC 拿最新数据，避免 HMR 导致 atoms 重置为空时重复创建会话
-    if (currentMode === 'chat') {
-      window.electronAPI.listConversations().then((freshConversations) => {
-        // 如果 mode 已切换，丢弃过期回调
-        if (initRef.current !== currentMode) return
-        const {
-          tabs: currentTabs,
-          draftSessionIds: currentDrafts,
-          setTabs: currentSetTabs,
-          setActiveTabId: currentSetActiveTabId,
-          createChat: currentCreateChat,
-        } = latestRef.current
-
-        // 1. 优先复用现有非归档、非 draft 会话
-        const existing = freshConversations.find(
-          (c) => !c.archived && !currentDrafts.has(c.id),
-        )
-        if (existing) {
-          const result = openTab(currentTabs, {
-            type: 'chat',
-            sessionId: existing.id,
-            title: existing.title,
-          })
-          currentSetTabs(result.tabs)
-          currentSetActiveTabId(result.activeTabId)
-          return
-        }
-        // 2. 检查是否已有 draft 会话，复用而不是创建新的
-        const draftSession = freshConversations.find(
-          (c) => !c.archived && currentDrafts.has(c.id),
-        )
-        if (draftSession) {
-          const result = openTab(currentTabs, {
-            type: 'chat',
-            sessionId: draftSession.id,
-            title: draftSession.title,
-          })
-          currentSetTabs(result.tabs)
-          currentSetActiveTabId(result.activeTabId)
-          return
-        }
-        // 3. 没有任何会话时才创建新的 draft 会话
-        currentCreateChat({ draft: true })
-      }).catch(console.error)
-    } else {
-      window.electronAPI.listActiveAgentSessions().then((freshSessions) => {
+    // Chat 已退役：欢迎页只为 Agent 会话恢复/创建标签，历史 Chat 数据不被读取。
+    window.electronAPI.listActiveAgentSessions().then((freshSessions) => {
         // 如果 mode 已切换，丢弃过期回调
         if (initRef.current !== currentMode) return
         const {
@@ -147,8 +101,7 @@ export function WelcomeView(): React.ReactElement {
         }
         // 没有任何会话时才创建新的 draft 会话
         currentCreateAgent({ draft: true })
-      }).catch(console.error)
-    }
+    }).catch(console.error)
   }, [mode, agentSettingsReady])
 
   // 短暂的过渡状态（通常几十毫秒内就会被 TabContent 替换）

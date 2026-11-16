@@ -5,19 +5,23 @@
  * 与 Proma Agent sessionId 的映射保存到本地 JSON 文件。
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import { writeJsonFileAtomic } from './safe-file'
+import { createBridgeWorkspaceSwitchJournal, type BridgeWorkspaceSwitchJournal } from './bridge-workspace-switch'
 import type { BridgeChatBinding } from './bridge-command-handler'
 import { redactSensitiveLogValue } from './bridge-log-redaction'
 
 export interface BridgeChatBindingStore {
   load(): BridgeChatBinding[]
   save(bindings: BridgeChatBinding[]): void
+  workspaceSwitchJournal?: BridgeWorkspaceSwitchJournal
 }
 
 export function createJsonBridgeChatBindingStore(filePath: string, logPrefix: string): BridgeChatBindingStore {
   return {
     load: () => loadBridgeChatBindings(filePath, logPrefix),
     save: (bindings) => saveBridgeChatBindings(filePath, bindings, logPrefix),
+    workspaceSwitchJournal: createBridgeWorkspaceSwitchJournal(filePath),
   }
 }
 
@@ -41,9 +45,10 @@ export function loadBridgeChatBindings(filePath: string, logPrefix: string): Bri
 
 export function saveBridgeChatBindings(filePath: string, bindings: BridgeChatBinding[], logPrefix: string): void {
   try {
-    writeFileSync(filePath, JSON.stringify(bindings, null, 2), 'utf-8')
+    writeJsonFileAtomic(filePath, bindings)
   } catch (error) {
     console.error(`[${logPrefix}] 保存聊天绑定失败:`, redactSensitiveLogValue(error))
+    throw error
   }
 }
 

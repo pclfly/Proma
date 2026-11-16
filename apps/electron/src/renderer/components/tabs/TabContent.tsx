@@ -1,14 +1,14 @@
 /**
  * TabContent — 标签内容渲染器
  *
- * 根据标签类型渲染参数化的 ChatView 或 AgentView。
- * 直接传递 sessionId/conversationId prop，无需桥接全局 atoms。
+ * 根据标签类型渲染Agent会话或文件预览。
+ * 直接传递 sessionId prop，无需桥接全局 atoms。
  */
 
 import * as React from 'react'
 import { useAtomValue } from 'jotai'
 import { tabsAtom } from '@/atoms/tab-atoms'
-import { ChatView } from '@/components/chat'
+
 import { AgentView } from '@/components/agent'
 import { PreviewTabContent } from '@/components/diff/PreviewTabContent'
 import { TabErrorBoundary } from './TabErrorBoundary'
@@ -36,13 +36,7 @@ export function TabContent({ tabId }: TabContentProps): React.ReactElement {
     )
   }
 
-  if (tab.type === 'chat') {
-    return (
-      <TabErrorBoundary key={tab.sessionId} sessionId={tab.sessionId}>
-        <ChatView conversationId={tab.sessionId} />
-      </TabErrorBoundary>
-    )
-  }
+  
 
   if (tab.type === 'preview') {
     return (

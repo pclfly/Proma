@@ -188,11 +188,11 @@ function main(): void {
   printStepResult(results[results.length - 1])
   if (!results[results.length - 1].success) return printSummary(results)
 
-  // ── 步骤 2: 构建主进程 ──
+  // ── 步骤 2: 统一构建主进程/运行时并审计，避免快速打包绕过门禁 ──
   step++
-  printStepStart(step, totalSteps, '构建主进程 (esbuild)')
+  printStepStart(step, totalSteps, '构建主进程与运行时 (esbuild)')
   results.push(
-    runStep('构建主进程', 'bun', ['run', 'build:main'], { verbose: opts.verbose })
+    runStep('构建主进程与运行时', 'bun', ['run', 'build:runtime'], { verbose: opts.verbose })
   )
   printStepResult(results[results.length - 1])
   if (!results[results.length - 1].success) return printSummary(results)

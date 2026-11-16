@@ -1,4 +1,4 @@
-import { inferReasoningTransport, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningProfile, type AgentSessionMeta, type AgentThinkingLevel, type ProviderType, type ReasoningCapability } from '@proma/shared'
+import { inferReasoningTransport, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningProfile, type AgentSessionMeta, type AgentThinkingLevel, type ProviderType, type ReasoningCapability, type ReasoningProfileConfigData } from '@proma/shared'
 import type { AppSettings } from '../../types'
 
 type ThinkingSettings = Pick<AppSettings, 'agentThinking' | 'agentEffort'>
@@ -10,10 +10,14 @@ export function resolvePiThinkingLevel(
   provider: ProviderType | undefined,
   modelId?: string,
   capability?: ReasoningCapability,
+  profiles?: readonly ReasoningProfileConfigData[],
 ): AgentThinkingLevel {
-  const reasoningProfile = resolveReasoningProfile({
+  if (provider === 'github-copilot' && !capability) return 'off'
+  // Copilot 同一渠道混用不同 API，档位以实际 catalog/profile capability 为准。
+  const reasoningProfile = provider === 'github-copilot' ? undefined : resolveReasoningProfile({
     modelId,
     transport: inferReasoningTransport(provider),
+    profiles,
   })
   if (reasoningProfile) {
     const persistedLevel = sessionMeta?.reasoningLevel ?? sessionMeta?.openAIThinkingLevel

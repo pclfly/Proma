@@ -189,6 +189,16 @@ export function getDingTalkBotById(botId: string): DingTalkBotConfig | undefined
   return config.bots.find((b) => b.id === botId)
 }
 
+/** 只修改默认项目；回滚到 undefined 时移除该字段，不重写凭据或渠道。 */
+export function updateDingTalkDefaultWorkspace(botId: string, workspaceId: string | undefined): void {
+  const config = readRawConfig()
+  const bot = config.bots.find((item) => item.id === botId)
+  if (!bot) throw new Error('钉钉 Bot 已不存在')
+  if (workspaceId === undefined) delete bot.defaultWorkspaceId
+  else bot.defaultWorkspaceId = workspaceId
+  writeJsonFileAtomic(getDingTalkConfigPath(), config)
+}
+
 /** 保存单个 Bot 配置（新建或更新），返回保存后的 Bot 配置 */
 export function saveDingTalkBotConfig(input: DingTalkBotConfigInput): DingTalkBotConfig {
   const config = readRawConfig()

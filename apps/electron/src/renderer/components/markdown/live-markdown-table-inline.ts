@@ -1,6 +1,7 @@
 import MarkdownIt from 'markdown-it'
 import { renderMarkdownMath } from '@/lib/markdown-math'
 import { isLikelyLiveMarkdownLatex } from './live-markdown-table'
+import { installInlineVaultWikiLinks } from './live-markdown-wikilink-inline'
 
 interface TableInlineEnvironment {
   breaks?: Array<{ from: number; to: number }>
@@ -9,6 +10,7 @@ interface TableInlineEnvironment {
 // 表格单元格是编辑按钮的一部分：只渲染内联格式，不引入嵌套链接、图片或任意 HTML。
 const markdown = new MarkdownIt({ html: false, breaks: true, linkify: false })
   .disable(['link', 'image', 'autolink'])
+installInlineVaultWikiLinks(markdown)
 
 markdown.inline.ruler.before('escape', 'table_math', (state, silent) => {
   const remaining = state.src.slice(state.pos, state.posMax)
@@ -66,6 +68,14 @@ export function liveMarkdownTableCellDraft(value: string): string {
   return draft.replace(/\r\n?/g, '\n')
 }
 
-export function renderLiveMarkdownTableInline(value: string): string {
-  return markdown.renderInline(value)
+export interface RenderLiveMarkdownTableInlineOptions {
+  /** 仅 Vault 阅读态开启；普通文件预览保持字面 [[双链]]。 */
+  vaultWikiLinks?: boolean
+}
+
+export function renderLiveMarkdownTableInline(
+  value: string,
+  options: RenderLiveMarkdownTableInlineOptions = {},
+): string {
+  return markdown.renderInline(value, { vaultWikiLinks: options.vaultWikiLinks === true })
 }

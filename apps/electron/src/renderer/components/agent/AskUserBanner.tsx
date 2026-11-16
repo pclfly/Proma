@@ -58,7 +58,6 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
     : 0
   const focusedOptIdx = requestDraft?.focusedOptIdx ?? -1
   const answers = requestDraft?.answers ?? createInitialDraft(questions).answers
-  const isLastTab = activeTab >= questions.length - 1
 
   // ===== Refs：确保 keydown handler 始终读取最新值，消除闭包过期问题 =====
   const activeTabRef = React.useRef(activeTab)
@@ -68,20 +67,8 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
   const focusedOptIdxRef = React.useRef(focusedOptIdx)
   focusedOptIdxRef.current = focusedOptIdx
   const submitRef = React.useRef<(() => void) | null>(null)
-  const autoAdvanceTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  const clearAutoAdvanceTimer = React.useCallback((): void => {
-    if (autoAdvanceTimerRef.current != null) {
-      clearTimeout(autoAdvanceTimerRef.current)
-      autoAdvanceTimerRef.current = null
-    }
-  }, [])
-
-  // 组件卸载时清理未触发的跳转定时器
-  React.useEffect(() => clearAutoAdvanceTimer, [clearAutoAdvanceTimer])
 
   React.useEffect(() => {
-    clearAutoAdvanceTimer()
     if (!request || questions.length === 0) return
     setDrafts((prev) => {
       const current = prev.get(request.requestId)
@@ -90,7 +77,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
       map.set(request.requestId, createInitialDraft(questions))
       return map
     })
-  }, [request?.requestId, questions, clearAutoAdvanceTimer, setDrafts])
+  }, [request?.requestId, questions, setDrafts])
 
   // 键盘导航：只在 requestId 变化时重建 handler，内部通过 ref 读取最新值
   React.useEffect(() => {
@@ -270,12 +257,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
     return a.selected.length > 0 || (a.showCustom && a.customText.trim().length > 0)
   })
 
-  const currentQuestion = questions[activeTab]
-  if (!currentQuestion) return null
-
-  const goNextTab = (): void => {
-    if (!isLastTab) setActiveTabByState((prev) => prev + 1)
-  }
+  if (questions.length === 0) return null
 
   return (
     <div className="ask-user-banner mx-4 mb-3 rounded-xl bg-card shadow-lg overflow-hidden animate-in slide-in-from-bottom-2 duration-200">
@@ -298,82 +280,62 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
           </div>
         </div>
 
-        {/* Tab 栏（多问题时显示） */}
         {questions.length > 1 && (
-          <div className="flex gap-1">
-            {questions.map((q, idx) => {
-              const isActive = idx === activeTab
-              const hasAnswer = getAnswer(idx).selected.length > 0
-                || (getAnswer(idx).showCustom && getAnswer(idx).customText.trim().length > 0)
-              return (
-                <button
-                  key={idx}
-                  type="button"
-                  className={`
-                    px-2.5 py-1 rounded-lg text-xs font-medium transition-all outline-none
-                    ${isActive
-                      ? 'bg-primary text-primary-foreground shadow-sm'
-                      : hasAnswer
-                        ? 'bg-primary/15 text-primary'
-                        : 'bg-muted/60 text-muted-foreground hover:bg-muted hover:text-foreground'
-                    }
-                  `}
-                  onClick={() => setActiveTabByState(idx)}
-                >
-                  {`${idx + 1}-${q.multiSelect ? '多选' : '单选'}：${q.header || `问题 ${idx + 1}`}`}
-                </button>
-              )
-            })}
-          </div>
+          <p className="text-xs text-muted-foreground">
+            共 {questions.length} 个问题，已合并为一张卡片；逐个选择后统一确认。
+          </p>
         )}
       </div>
 
-      {/* 当前问题内容 */}
-      <div className="px-4 pb-2">
-        <QuestionCard
-          question={currentQuestion}
-          questionIndex={activeTab}
-          answer={getAnswer(activeTab)}
-          focusedIndex={focusedOptIdx}
-          showBadge={questions.length === 1}
-          onToggleOption={(label) => {
-            toggleOptionByState(activeTab, currentQuestion, label)
-            if (!currentQuestion.multiSelect && !isLastTab) {
-              clearAutoAdvanceTimer()
-              autoAdvanceTimerRef.current = setTimeout(() => {
-                autoAdvanceTimerRef.current = null
-                setActiveTabByState((prev) => prev + 1)
-              }, 150)
-            }
-          }}
-          onToggleCustom={() => toggleCustomByState(activeTab)}
-          onCustomTextChange={(text) => updateAnswers((prev) => {
-            const map = new Map(prev)
-            const cur = map.get(activeTab) ?? EMPTY_ANSWER
-            map.set(activeTab, { ...cur, customText: text })
-            return map
-          })}
-          onSubmit={isLastTab ? handleSubmit : goNextTab}
-        />
+      {/* 同一请求的所有问题同屏展示，不再用 Tab 分页 */}
+      <div className="max-h-[min(60vh,520px)] space-y-2 overflow-y-auto px-4 pb-2 scrollbar-thin">
+        {questions.map((question, idx) => (
+          <div
+            key={idx}
+            onMouseDown={() => setActiveTabByState(idx)}
+            className={idx === activeTab ? 'rounded-lg ring-1 ring-primary/30' : undefined}
+          >
+            <QuestionCard
+              question={question}
+              questionIndex={idx}
+              answer={getAnswer(idx)}
+              focusedIndex={idx === activeTab ? focusedOptIdx : -1}
+              showBadge
+              onToggleOption={(label) => {
+                setActiveTabByState(idx)
+                toggleOptionByState(idx, question, label)
+              }}
+              onToggleCustom={() => {
+                setActiveTabByState(idx)
+                toggleCustomByState(idx)
+              }}
+              onCustomTextChange={(text) => updateAnswers((prev) => {
+                const map = new Map(prev)
+                const cur = map.get(idx) ?? EMPTY_ANSWER
+                map.set(idx, { ...cur, customText: text })
+                return map
+              })}
+              onSubmit={idx === questions.length - 1 ? handleSubmit : () => setActiveTabByState(idx + 1)}
+            />
+          </div>
+        ))}
       </div>
 
       {/* 底部 */}
       <div className="flex items-center justify-end gap-1.5 px-4 pb-3">
         <span className="text-[10px] text-muted-foreground/40 mr-auto">
-          ↑↓ 选择 · Enter {isLastTab ? '确认' : '下一个'}
+          ↑↓ 选择 · Enter 确认
         </span>
-        {isLastTab && (
-          <Button
-            variant="default"
-            size="sm"
-            onClick={handleSubmit}
-            disabled={submitting || !hasValidAnswers}
-            className="h-7 px-3 text-xs"
-          >
-            <Send className="size-3 mr-1" />
-            确认
-          </Button>
-        )}
+        <Button
+          variant="default"
+          size="sm"
+          onClick={handleSubmit}
+          disabled={submitting || !hasValidAnswers}
+          className="h-7 px-3 text-xs"
+        >
+          <Send className="size-3 mr-1" />
+          确认
+        </Button>
       </div>
     </div>
   )

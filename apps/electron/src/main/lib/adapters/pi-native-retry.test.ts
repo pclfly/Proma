@@ -52,6 +52,10 @@ describe('Pi native retry classifier', () => {
     expect(result.stopReason).toBe('stop')
   })
 
+  test.each(['request id abc429def', 'payload has 150024 bytes', 'uuid ff503a00'])('Given 非状态码数字 %s When 分类 Then 不误重试', (errorMessage) => {
+    expect(isRetryableAssistantError(failedAssistant(errorMessage))).toBe(false)
+  })
+
   test('does not broadly retry unrelated stream-ended errors', () => {
     expect(isRetryableAssistantError(
       failedAssistant('stream ended before the model emitted a local marker'),

@@ -39,13 +39,16 @@ export function injectOpenAIReasoningLevel(
     modelId,
     transport: 'openai-responses',
   })
+  // 不支持思考的模型交由 Pi 省略 reasoning，不能被历史档位重新打开。
+  if (profile?.reasoning === false) return payload
   const encoding = profile?.encodings['openai-responses']
   if (encoding?.kind !== 'openai-reasoning-effort' || !settings.thinkingLevel) return payload
 
   const normalizedLevel = normalizeReasoningLevel(profile, settings.thinkingLevel)
   if (!normalizedLevel) return payload
-  const effort = encoding.effortMap[normalizedLevel] ?? normalizedLevel
-  if (effort === null) return payload
+  const mapped = encoding.effortMap[normalizedLevel]
+  if (mapped === null) return payload
+  const effort = mapped ?? (normalizedLevel === 'off' ? 'none' : normalizedLevel)
 
   const existingReasoning = isReasoningPayload(payload.reasoning) ? payload.reasoning : {}
   // ChatGPT Codex OAuth does not accept reasoning.mode. Responses channels likewise
@@ -53,7 +56,7 @@ export function injectOpenAIReasoningLevel(
   const { mode: _unsupportedReasoningMode, ...reasoningWithoutMode } = existingReasoning
   const reasoning = {
     ...reasoningWithoutMode,
-    ...(effort === 'none' || existingReasoning.effort === undefined ? { effort } : {}),
+    effort,
   }
   return { ...payload, reasoning }
 }

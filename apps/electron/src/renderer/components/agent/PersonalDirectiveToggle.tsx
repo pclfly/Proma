@@ -1,99 +1,119 @@
 /**
- * PersonalDirectiveToggle — Agent「破甲」个人指令切换器
+ * PersonalDirectiveToggle — Agent「破甲」会话级开关
  *
- * 在 Agent 输入工具栏提供「破甲：开启 / 关闭」运行时开关。
- * 状态持久化到 settings.json 的 personalDirective.enabled；
- * 开启后主进程会把 personalDirective.content 追加进 Agent 系统提示词。
- * 开关只影响后续模型请求，不修改已经发出的请求。
+ * 破甲是**会话级**状态：每个会话独立维护，新建会话默认关闭。
+ *
+ * 分工：
+ * - `settings.personalDirective`（全局）决定「破甲装了什么」：正文、技能根、MCP 配置。
+ * - `sessionMeta.armorEnabled`（会话级）决定「本会话用不用」。
+ *   两者都开才注入提示词与技能根。
+ *
+ * 所以本开关只写会话元数据，绝不改全局 settings —— 否则一个会话的开关
+ * 会污染其它会话，正是这个组件要修掉的行为。
  *
  * 健壮性约定：
  * - 读取/写入失败时用 toast 明确提示，绝不静默回退；
- * - 读取失败时中止本次切换，绝不把 content 清空或写成空串。
+ * - 全局破甲未配置内容时，开启会明确提示先去配置，而不是假装成功；
+ * - 「是否已配置」一律现读 settings.json 判定，不依赖可能过期的内存状态。
  */
 
 import * as React from 'react'
 import { Flame, FlameKindling } from 'lucide-react'
 import { toast } from 'sonner'
-import { useAtom } from 'jotai'
+import { useAtomValue, useSetAtom } from 'jotai'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { inputToolbarButtonClass, inputToolbarActiveButtonClass } from '@/components/ai-elements/input-toolbar-styles'
-import { personalDirectiveEnabledAtom } from '@/atoms/personal-directive-atoms'
+import { agentSessionsAtom, sessionArmorEnabledAtom } from '@/atoms/agent-atoms'
+import { inspectPersonalDirective, type PersonalDirectiveConfigState } from '@/lib/personal-directive-config'
 
 /** PersonalDirectiveToggle 属性接口 */
 interface PersonalDirectiveToggleProps {
+  /** 当前会话 ID；破甲状态按会话存储 */
+  sessionId: string
   className?: string
 }
 
-export function PersonalDirectiveToggle({ className }: PersonalDirectiveToggleProps): React.ReactElement | null {
-  // 与 ArmorRefusalBadge 共用同一 atom，切换时徽标即时跟随。
-  const [enabled, setEnabled] = useAtom(personalDirectiveEnabledAtom)
-  const [loaded, setLoaded] = React.useState(false)
+export function PersonalDirectiveToggle({ sessionId, className }: PersonalDirectiveToggleProps): React.ReactElement | null {
+  // 会话级状态：直接由 sessions atom 派生，切换后无需本地副本
+  const enabled = useAtomValue(sessionArmorEnabledAtom(sessionId))
+  const setAgentSessions = useSetAtom(agentSessionsAtom)
+  // 全局配置状态；null 表示还没读到，避免挂载瞬间把「未知」误判成「未配置」
+  const [configState, setConfigState] = React.useState<PersonalDirectiveConfigState | null>(null)
+  const [pending, setPending] = React.useState(false)
 
-  /** 挂载时读取当前设置，回填共享开关状态（幂等） */
+  /** 挂载时读取全局配置，供提示文案使用；不决定本会话开关 */
   React.useEffect(() => {
     let mounted = true
     window.electronAPI.getSettings()
-      .then((s) => {
-        if (!mounted) return
-        setEnabled(s.personalDirective?.enabled ?? false)
-        setLoaded(true)
+      .then((settings) => {
+        if (mounted) setConfigState(inspectPersonalDirective(settings.personalDirective))
       })
       .catch((error) => {
-        if (!mounted) return
-        console.error('[PersonalDirectiveToggle] 读取设置失败:', error)
-        toast.error('读取破甲开关失败', { description: String(error) })
-        setLoaded(true)
+        console.error('[PersonalDirectiveToggle] 读取破甲配置失败:', error)
       })
     return (): void => { mounted = false }
-  }, [setEnabled])
+  }, [])
 
-  /** 翻转开关；失败时 toast 提示并回滚，绝不静默、绝不清空 content */
+  /** 翻转本会话开关；只写会话元数据 */
   const toggle = React.useCallback(async (): Promise<void> => {
-    const previous = enabled
+    if (pending) return
     const next = !enabled
 
-    // 读取最新设置，拿到当前 content；读取失败则中止，避免写坏 content
-    const current = await window.electronAPI.getSettings().catch((error) => {
-      console.error('[PersonalDirectiveToggle] 读取设置失败，已中止切换:', error)
-      toast.error('切换破甲失败', { description: '读取设置失败：' + String(error) })
-      return undefined
-    })
-    if (!current) return
-
-    const pd = current.personalDirective
-    const content = pd?.content ?? ''
-    const markdownPath = (pd?.markdownPath ?? '').trim()
-
-    // 开启时校验 markdownPath 指向的 .md 文件是否存在；缺失则提示并中止开启。
-    if (next && markdownPath.length > 0) {
-      const fileCheck = await window.electronAPI.checkPersonalDirectiveFile().catch(() => null)
-      if (fileCheck && !fileCheck.exists) {
-        toast.error('破甲提示词文件不存在', { description: fileCheck.resolvedPath || markdownPath })
-        return
-      }
-    }
-
-    if (content.trim().length === 0 && markdownPath.length === 0) {
-      toast.error('破甲指令内容为空', { description: '请在 settings.json 配置 personalDirective.content 或 markdownPath' })
-      return
-    }
-
-    setEnabled(next)
+    setPending(true)
     try {
-      await window.electronAPI.updateSettings({ personalDirective: { enabled: next, content, markdownPath } })
-      toast.success(next ? '破甲：已开启' : '破甲：已关闭', {
-        description: next ? '已注入提示词，后续请求生效' : '已停止注入，保持默认行为',
+      if (next) {
+        // 以磁盘上的最新配置为准：挂载时读到的状态可能已被用户改过。
+        const settings = await window.electronAPI.getSettings()
+        const state = inspectPersonalDirective(settings.personalDirective)
+        setConfigState(state)
+
+        if (state === 'disabled') {
+          toast.error('破甲未启用', {
+            description: '请在 settings.json 把 personalDirective.enabled 设为 true',
+          })
+          return
+        }
+        if (state === 'empty') {
+          toast.error('破甲未配置正文', {
+            description: '请先在 settings.json 的 personalDirective 配置 markdownPath 或 content',
+          })
+          return
+        }
+
+        // markdownPath 指向的文件可能已被删除或改名，开启前校验一次。
+        const markdownPath = (settings.personalDirective?.markdownPath ?? '').trim()
+        if (markdownPath.length > 0) {
+          const fileCheck = await window.electronAPI.checkPersonalDirectiveFile().catch(() => null)
+          if (fileCheck && !fileCheck.exists) {
+            toast.error('破甲提示词文件不存在', { description: fileCheck.resolvedPath || markdownPath })
+            return
+          }
+        }
+      }
+
+      // 先本地翻转，避免等待 IPC 期间按钮状态滞后；主进程返回后再以权威元数据覆盖。
+      setAgentSessions((prev) => prev.map((item) => (
+        item.id === sessionId ? { ...item, armorEnabled: next } : item
+      )))
+
+      const updated = await window.electronAPI.updateSessionArmor(sessionId, next)
+      setAgentSessions((prev) => prev.map((item) => (item.id === sessionId ? updated : item)))
+      toast.success(next ? '本会话破甲：开启' : '本会话破甲：关闭', {
+        description: next ? '仅本会话生效，后续请求注入破甲正文' : '仅本会话生效，其它会话不受影响',
       })
     } catch (error) {
-      console.error('[PersonalDirectiveToggle] 切换失败，回滚 UI:', error)
-      setEnabled(previous)
+      // 乐观更新失败时回滚本会话状态，UI 不能停留在未生效的「已开启」。
+      setAgentSessions((prev) => prev.map((item) => (
+        item.id === sessionId ? { ...item, armorEnabled: enabled } : item
+      )))
+      console.error('[PersonalDirectiveToggle] 切换失败:', error)
       toast.error(next ? '开启破甲失败' : '关闭破甲失败', { description: String(error) })
+    } finally {
+      setPending(false)
     }
-  }, [enabled])
-
-  if (!loaded) return null
+  }, [enabled, pending, sessionId, setAgentSessions])
 
   return (
     <TooltipProvider delayDuration={300} disableHoverableContent>
@@ -104,19 +124,30 @@ export function PersonalDirectiveToggle({ className }: PersonalDirectiveTogglePr
             variant="ghost"
             size="icon"
             aria-pressed={enabled}
-            aria-label={enabled ? '破甲：开启' : '破甲：关闭'}
+            aria-label={enabled ? '本会话破甲：开启' : '本会话破甲：关闭'}
+            disabled={pending}
             onClick={() => { void toggle(); requestAnimationFrame(() => document.querySelector<HTMLElement>('.ProseMirror')?.focus()) }}
             className={cn(inputToolbarButtonClass, enabled && inputToolbarActiveButtonClass, className)}
           >
             {enabled ? <Flame className="size-5" /> : <FlameKindling className="size-5" />}
           </Button>
         </TooltipTrigger>
-        <TooltipContent side="top" className="max-w-[220px]">
-          <p className="font-medium">{enabled ? '破甲：开启' : '破甲：关闭'}</p>
+        <TooltipContent side="top" className="max-w-[240px]">
+          <p className="font-medium">{enabled ? '本会话破甲：开启' : '本会话破甲：关闭'}</p>
           <p className="text-xs text-muted-foreground mt-0.5">
-            {enabled ? '已注入「个人指令（破甲）」到 Agent 系统提示词' : '未注入，保持默认行为'}
+            {configState === null
+              ? '开启时会重新校验全局破甲配置'
+              : configState === 'disabled'
+                ? '全局破甲未启用（personalDirective.enabled 为 false）'
+                : configState === 'empty'
+                  ? '全局未配置破甲正文，开启前需先配置'
+                  : enabled
+                    ? '已注入破甲正文与技能根，仅本会话'
+                    : '未注入，保持默认行为'}
           </p>
-          <p className="text-xs text-muted-foreground mt-1">点击切换，仅影响后续请求</p>
+          <p className="text-xs text-muted-foreground mt-1">
+            会话级开关：新建会话默认关闭
+          </p>
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>

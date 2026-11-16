@@ -1,4 +1,5 @@
 import { Menu, shell, BrowserWindow } from 'electron'
+import { resetFontSizesInMain, stepFontSizesInMain } from './lib/font-sizes'
 
 export function createApplicationMenu(): Menu {
   const isMac = process.platform === 'darwin'
@@ -113,9 +114,9 @@ export function createApplicationMenu(): Menu {
         },
         { role: 'toggleDevTools' as const, label: '切换开发者工具' },
         { type: 'separator' as const },
-        { role: 'resetZoom' as const, label: '重置缩放' },
-        { role: 'zoomIn' as const, label: '放大' },
-        { role: 'zoomOut' as const, label: '缩小' },
+        { label: '重置字号', accelerator: 'CmdOrCtrl+0', click: () => resetFontSizesInMain() },
+        { label: '放大字号', accelerator: 'CmdOrCtrl+=', click: () => stepFontSizesInMain(1) },
+        { label: '缩小字号', accelerator: 'CmdOrCtrl+-', click: () => stepFontSizesInMain(-1) },
         { type: 'separator' as const },
         { role: 'togglefullscreen' as const, label: '切换全屏' },
       ],

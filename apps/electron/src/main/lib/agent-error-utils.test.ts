@@ -73,6 +73,41 @@ describe('mapAgentErrorToTypedError - HTTP 状态优先分类', () => {
     expect(result.canRetry).toBe(true)
   })
 
+  test.each([
+    ['ERR_PROXY_CONNECTION_FAILED', '代理不可用'],
+    ['ERR_NAME_NOT_RESOLVED', '域名解析失败'],
+    ['ERR_INTERNET_DISCONNECTED', '网络已断开'],
+    ['ERR_NETWORK_CHANGED', '网络已切换'],
+    ['ERR_TIMED_OUT', '网络连接超时'],
+  ])('Given %s When 归类为网络错误 Then 标题给出具体原因 %s', (code, expectedTitle) => {
+    const raw = `fetch failed: ${code}`
+    const result = mapAgentErrorToTypedError('unknown', raw, raw)
+
+    expect(result.code).toBe('network_error')
+    expect(result.title).toBe(expectedTitle)
+    expect(result.message.length).toBeGreaterThan(0)
+    expect(result.canRetry).toBe(true)
+    expect(result.actions.map((action) => action.action)).toEqual(['settings', 'retry'])
+  })
+
+  test('Given 流式响应中断 When 归类为网络错误 Then 提示响应传输中断', () => {
+    const raw = 'fetch failed: ERR_INCOMPLETE_CHUNKED_ENCODING'
+    const result = mapAgentErrorToTypedError('unknown', raw, raw)
+
+    expect(result.code).toBe('network_error')
+    expect(result.title).toBe('响应传输中断')
+    expect(result.message).toContain('传输过程中断开')
+  })
+
+  test('Given 带明确 HTTP 状态码且含 ECONNRESET When 映射错误 Then 不误判为连接层网络错误', () => {
+    const raw = 'provider API error (502): ECONNRESET while reading response'
+    const result = mapAgentErrorToTypedError('unknown', raw, raw)
+
+    expect(result.code).toBe('service_error')
+    expect(result.title).toBe('网关异常')
+    expect(result.code).not.toBe('network_error')
+  })
+
   test('Given 空响应体错误包含疑似凭据 Then 诊断摘要会脱敏', () => {
     const raw = 'provider API error (400): 400 status code (no body), api_key=super-secret-value'
     const result = mapAgentErrorToTypedError('provider_error', raw, raw)

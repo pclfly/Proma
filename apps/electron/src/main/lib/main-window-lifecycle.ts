@@ -191,3 +191,48 @@ export function hideMacMainWindowAfterClose(
   win.setFullScreen(false)
   schedule(hideWindowAndApp, FULL_SCREEN_HIDE_FALLBACK_DELAY_MS)
 }
+
+export interface WindowCreationBoundsInput {
+  /** 上次退出时保存的窗口状态；首次启动为 undefined。 */
+  savedState?: WindowBounds & { isMaximized?: boolean }
+  /** 目标显示器的工作区（已排除任务栏/程序坞）。 */
+  workArea: WindowWorkArea
+  /** 普通窗口的可见性规范化，用于非最大化启动。 */
+  normalizeVisible: (bounds: WindowBounds) => WindowBounds
+  /** 无保存状态时的默认尺寸。 */
+  fallbackSize: { width: number; height: number }
+}
+
+/** 只保留 BrowserWindow 需要的四个几何字段，避免保存状态里的 isMaximized 混进构造参数。 */
+function toWindowBounds(bounds: WindowBounds): WindowBounds {
+  return { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height }
+}
+
+/**
+ * 解析窗口创建时使用的 bounds。
+ *
+ * 目标状态为最大化时直接使用目标显示器的工作区尺寸：启动页是 `resizable: false`
+ * 的无边框窗口，Windows 下对隐藏窗口调用 maximize() 不会铺满屏幕，窗口会先按普通
+ * 尺寸显示一帧再跳变，表现为「启动先出现一个小窗口，随后才全屏」。用最终尺寸创建
+ * 就没有这一跳变。
+ */
+export function resolveWindowCreationBounds(input: WindowCreationBoundsInput): Partial<WindowBounds> {
+  const { savedState, workArea, normalizeVisible, fallbackSize } = input
+  const shouldMaximize = savedState?.isMaximized ?? true
+
+  if (!savedState) {
+    return shouldMaximize && isUsableArea(workArea)
+      ? { x: Math.round(workArea.x), y: Math.round(workArea.y), width: Math.round(workArea.width), height: Math.round(workArea.height) }
+      : { width: fallbackSize.width, height: fallbackSize.height }
+  }
+
+  if (!shouldMaximize) return toWindowBounds(normalizeVisible(savedState))
+
+  if (!isUsableArea(workArea)) return toWindowBounds(normalizeVisible(savedState))
+  return {
+    x: Math.round(workArea.x),
+    y: Math.round(workArea.y),
+    width: Math.round(workArea.width),
+    height: Math.round(workArea.height),
+  }
+}

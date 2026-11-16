@@ -1,20 +1,19 @@
 /**
- * ChannelSettings - 渠道配置页
+ * ChannelSettings - 模型设置（渠道卡片 + 详情视图）
  *
- * 管理所有渠道的添加、编辑、删除与启用状态。
+ * 列表以卡片展示渠道；点击卡片进入详情，复用 ChannelForm 编辑。
+ * 进入详情时按需刷新该渠道的模型与订阅额度，不做后台轮询。
  */
 
 import * as React from 'react'
 import { useAtom, useSetAtom } from 'jotai'
-import { CheckCircle2, ExternalLink, Pencil, Plus, Trash2, X } from 'lucide-react'
+import { Loader2, Plus, X } from 'lucide-react'
+import type { Channel, ChannelPlanQuotaResult } from '@proma/shared'
 import { Button } from '@/components/ui/button'
-import { Switch } from '@/components/ui/switch'
-import { PROVIDER_LABELS } from '@proma/shared'
-import type { Channel } from '@proma/shared'
-import { getChannelLogo, PromaLogo } from '@/lib/model-logo'
 import { agentChannelIdAtom, agentModelIdAtom } from '@/atoms/agent-atoms'
-import { channelsAtom } from '@/atoms/chat-atoms'
-import { SettingsSection, SettingsCard, SettingsRow } from './primitives'
+import { channelsAtom } from '@/atoms/channel-atoms'
+import { fetchChannelPlanQuota, getCachedPlanQuota, supportsChannelPlanQuota } from '@/lib/channel-plan-quota'
+import { SettingsCard, SettingsSection } from './primitives'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -25,35 +24,79 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { ChannelAuthorizationNotice, ChannelCard, ChannelDetailHeader } from './ChannelCard'
+import { buildChannelCards, hasModelListChanges, isQuotaFailure } from './channel-cards'
+import { mergeFetchedChannelModels } from './channel-model-state'
 import { ChannelForm } from './ChannelForm'
 import { ReasoningProfileSettings } from './ReasoningProfileSettings'
 
-/** 组件视图模式 */
-type ViewMode = 'list' | 'create' | 'edit'
+type ViewMode = 'list' | 'create' | 'detail'
+
+/** 模型目录刷新节流：刚刷新过的渠道不重复请求；失败不记时间，下次进入立即重试。 */
+const MODEL_REFRESH_TTL_MS = 60_000
+const lastModelRefreshAt = new Map<string, number>()
+const inflightModelRefreshes = new Map<string, Promise<Channel | null>>()
+
+async function refreshChannelModels(channel: Channel): Promise<Channel | null> {
+  const last = lastModelRefreshAt.get(channel.id)
+  if (last !== undefined && Date.now() - last < MODEL_REFRESH_TTL_MS) return null
+
+  const key = `${channel.id}:${channel.updatedAt}`
+  const inflight = inflightModelRefreshes.get(key)
+  if (inflight) return inflight
+
+  const task = (async (): Promise<Channel | null> => {
+    if (!channel.apiKey) return null
+    const apiKey = await window.electronAPI.decryptApiKey(channel.id)
+    if (!apiKey.trim()) return null
+    const result = await window.electronAPI.fetchModels({
+      provider: channel.provider,
+      baseUrl: channel.baseUrl,
+      apiKey,
+    })
+    if (!result.success) throw new Error(result.message || '获取模型失败')
+    // 空清单可能是供应商分页/临时异常，进入刷新时不能据此清空已有模型。
+    if (result.models.length === 0) return null
+    // 进入刷新只合并清单，不自动启用新模型，避免改变用户的选择。
+    const merged = mergeFetchedChannelModels(channel.models, result.models, false)
+    lastModelRefreshAt.set(channel.id, Date.now())
+    if (!hasModelListChanges(channel.models, merged)) return null
+    return await window.electronAPI.updateChannel(channel.id, { models: merged })
+  })()
+
+  inflightModelRefreshes.set(key, task)
+  try {
+    return await task
+  } catch (error) {
+    lastModelRefreshAt.delete(channel.id)
+    throw error
+  } finally {
+    inflightModelRefreshes.delete(key)
+  }
+}
 
 export function ChannelSettings(): React.ReactElement {
   const [channels, setChannels] = React.useState<Channel[]>([])
-  const [viewMode, setViewMode] = React.useState<ViewMode>('list')
-  const [editingChannel, setEditingChannel] = React.useState<Channel | null>(null)
-  const [loading, setLoading] = React.useState(true)
+  const setGlobalChannels = useSetAtom(channelsAtom)
   const [agentChannelId, setAgentChannelId] = useAtom(agentChannelIdAtom)
   const [, setAgentModelId] = useAtom(agentModelIdAtom)
-  const setGlobalChannels = useSetAtom(channelsAtom)
+  const [viewMode, setViewMode] = React.useState<ViewMode>('list')
+  const [detailChannel, setDetailChannel] = React.useState<Channel | null>(null)
+  const detailChannelRef = React.useRef<Channel | null>(null)
+  const [detailReady, setDetailReady] = React.useState(false)
+  const [refreshNotice, setRefreshNotice] = React.useState<string | null>(null)
+  const [refreshErrors, setRefreshErrors] = React.useState<Record<string, string>>({})
+  const [quotaByChannel, setQuotaByChannel] = React.useState<Record<string, ChannelPlanQuotaResult>>({})
+  const [loading, setLoading] = React.useState(true)
   const [deleteTarget, setDeleteTarget] = React.useState<Channel | null>(null)
-  /** 新建订阅渠道后保留成功反馈，避免表单自动返回列表时用户错过短暂 toast。 */
   const [recentlyAuthorizedChannel, setRecentlyAuthorizedChannel] = React.useState<Channel | null>(null)
-  const agentChannelIdRef = React.useRef(agentChannelId)
 
-  React.useEffect(() => {
-    agentChannelIdRef.current = agentChannelId
-  }, [agentChannelId])
-
-  /** 加载渠道列表 */
+  /** 加载渠道列表并同步全局缓存 */
   const loadChannels = React.useCallback(async (): Promise<Channel[]> => {
     try {
       const list = await window.electronAPI.listChannels()
       setChannels(list)
-      setGlobalChannels(list) // 同步到全局缓存
+      setGlobalChannels(list)
       return list
     } catch (error) {
       console.error('[渠道设置] 加载渠道列表失败:', error)
@@ -61,34 +104,105 @@ export function ChannelSettings(): React.ReactElement {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [setGlobalChannels])
 
   React.useEffect(() => {
-    loadChannels()
+    void loadChannels()
   }, [loadChannels])
 
-  /** 删除渠道（通过弹窗确认） */
-  const handleDeleteRequest = (channel: Channel): void => {
-    setDeleteTarget(channel)
-  }
+  /** 记录/清除某个渠道的最近错误 */
+  const setChannelError = React.useCallback((channelId: string, message: string | null): void => {
+    setRefreshErrors((prev) => {
+      if (message === null) {
+        if (!(channelId in prev)) return prev
+        const next = { ...prev }
+        delete next[channelId]
+        return next
+      }
+      return { ...prev, [channelId]: message }
+    })
+  }, [])
 
-  /** 确认删除 */
+  const openChannel = React.useCallback((channel: Channel): void => {
+    detailChannelRef.current = channel
+    setDetailChannel(channel)
+    setRefreshNotice(null)
+    setDetailReady(false)
+    setViewMode('detail')
+  }, [])
+
+  const backToList = React.useCallback((): void => {
+    detailChannelRef.current = null
+    setDetailChannel(null)
+    setViewMode('list')
+  }, [])
+
+  /** 进入详情：刷新模型与额度；失败保留旧数据并给出提示。 */
+  React.useEffect(() => {
+    if (viewMode !== 'detail' || !detailChannel?.id) return
+    const channel = detailChannelRef.current
+    if (!channel) return
+    let cancelled = false
+    setDetailReady(false)
+    setRefreshNotice(null)
+
+    void (async () => {
+      let latest = channel
+      try {
+        const refreshed = await refreshChannelModels(channel)
+        if (refreshed) {
+          latest = refreshed
+          // 即使已经返回列表也同步列表数据，避免刷新写入后卡片仍是旧模型数。
+          setChannels((prev) => prev.map((item) => (item.id === refreshed.id ? refreshed : item)))
+          setGlobalChannels((prev) => prev.map((item) => (item.id === refreshed.id ? refreshed : item)))
+          if (!cancelled) {
+            detailChannelRef.current = refreshed
+            setDetailChannel(refreshed)
+          }
+        }
+        if (cancelled) return
+        setChannelError(channel.id, null)
+      } catch (error) {
+        if (cancelled) return
+        const message = error instanceof Error ? error.message : '未知错误'
+        setChannelError(channel.id, `模型刷新失败：${message}`)
+        setRefreshNotice(`模型刷新失败，已保留原有模型：${message}`)
+      }
+      if (cancelled) return
+      setDetailReady(true)
+
+      if (!supportsChannelPlanQuota(latest)) return
+      const quota = await fetchChannelPlanQuota(latest.id, latest.updatedAt)
+      if (cancelled) return
+      // 查询失败时保留上一次成功摘要，不把卡片额度清空或归零。
+      setQuotaByChannel((prev) => {
+        if (isQuotaFailure(quota) && prev[latest.id]) return prev
+        return { ...prev, [latest.id]: quota }
+      })
+      if (isQuotaFailure(quota) && quota.message) {
+        setRefreshNotice((prev) => prev ?? `订阅额度查询失败，已保留原有摘要：${quota.message}`)
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+    // 仅在进入详情或切换渠道时触发；同 id 渠道的数据更新不会重新跑。
+  }, [viewMode, detailChannel?.id, setChannelError, setGlobalChannels])
+
   const handleDeleteConfirm = async (): Promise<void> => {
     if (!deleteTarget) return
     const target = deleteTarget
     try {
       await window.electronAPI.deleteChannel(target.id)
-
-      // 如果删除的是当前选中的 Agent 渠道，清空选择
       if (agentChannelId === target.id) {
         setAgentChannelId(null)
         setAgentModelId(null)
       }
-
       await window.electronAPI.updateSettings({
         ...(agentChannelId === target.id && { agentChannelId: undefined, agentModelId: undefined }),
       })
-
+      setChannelError(target.id, null)
       await loadChannels()
       setDeleteTarget(null)
     } catch (error) {
@@ -96,20 +210,18 @@ export function ChannelSettings(): React.ReactElement {
     }
   }
 
-  /** 切换渠道启用状态 */
   const handleToggle = async (channel: Channel): Promise<void> => {
     try {
-      const savedChannel = await window.electronAPI.updateChannel(channel.id, { enabled: !channel.enabled })
+      await window.electronAPI.updateChannel(channel.id, { enabled: !channel.enabled })
       await loadChannels()
     } catch (error) {
       console.error('[渠道设置] 切换渠道状态失败:', error)
+      setChannelError(channel.id, '切换启用状态失败，请重试')
     }
   }
 
-  /** 表单保存回调 */
   const handleFormSaved = async (savedChannel?: Channel): Promise<void> => {
-    setViewMode('list')
-    setEditingChannel(null)
+    backToList()
     const latestChannels = await loadChannels()
     if (savedChannel?.provider === 'github-copilot') {
       // 使用落库后的对象，确保模型计数与 enabled 状态和列表完全一致。
@@ -117,27 +229,55 @@ export function ChannelSettings(): React.ReactElement {
     }
   }
 
-  /** 取消表单 */
-  const handleFormCancel = (): void => {
-    setViewMode('list')
-    setEditingChannel(null)
-  }
+  const cards = React.useMemo(() => buildChannelCards(channels, {
+    quotaOf: (channel) => quotaByChannel[channel.id] ?? getCachedPlanQuota(channel.id, channel.updatedAt),
+    errorOf: (channel) => refreshErrors[channel.id],
+  }), [channels, quotaByChannel, refreshErrors])
 
-  // 表单视图
-  if (viewMode === 'create' || viewMode === 'edit') {
+  if (viewMode === 'create') {
+    return <ChannelForm channel={null} onSaved={handleFormSaved} onCancel={backToList} />
+  }
+  if (viewMode === 'detail' && detailChannel) {
     return (
-      <ChannelForm
-        channel={editingChannel}
-        onSaved={handleFormSaved}
-        onCancel={handleFormCancel}
-      />
+      <div className="space-y-6">
+        <ChannelDetailHeader channel={detailChannel} onBack={backToList} />
+
+        {refreshNotice && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 rounded-xl border border-destructive/25 bg-destructive/[0.06] px-4 py-3 text-sm text-destructive"
+          >
+            <span className="min-w-0 flex-1">{refreshNotice}</span>
+            <button
+              type="button"
+              onClick={() => setRefreshNotice(null)}
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md hover:bg-destructive/10"
+              aria-label="关闭刷新提示"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
+
+        {detailReady ? (
+          <ChannelForm
+            key={detailChannel.id}
+            channel={detailChannel}
+            onSaved={handleFormSaved}
+            onCancel={backToList}
+          />
+        ) : (
+          <div className="flex items-center justify-center gap-2 rounded-xl border border-border/60 bg-content-area py-12 text-sm text-muted-foreground">
+            <Loader2 size={16} className="animate-spin" />
+            正在刷新渠道信息…
+          </div>
+        )}
+      </div>
     )
   }
 
-  // 列表视图
   return (
     <div className="space-y-8">
-      {/* 区块一：模型配置 */}
       <SettingsSection
         title="模型配置"
         description="管理 AI 供应商连接，配置 API Key 和可用模型。"
@@ -149,42 +289,41 @@ export function ChannelSettings(): React.ReactElement {
         }
       >
         {recentlyAuthorizedChannel && (
-          <AuthorizationSuccessNotice
+          <ChannelAuthorizationNotice
             channel={recentlyAuthorizedChannel}
             onViewModels={() => {
-              setEditingChannel(recentlyAuthorizedChannel)
+              const target = recentlyAuthorizedChannel
               setRecentlyAuthorizedChannel(null)
-              setViewMode('edit')
+              if (target) openChannel(target)
             }}
             onDismiss={() => setRecentlyAuthorizedChannel(null)}
           />
         )}
-        <SettingsCard>
-          <PromaProviderCard />
-        </SettingsCard>
         {loading ? (
-          <div className="text-sm text-muted-foreground py-8 text-center">加载中...</div>
-        ) : channels.length === 0 ? (
+          <div className="py-8 text-center text-sm text-muted-foreground">加载中...</div>
+        ) : cards.length === 0 ? (
           <SettingsCard divided={false}>
-            <div className="text-sm text-muted-foreground py-12 text-center">
-              还没有配置任何模型，点击上方"添加配置"开始
+            <div className="flex flex-col items-center gap-3 py-14 text-center">
+              <p className="text-sm text-muted-foreground">还没有配置任何模型</p>
+              <Button size="sm" onClick={() => setViewMode('create')}>
+                <Plus size={16} />
+                <span>添加配置</span>
+              </Button>
             </div>
           </SettingsCard>
         ) : (
-          <SettingsCard>
-            {channels.map((channel) => (
-              <ChannelRow
-                key={channel.id}
-                channel={channel}
-                onEdit={() => {
-                  setEditingChannel(channel)
-                  setViewMode('edit')
-                }}
-                onDelete={() => handleDeleteRequest(channel)}
-                onToggle={() => handleToggle(channel)}
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {cards.map((card) => (
+              <ChannelCard
+                key={card.channel.id}
+                card={card}
+                isCurrent={agentChannelId === card.channel.id}
+                onOpen={() => openChannel(card.channel)}
+                onToggle={() => void handleToggle(card.channel)}
+                onDelete={() => setDeleteTarget(card.channel)}
               />
             ))}
-          </SettingsCard>
+          </div>
         )}
       </SettingsSection>
 
@@ -207,127 +346,5 @@ export function ChannelSettings(): React.ReactElement {
         </AlertDialogContent>
       </AlertDialog>
     </div>
-  )
-}
-
-function openPromaDownload(): void {
-  window.open('https://proma.cool/download', '_blank')
-}
-
-// ===== 授权成功反馈 =====
-
-function AuthorizationSuccessNotice({
-  channel,
-  onViewModels,
-  onDismiss,
-}: {
-  channel: Channel
-  onViewModels: () => void
-  onDismiss: () => void
-}): React.ReactElement {
-  const enabledModelCount = channel.models.filter((model) => model.enabled).length
-  return (
-    <div
-      role="status"
-      aria-live="polite"
-      className="flex items-start gap-3 rounded-xl border border-emerald-500/25 bg-emerald-500/[0.08] px-4 py-3 text-emerald-950 shadow-[0_1px_2px_rgba(16,185,129,0.08)] dark:text-emerald-100"
-    >
-      <CheckCircle2 size={20} className="mt-0.5 shrink-0 text-emerald-600 dark:text-emerald-400" />
-      <div className="min-w-0 flex-1">
-        <p className="text-sm font-medium text-wrap-pretty">GitHub Copilot 已授权并保存</p>
-        <p className="mt-0.5 text-xs leading-5 text-emerald-800/80 dark:text-emerald-200/80">
-          已启用 <span className="font-medium tabular-nums">{enabledModelCount}</span> 个当前订阅可用模型；现在可在 Agent 的模型选择器中使用。
-        </p>
-        <Button
-          type="button"
-          variant="link"
-          size="sm"
-          onClick={onViewModels}
-          className="mt-1 h-7 px-0 text-emerald-800 hover:text-emerald-950 dark:text-emerald-200 dark:hover:text-emerald-50"
-        >
-          查看已启用模型
-        </Button>
-      </div>
-      <button
-        type="button"
-        onClick={onDismiss}
-        className="-mr-1 -mt-1 flex h-10 w-10 shrink-0 items-center justify-center rounded-lg text-emerald-800/70 transition-colors hover:bg-emerald-500/10 hover:text-emerald-950 active:scale-[0.96] dark:text-emerald-200/70 dark:hover:text-emerald-50"
-        title="关闭授权成功提示"
-        aria-label="关闭授权成功提示"
-      >
-        <X size={16} />
-      </button>
-    </div>
-  )
-}
-
-// ===== 渠道行子组件 =====
-
-interface ChannelRowProps {
-  channel: Channel
-  onEdit: () => void
-  onDelete: () => void
-  onToggle: () => void
-}
-
-function ChannelRow({ channel, onEdit, onDelete, onToggle }: ChannelRowProps): React.ReactElement {
-  const enabledCount = channel.models.filter((m) => m.enabled).length
-  const description = [
-    PROVIDER_LABELS[channel.provider],
-    enabledCount > 0 ? `${enabledCount} 个模型已启用` : undefined,
-  ]
-    .filter(Boolean)
-    .join(' · ')
-
-  return (
-    <SettingsRow
-      label={channel.name}
-      icon={<img src={getChannelLogo(channel)} alt="" className="w-8 h-8 rounded" />}
-      description={
-        <span>{description}</span>
-      }
-      className="group"
-    >
-      <div className="flex items-center gap-2">
-        {/* 操作按钮 */}
-        <button
-          onClick={onEdit}
-          className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors opacity-0 group-hover:opacity-100"
-          title="编辑"
-        >
-          <Pencil size={14} />
-        </button>
-        <button
-          onClick={onDelete}
-          className="p-1.5 rounded-md text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors opacity-0 group-hover:opacity-100"
-          title="删除"
-        >
-          <Trash2 size={14} />
-        </button>
-
-        {/* 启用/关闭开关 */}
-        <Switch
-          checked={channel.enabled}
-          onCheckedChange={onToggle}
-        />
-      </div>
-    </SettingsRow>
-  )
-}
-
-// ===== Proma 官方供应商推广卡片 =====
-
-function PromaProviderCard(): React.ReactElement {
-  return (
-    <SettingsRow
-      label="Proma"
-      icon={<img src={PromaLogo} alt="Proma" className="w-8 h-8 rounded" />}
-      description="Proma 商业版｜安全、稳定、优惠的内置模型｜适用于 Chat 与 Agent"
-    >
-      <Button size="sm" variant="outline" className="gap-1.5" onClick={openPromaDownload}>
-        <ExternalLink size={13} />
-        <span>下载商业版</span>
-      </Button>
-    </SettingsRow>
   )
 }

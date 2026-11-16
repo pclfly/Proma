@@ -24,8 +24,9 @@ import {
   ContextMenuItem,
   ContextMenuTrigger,
 } from '@/components/ui/context-menu'
-import { agentDiffUnseenChangesAtom, currentAgentSessionIdAtom } from '@/atoms/agent-atoms'
+import { agentDiffUnseenChangesAtom, currentAgentSessionIdAtom, getBrowserTabIdFromSidePanelTab } from '@/atoms/agent-atoms'
 import type { AgentSidePanelTab, SessionIndicatorStatus, WorkspaceComponentTab } from '@/atoms/agent-atoms'
+import { BrowserTabPreviewPopover } from '@/components/browser/BrowserTabPreviewPopover'
 import { groupRightWorkspaceTabs, type RightWorkspacePane } from '@/lib/right-workspace-split'
 import { getDelegationStatusIconClass } from '@/lib/agent-session-list'
 import type { ProductivityToolsSettings } from '@/types/settings'
@@ -108,12 +109,61 @@ export function DiffPanelTabBar({
   const barRef = React.useRef<HTMLDivElement>(null)
   const suppressClickTabRef = React.useRef<AgentSidePanelTab | null>(null)
   const activeTabDragCancelRef = React.useRef<(() => void) | null>(null)
+  const [hoveredBrowserTab, setHoveredBrowserTab] = React.useState<{ id: AgentSidePanelTab; tabId: string } | null>(null)
+  const hoverEnterTimerRef = React.useRef<ReturnType<typeof setTimeout>>()
+  const hoverLeaveTimerRef = React.useRef<ReturnType<typeof setTimeout>>()
 
   React.useEffect(() => () => onAddTabMenuOpenChange?.(false), [onAddTabMenuOpenChange])
   React.useEffect(() => () => activeTabDragCancelRef.current?.(), [])
   React.useEffect(() => {
     if (!visibleTabs?.left || !visibleTabs.right) setIsSplitTabGroupHovered(false)
   }, [visibleTabs?.left, visibleTabs?.right])
+
+  const clearBrowserPreviewTimers = React.useCallback(() => {
+    if (hoverEnterTimerRef.current) clearTimeout(hoverEnterTimerRef.current)
+    if (hoverLeaveTimerRef.current) clearTimeout(hoverLeaveTimerRef.current)
+    hoverEnterTimerRef.current = undefined
+    hoverLeaveTimerRef.current = undefined
+  }, [])
+
+  const keepBrowserPreviewOpen = React.useCallback(() => {
+    clearBrowserPreviewTimers()
+  }, [clearBrowserPreviewTimers])
+
+  const closeBrowserPreviewSoon = React.useCallback(() => {
+    if (hoverEnterTimerRef.current) clearTimeout(hoverEnterTimerRef.current)
+    hoverEnterTimerRef.current = undefined
+    if (hoverLeaveTimerRef.current) clearTimeout(hoverLeaveTimerRef.current)
+    hoverLeaveTimerRef.current = setTimeout(() => {
+      setHoveredBrowserTab(null)
+    }, 120)
+  }, [])
+
+  const openBrowserPreviewSoon = React.useCallback((tab: WorkspacePanelTab) => {
+    clearBrowserPreviewTimers()
+    const browserTabId = getBrowserTabIdFromSidePanelTab(tab.id)
+    if (!browserTabId || !currentSessionId) {
+      setHoveredBrowserTab(null)
+      return
+    }
+    hoverEnterTimerRef.current = setTimeout(() => {
+      setHoveredBrowserTab({ id: tab.id, tabId: browserTabId })
+    }, 250)
+  }, [clearBrowserPreviewTimers, currentSessionId])
+
+  React.useEffect(() => () => clearBrowserPreviewTimers(), [clearBrowserPreviewTimers])
+
+  // Session 或 Tab 集合变化后，旧缩略图请求不能继续挂在新的侧栏上。
+  React.useEffect(() => {
+    setHoveredBrowserTab(null)
+    clearBrowserPreviewTimers()
+  }, [clearBrowserPreviewTimers, currentSessionId])
+
+  React.useEffect(() => {
+    if (hoveredBrowserTab && !tabs.some((tab) => tab.id === hoveredBrowserTab.id)) {
+      setHoveredBrowserTab(null)
+    }
+  }, [hoveredBrowserTab, tabs])
 
   const handleAddTabMenuOpenChange = React.useCallback((open: boolean) => {
     if (open) suppressPointerDismissFocusRestoreRef.current = false
@@ -353,8 +403,14 @@ export function DiffPanelTabBar({
                         ),
                   )}
                 data-visible-pane={visiblePane ?? undefined}
-                onPointerEnter={() => { if (isSplitTab) setIsSplitTabGroupHovered(true) }}
-                onPointerLeave={() => { if (isSplitTab) setIsSplitTabGroupHovered(false) }}
+                onPointerEnter={() => {
+                  if (isSplitTab) setIsSplitTabGroupHovered(true)
+                  openBrowserPreviewSoon(tab)
+                }}
+                onPointerLeave={() => {
+                  if (isSplitTab) setIsSplitTabGroupHovered(false)
+                  closeBrowserPreviewSoon()
+                }}
               >
                 <button
                   type="button"
@@ -557,6 +613,15 @@ export function DiffPanelTabBar({
           </Tooltip>
         )}
       </div>
+      {hoveredBrowserTab && currentSessionId && (
+        <BrowserTabPreviewPopover
+          sessionId={currentSessionId}
+          tabId={hoveredBrowserTab.tabId}
+          anchor={tabRefs.current.get(hoveredBrowserTab.id) ?? null}
+          onMouseEnter={keepBrowserPreviewOpen}
+          onMouseLeave={closeBrowserPreviewSoon}
+        />
+      )}
     </div>
   )
 }

@@ -28,6 +28,7 @@ import { shouldInspectMermaidCodeBlock, shouldRenderMermaidCodeBlock } from '@/l
 import { normalizeLatexDelimiters } from '@/lib/normalize-latex'
 import { normalizeMalformedStrongDelimiters } from '@/lib/markdown-emphasis'
 import { copyTextToClipboard } from '@/lib/clipboard'
+import { getInlineMediaKind } from '@/lib/media-preview'
 import { Button } from '@/components/ui/button'
 import { ImageLightbox, type LightboxImage } from '@/components/ui/image-lightbox'
 import {
@@ -40,6 +41,7 @@ import { LoadingIndicator } from '@/components/ui/loading-indicator'
 import { CodeBlock, MermaidBlock } from '@proma/ui'
 import { detectLanguage } from '@proma/core'
 import { FilePathChip, ResolvableFilePathChip, isAbsoluteFilePath, isImageFilePath, isLocalFileReference, isRelativeFilePath } from './file-path-chip'
+import { getFileName } from './file-path-chip-utils'
 import { buildAgentHistoryQuoteLabel, parseAgentHistoryQuoteMention } from '@/lib/quoted-selection'
 import { createMentionPattern } from '@/lib/mention-patterns'
 import { resolveSkillMentionName } from '@/lib/skill-mention-name'
@@ -132,8 +134,13 @@ export function MessageContent({
   return (
     <div
       className={cn(
-        'flex max-w-full min-w-0 flex-col gap-2 overflow-hidden pl-[46px]',
-        'group-[.is-user]:text-foreground group-[.is-user]:items-start',
+        'message-bubble flex max-w-full min-w-0 flex-col gap-2 overflow-hidden pl-0',
+        // 官方 0.22.0：用户消息右对齐、白色气泡黑字，双端都不显示头像。
+        // 白底是固定视觉，气泡内的语义色与 chip 需要按浅色面着色，见 globals.css 的
+        // .message-item.is-user .message-bubble 规则。
+        'group-[.is-user]:ml-auto group-[.is-user]:w-fit group-[.is-user]:max-w-[85%] group-[.is-user]:items-end',
+        'group-[.is-user]:rounded-2xl group-[.is-user]:bg-white group-[.is-user]:px-4 group-[.is-user]:py-3',
+        'group-[.is-user]:text-black group-[.is-user]:shadow-sm',
         'group-[.is-assistant]:w-full group-[.is-assistant]:text-foreground',
         className
       )}
@@ -293,6 +300,11 @@ interface MessagePathResolutionContext {
 const BasePathsContext = React.createContext<MessagePathResolutionContext | undefined>(undefined)
 const AgentHistoryQuoteClickContext = React.createContext<((quote: QuotedSelection) => void) | undefined>(undefined)
 
+/** 附件读取必须绑定当前消息所属 Agent 会话；未在 Provider 内时返回 undefined。 */
+export function useMessageSessionId(): string | undefined {
+  return React.useContext(BasePathsContext)?.sessionId
+}
+
 /** 提供会话与附加目录候选给所有内嵌的 MessageResponse。 */
 export function BasePathsProvider({ basePaths, sessionId, children }: MessagePathResolutionContext & { children: React.ReactNode }): React.ReactElement {
   const value = React.useMemo(() => ({ basePaths, sessionId }), [basePaths, sessionId])
@@ -377,6 +389,7 @@ function MentionChip({ type, value }: { type: MentionType; value: string }): Rea
         type="button"
         disabled={!canNavigate}
         onClick={canNavigate ? () => onAgentHistoryQuoteClick?.(quote) : undefined}
+        data-mention-type={type}
         className={cn(
           'inline-flex items-center gap-0.5 rounded px-1 py-[1px] text-[13px] font-medium whitespace-nowrap align-baseline',
           style.className,
@@ -399,8 +412,9 @@ function MentionChip({ type, value }: { type: MentionType; value: string }): Rea
   const isNamedReference = type === 'session' || type === 'todo' || type === 'calendar_event'
   const [referenceId = '', ...labelParts] = isNamedReference ? decoded.split('::') : [decoded]
   const label = labelParts.length > 0 ? labelParts.join('::') : undefined
+  // 只显示文件名：Windows 路径用反斜杠，必须走统一的分隔符处理，否则整段路径都会进 chip。
   const display = type === 'file'
-    ? (decoded.split('/').pop() || decoded)
+    ? getFileName(decoded)
     : type === 'session'
       ? (label || `会话 ${referenceId.slice(0, 8)}`)
       : type === 'todo'
@@ -410,6 +424,7 @@ function MentionChip({ type, value }: { type: MentionType; value: string }): Rea
           : decoded
   return (
     <span
+      data-mention-type={type}
       className={cn(
         'inline-flex items-center gap-0.5 rounded px-1 py-[1px] text-[13px] font-medium whitespace-nowrap align-baseline',
         style.className
@@ -608,6 +623,8 @@ const MarkdownImage = React.memo(function MarkdownImage({
   const [failed, setFailed] = React.useState(false)
   const decodedSrc = src ? safeDecode(src) : ''
   const isLocalSource = isLocalFileReference(decodedSrc)
+  // Markdown 里的媒体通常写成 ![x](clip.mp4)；按扩展名升级为真正的播放器。
+  const mediaKind = getInlineMediaKind(decodedSrc)
 
   React.useEffect(() => {
     if (!isLocalSource) {
@@ -637,6 +654,48 @@ const MarkdownImage = React.memo(function MarkdownImage({
   }, [contextBasePaths, decodedSrc, isLocalSource, pathResolutionContext?.sessionId])
 
   if (!src) return null
+
+  if (mediaKind) {
+    const mediaSrc = isLocalSource ? resolvedSrc : src
+    if (!mediaSrc) {
+      return (
+        <span className="inline-flex max-w-full rounded bg-muted px-2 py-1 text-xs text-muted-foreground" role="img" aria-label={alt || decodedSrc}>
+          {failed
+            ? `${mediaKind === 'video' ? '视频' : '音频'}无法读取：${alt || decodedSrc}`
+            : `正在加载${mediaKind === 'video' ? '视频' : '音频'}…`}
+        </span>
+      )
+    }
+    const handleMediaError = (): void => {
+      if (isLocalSource) {
+        setResolvedSrc(null)
+        setFailed(true)
+      }
+    }
+    return mediaKind === 'video'
+      ? (
+          <video
+            src={mediaSrc}
+            controls
+            playsInline
+            preload="metadata"
+            aria-label={alt || decodedSrc}
+            className="my-2 max-h-[420px] w-full rounded-lg bg-black"
+            onError={handleMediaError}
+          />
+        )
+      : (
+          <audio
+            src={mediaSrc}
+            controls
+            preload="metadata"
+            aria-label={alt || decodedSrc}
+            className="my-2 w-full"
+            onError={handleMediaError}
+          />
+        )
+  }
+
   if (!isLocalSource) return <img src={src} alt={alt} {...imageProps} />
   if (!resolvedSrc) {
     return (
@@ -882,7 +941,7 @@ export const UserMessageContent = React.memo(
     }, [])
 
     return (
-      <div className={cn('relative inline-block max-w-full rounded-[10px] bg-primary/10 px-3.5 py-2.5', className)} {...props}>
+      <div className={cn('relative inline-block max-w-full', className)} {...props}>
         <div
           ref={contentRef}
           className={cn(
@@ -892,7 +951,18 @@ export const UserMessageContent = React.memo(
           )}
         >
           <AgentHistoryQuoteClickContext.Provider value={onAgentHistoryQuoteClick}>
-            <MessageResponse className="prose-p:my-0.5 prose-headings:my-1.5" remarkPlugins={USER_REMARK_PLUGINS}>{children}</MessageResponse>
+            <MessageResponse
+              className={cn(
+                'prose-p:my-0.5 prose-headings:my-1.5',
+                // 用户气泡固定白底黑字，覆盖 dark:prose-invert 的浅色正文。
+                '[--tw-prose-body:#111827] [--tw-prose-invert-body:#111827]',
+                '[--tw-prose-headings:#111827] [--tw-prose-invert-headings:#111827]',
+                '[--tw-prose-bold:#111827] [--tw-prose-invert-bold:#111827]',
+                '[--tw-prose-code:#111827] [--tw-prose-invert-code:#111827]',
+                '[--tw-prose-links:#1d4ed8] [--tw-prose-invert-links:#1d4ed8]',
+              )}
+              remarkPlugins={USER_REMARK_PLUGINS}
+            >{children}</MessageResponse>
           </AgentHistoryQuoteClickContext.Provider>
         </div>
         {shouldCollapse && (
@@ -900,8 +970,8 @@ export const UserMessageContent = React.memo(
             type="button"
             onClick={toggleExpand}
             className={cn(
-              'mt-2 flex items-center gap-1 text-xs text-foreground/35 transition-colors',
-              'hover:text-foreground/55'
+              'mt-2 flex items-center gap-1 text-xs text-black/45 transition-colors',
+              'hover:text-black/70'
             )}
           >
             {isExpanded ? (
@@ -979,6 +1049,11 @@ export function MessageAttachments({
   const imageAttachments = attachments.filter((att) => att.mediaType.startsWith('image/'))
   const fileAttachments = attachments.filter((att) => !att.mediaType.startsWith('image/'))
   const isSingleImage = imageAttachments.length === 1 && fileAttachments.length === 0
+  const sessionId = useMessageSessionId()
+  const attachmentContext = React.useMemo(
+    () => sessionId ? { kind: 'agent' as const, sessionId } : undefined,
+    [sessionId],
+  )
 
   // 共享大图预览状态（多图可左右翻页）
   const [lightboxOpen, setLightboxOpen] = React.useState(false)
@@ -1000,10 +1075,10 @@ export function MessageAttachments({
     () => imageAttachments.map((att) => ({
       src: loadedSrcs[att.id] ?? '',
       alt: att.filename,
-      onSave: () => window.electronAPI.saveImageAs(att.localPath, att.filename),
+      onSave: () => window.electronAPI.saveImageAs(att.localPath, att.filename, attachmentContext),
       onEditComplete: onImageEditComplete,
     })),
-    [imageAttachments, loadedSrcs, onImageEditComplete]
+    [imageAttachments, loadedSrcs, onImageEditComplete, attachmentContext]
   )
 
   return (
@@ -1062,10 +1137,15 @@ interface MessageAttachmentImageProps {
 /** 图片附件展示（单图: max 500px，多图: 280px 方块），点击可预览大图 */
 function MessageAttachmentImage({ attachment, isSingle = false, index, onOpen, onLoaded }: MessageAttachmentImageProps): React.ReactElement {
   const [imageSrc, setImageSrc] = React.useState<string | null>(null)
+  const sessionId = useMessageSessionId()
+  const context = React.useMemo(
+    () => sessionId ? { kind: 'agent' as const, sessionId } : undefined,
+    [sessionId],
+  )
 
   React.useEffect(() => {
     window.electronAPI
-      .readAttachment(attachment.localPath)
+      .readAttachment(attachment.localPath, context)
       .then((base64) => {
         const src = `data:${attachment.mediaType};base64,${base64}`
         setImageSrc(src)
@@ -1074,12 +1154,12 @@ function MessageAttachmentImage({ attachment, isSingle = false, index, onOpen, o
       .catch((error) => {
         console.error('[MessageAttachmentImage] 读取附件失败:', error)
       })
-  }, [attachment.id, attachment.localPath, attachment.mediaType, onLoaded])
+  }, [attachment.id, attachment.localPath, attachment.mediaType, context, onLoaded])
 
   /** 保存图片到本地 */
   const handleSave = React.useCallback((): void => {
-    window.electronAPI.saveImageAs(attachment.localPath, attachment.filename)
-  }, [attachment.localPath, attachment.filename])
+    window.electronAPI.saveImageAs(attachment.localPath, attachment.filename, context)
+  }, [attachment.localPath, attachment.filename, context])
 
   if (!imageSrc) {
     return (

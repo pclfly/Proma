@@ -9,12 +9,20 @@
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
 import { LeftSidebar } from './LeftSidebar'
+import { GlobalIconRail, GLOBAL_ICON_RAIL_WIDTH } from './GlobalIconRail'
+import { PlanningSectionSidebar } from '@/components/planning/PlanningSectionSidebar'
+import { SkillsSectionSidebar } from '@/components/agent-skills/SkillsSectionSidebar'
+import { AutomationsListView } from '@/components/automation/AutomationsListView'
+import { StarredSectionSidebar } from '@/components/starred/StarredSessionsView'
+import { VaultSectionSidebarHost } from '@/components/vault/VaultSectionSidebarHost'
+import { planningTabAtom } from '@/atoms/planning-atoms'
+import { agentSkillsTabAtom } from '@/atoms/active-view'
 import { RightSidePanel } from './RightSidePanel'
 import { MainArea } from '@/components/tabs/MainArea'
 import { appModeAtom } from '@/atoms/app-mode'
 import { agentDiffPanelTabAtom, agentSessionComponentOpenMapAtom, agentSessionsAtom, agentSidePanelLayoutAtomFamily, agentSidePanelLayoutMapAtom, agentSidePanelSplitMapAtom, currentAgentSessionIdAtom, currentSessionSidePanelOpenAtom, isWorkspaceComponentTab, pruneAgentSidePanelLayouts, fileBrowserExpandedPathsAtom, fileBrowserScrollTopMapAtom, pruneFileBrowserStateMap } from '@/atoms/agent-atoms'
 import { leftSidebarWidthAtom } from '@/atoms/sidebar-atoms'
-import { sidebarCollapsedAtom } from '@/atoms/tab-atoms'
+import { effectiveSidebarCollapsedAtom } from '@/atoms/preview-sidebar-atoms'
 import { clampRightPanelWidth, getRightPanelMaxWidth } from './right-panel-layout'
 import { automationFormAtom } from '@/atoms/automation-atoms'
 import { activeViewAtom } from '@/atoms/active-view'
@@ -24,9 +32,10 @@ import { WorkspaceMemoryChangeObserver } from '@/components/agent-skills/Workspa
 import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { WindowControls } from '@/components/WindowControls'
 import { SettingsPanel } from '@/components/settings/SettingsPanel'
-import { detectIsWindows } from '@/lib/platform'
+import { detectIsMac, detectIsWindows } from '@/lib/platform'
 import { getWindowTitlebarContentInsetClass } from '@/lib/window-titlebar-layout'
 import { cn } from '@/lib/utils'
+import { useCompactShell } from '@/lib/use-shell-layout'
 import { Toaster } from '@/components/ui/sonner'
 
 const MIN_RIGHT_PANEL_WIDTH = 300
@@ -37,7 +46,8 @@ const MIN_TODO_PANEL_WIDTH = 600
 // 两个 Pane 需要各自保留约 320px 内容区及中间分隔条。
 const MIN_SPLIT_PANEL_WIDTH = 720
 const EXPANDED_WORKSPACE_DEFAULT_VIEWPORT_RATIO = 2 / 5
-const COLLAPSED_LEFT_SIDEBAR_WIDTH = 60
+/** 折叠时只保留全局图标栏，不再保留会话头像 Rail。 */
+const COLLAPSED_LEFT_SIDEBAR_WIDTH = GLOBAL_ICON_RAIL_WIDTH
 
 function isExpandedWorkspaceTab(tab: string | undefined): boolean {
   return Boolean(
@@ -70,6 +80,54 @@ function clampLeftSidebarWidth(width: number): number {
   return Math.max(MIN_LEFT_SIDEBAR_WIDTH, Math.min(MAX_LEFT_SIDEBAR_WIDTH, width))
 }
 
+/**
+ * 窗口标题栏左侧的 Proma 标识。
+ *
+ * 与最小化 / 最大化 / 关闭按钮同一行（32px 标题栏），不占用图标栏。
+ * macOS 让出红绿灯宽度，Windows 从最左侧开始。
+ */
+function AppTitlebarBrand(): React.ReactElement {
+  const isMac = detectIsMac()
+  // 只做展示，不注册 drag region：否则会盖住右侧窗口按钮的点击。
+  return (
+    <div className="pointer-events-none fixed inset-x-0 top-0 z-[100] h-8">
+      <span
+        className="absolute top-0 flex h-8 items-center text-[11px] font-semibold tracking-tight text-foreground/75"
+        style={{ left: isMac ? 76 : 14 }}
+      >
+        Proma
+      </span>
+    </div>
+  )
+}
+
+/** 分区侧栏统一外框：38px 标题行 + 可滚动内容。 */
+function SectionSidebarFrame({
+  title,
+  width,
+  children,
+}: {
+  title: string
+  width: number
+  children?: React.ReactNode
+}): React.ReactElement {
+  const isMac = detectIsMac()
+  return (
+    <div
+      className="flex h-full flex-col bg-[hsl(var(--sidebar-surface))]"
+      style={{ width }}
+      aria-label={title}
+    >
+      <div className={cn('flex h-[38px] shrink-0 items-center px-4 text-[15px] font-semibold text-foreground', isMac && 'mt-[50px] h-[38px]')}>
+        {title}
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto scrollbar-thin">
+        {children}
+      </div>
+    </div>
+  )
+}
+
 export function AppShell(): React.ReactElement {
   const appMode = useAtomValue(appModeAtom)
   const { workspaces, currentWorkspaceId } = useProjectActions()
@@ -92,6 +150,8 @@ export function AppShell(): React.ReactElement {
 
   // 定时任务表单打开时隐藏右侧文件面板，让中间区域扩展到全宽（表单内含自己的右栏配置）
   const [activeView, setActiveView] = useAtom(activeViewAtom)
+  const planningTab = useAtomValue(planningTabAtom)
+  const agentSkillsTab = useAtomValue(agentSkillsTabAtom)
   const productivityTools = useAtomValue(productivityToolsAtom)
   React.useEffect(() => {
     if (!productivityTools.obsidianEnabled && activeView === 'vault') setActiveView('conversations')
@@ -122,15 +182,26 @@ export function AppShell(): React.ReactElement {
       return changed ? next : previous
     })
   }, [activeView, productivityTools.calendarEnabled, productivityTools.obsidianEnabled, productivityTools.todosEnabled, setActiveView, setAgentDiffPanelTabs, setAgentSessionComponentOpenMap])
-  const showRightPanel = appMode === 'agent' && !!currentSessionId && !(automationForm.open && activeView !== 'conversations') && activeView !== 'planning' && activeView !== 'agent-skills'
+  // 官方 0.22.0：右侧会话面板只在 Agent 会话主视图出现；清单/日程/收藏/记忆/Skills 都是全屏工作区。
+  const compactShell = useCompactShell()
+  const showRightPanelBase = appMode === 'agent' && !!currentSessionId && activeView === 'conversations' && !(automationForm.open && activeView !== 'conversations')
   const isWindows = React.useMemo(() => detectIsWindows(), [])
 
   // 左侧边栏可拖拽宽度
   const [leftSidebarWidth, setLeftSidebarWidth] = useAtom(leftSidebarWidthAtom)
-  const [sidebarCollapsed, setSidebarCollapsed] = useAtom(sidebarCollapsedAtom)
+  const [sidebarCollapsed, setSidebarCollapsed] = useAtom(effectiveSidebarCollapsedAtom)
   const leftDragging = React.useRef(false)
   const [isDraggingLeftSidebar, setIsDraggingLeftSidebar] = React.useState(false)
   const clampedLeftSidebarWidth = clampLeftSidebarWidth(leftSidebarWidth)
+  const showConversationSidebar = activeView === 'conversations'
+  // 记忆与日程是整页视图，官方不给第二列；其余分区都有分区侧栏。
+  const showSectionSidebar = !compactShell && !sidebarCollapsed && (
+    showConversationSidebar
+    || (activeView === 'planning' && planningTab !== 'calendar')
+    || activeView === 'starred'
+    || activeView === 'vault'
+    || (activeView === 'agent-skills' && agentSkillsTab !== 'memory')
+  )
 
   React.useEffect(() => {
     if (clampedLeftSidebarWidth !== leftSidebarWidth) {
@@ -199,16 +270,21 @@ export function AppShell(): React.ReactElement {
     activeRightPanelSplit === null && activeRightPanelTab === 'todos',
     rightPanelLayout.hasOpenedWideWorkspace || (activeRightPanelSplit === null && isExpandedRightWorkspace),
   )
+  // 紧凑单栏只影响渲染，不改写用户的桌面折叠偏好。
+  const layoutSidebarCollapsed = sidebarCollapsed || compactShell
+  const showRightPanel = showRightPanelBase && !compactShell
   const rightPanelMinimumWidth = activeRightPanelSplit
     ? MIN_SPLIT_PANEL_WIDTH
     : ordinaryRightPanelMinimumWidth
-  const leftSidebarContentWidth = sidebarCollapsed ? COLLAPSED_LEFT_SIDEBAR_WIDTH : clampedLeftSidebarWidth
+  // 全局图标栏常驻；展开时额外占用分区侧栏宽度。
+  const leftSidebarContentWidth = GLOBAL_ICON_RAIL_WIDTH
+    + (layoutSidebarCollapsed ? 0 : clampedLeftSidebarWidth)
   // 经典界面已移除，侧栏始终只占内容宽度与分隔线。
   const leftSidebarOccupiedWidth = leftSidebarContentWidth + 1
   // 右侧面板是完整的工作区：不论当前为文件、改动或扩展 Tab，继续向左拖拽时
   // 都应能收起左侧 Sidebar，并使用释放出的全部宽度；主区域仍由 MIN_MAIN_AREA_WIDTH 兜底。
-  const canUseCollapsedSidebarSpace = sidebarCollapsed
-  const canAutoCollapseSidebarForRightPanel = !sidebarCollapsed
+  const canUseCollapsedSidebarSpace = layoutSidebarCollapsed
+  const canAutoCollapseSidebarForRightPanel = !layoutSidebarCollapsed
   const clampedRightPanelWidth = clampRightPanelWidth(
     rightPanelLayout.width,
     viewportWidth,
@@ -358,23 +434,50 @@ export function AppShell(): React.ReactElement {
   return (
     <>
       <WindowControls />
+      <AppTitlebarBrand />
 
       <div className="shell-bg relative h-screen w-screen overflow-hidden bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-950 dark:to-zinc-900">
         <div
           ref={appContentRef}
           className={cn('flex h-full w-full', getWindowTitlebarContentInsetClass(isWindows), settingsOpen && 'hidden')}
         >
-            {/* 左侧边栏：可折叠，可拖拽调整宽度 */}
-            <div className="relative z-[60] crt-sidebar">
-              <LeftSidebar width={clampedLeftSidebarWidth} noTransition={isDraggingLeftSidebar} />
-              {/* 侧边栏展开时显示拖拽手柄，折叠态隐藏 */}
-              {!sidebarCollapsed && (
-                <div
-                  className={cn(
-                    'absolute right-0 top-0 bottom-0 w-4 translate-x-1/2 cursor-col-resize hover:bg-primary/5 active:bg-primary/50 transition-colors z-20'
-                  )}
-                  onMouseDown={handleLeftSidebarMouseDown}
-                />
+            {/* 左侧：全局图标栏常驻；分区侧栏可折叠、可拖拽调整宽度。 */}
+            <div className="relative z-[60] crt-sidebar flex h-full">
+              <GlobalIconRail />
+              {showSectionSidebar && (
+                <div className="relative h-full">
+                  {showConversationSidebar ? (
+                    <LeftSidebar width={clampedLeftSidebarWidth} noTransition={isDraggingLeftSidebar} />
+                  ) : activeView === 'planning' && planningTab === 'todos' ? (
+                    <SectionSidebarFrame title="清单" width={clampedLeftSidebarWidth}>
+                      <PlanningSectionSidebar />
+                    </SectionSidebarFrame>
+                  ) : activeView === 'planning' && planningTab === 'automations' ? (
+                    <SectionSidebarFrame title="定时任务" width={clampedLeftSidebarWidth}>
+                      <div className="p-2"><AutomationsListView /></div>
+                    </SectionSidebarFrame>
+                  ) : activeView === 'planning' ? (
+                    <SectionSidebarFrame title="日程" width={clampedLeftSidebarWidth} />
+                  ) : activeView === 'vault' ? (
+                    <SectionSidebarFrame title="Obsidian" width={clampedLeftSidebarWidth}>
+                      <VaultSectionSidebarHost />
+                    </SectionSidebarFrame>
+                  ) : activeView === 'starred' ? (
+                    <SectionSidebarFrame title="收藏会话" width={clampedLeftSidebarWidth}>
+                      <StarredSectionSidebar />
+                    </SectionSidebarFrame>
+                  ) : activeView === 'agent-skills' ? (
+                    <SectionSidebarFrame title="Skills/MCP" width={clampedLeftSidebarWidth}>
+                      <SkillsSectionSidebar />
+                    </SectionSidebarFrame>
+                  ) : null}
+                  <div
+                    className={cn(
+                      'absolute right-0 top-0 bottom-0 w-4 translate-x-1/2 cursor-col-resize hover:bg-primary/5 active:bg-primary/50 transition-colors z-20'
+                    )}
+                    onMouseDown={handleLeftSidebarMouseDown}
+                  />
+                </div>
               )}
             </div>
             <div aria-hidden="true" className="relative z-[61] w-px flex-shrink-0 bg-border/80 dark:bg-border/70" />

@@ -10,15 +10,22 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, cpSync, mkdirSync
 import { cp as cpAsync, readFile as readFileAsync, realpath as realpathAsync, writeFile as writeFileAsync } from 'node:fs/promises'
 import type { Dirent } from 'node:fs'
 import { writeExistingSkillFile } from './skill-file-write'
+import { writeWorkspaceKnowledgeFileAtomic } from './workspace-knowledge-write'
+import { createKnowledgeReadTicket, consumeKnowledgeReadTicket, invalidateKnowledgeReadTickets, type KnowledgeReadTicket } from './workspace-knowledge-read-ticket'
+import { notifyWorkspaceKnowledgePolicyChanged } from './workspace-knowledge-policy-events'
+import { knowledgePathKey, knowledgeBoundaryMatches, captureKnowledgeBoundary, knowledgeResolutionBoundary, normalizeKnowledgeRelativePath, resolveWorkspaceKnowledgePath, type KnowledgeAccessPolicy, type KnowledgeBoundarySnapshot } from './workspace-knowledge-access'
+import { knowledgeAccessState, scanWorkspaceMemoryTree, type WorkspaceMemoryTreeLimits, type WorkspaceMemoryTreeSnapshot } from './workspace-memory-tree'
 import { rmSyncWithRetry, renameIfDestinationAbsentWithRetry, renameWithRetry } from './fs-retry'
+import { isEnterpriseSkillSource, readEnterpriseSkillSource } from './enterprise-skills-service'
 import { getLocalProjectRootStatus } from './project-root-health'
 import { writeJsonFileAtomic, readJsonFileSafe, writeTextFileAtomic } from './safe-file'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { join, resolve, relative, isAbsolute, dirname, basename } from 'node:path'
 import {
   getAgentWorkspacesIndexPath,
   getAgentWorkspacesDir,
   getAgentWorkspacePath,
+  resolveAgentWorkspaceDirPath,
   getWorkspaceMcpPath,
   getWorkspaceSkillsDir,
   getWorkspaceFilesDir,
@@ -32,7 +39,7 @@ import { findAllGitRoots, normalizeGitRoot } from './git-diff-service'
 import { listBuiltinMcpServers } from './builtin-mcp/catalog'
 import { RESERVED_BUILTIN_KEYS } from './builtin-mcp/baseline'
 import { inferMcpTransportType, normalizeMcpTransportType } from '@proma/shared'
-import type { AgentWorkspace, CreateAgentWorkspaceInput, WorkspaceMcpConfig, SkillMeta, SkillImportSource, OtherWorkspaceSkillsGroup, WorkspaceCapabilities, SkillFileNode, SkillFileContent, WorkspaceMemorySummary, BulkImportSkillItemResult, BulkImportSkillsResult, BulkImportWorkspaceSelection } from '@proma/shared'
+import type { AgentWorkspace, CreateAgentWorkspaceInput, WorkspaceMcpConfig, SkillMeta, SkillImportSource, EnterpriseSkillSource, OtherWorkspaceSkillsGroup, WorkspaceCapabilities, SkillFileNode, SkillFileContent, WorkspaceMemorySummary, WorkspaceMemoryFileNode, BulkImportSkillItemResult, BulkImportSkillsResult, BulkImportWorkspaceSelection } from '@proma/shared'
 
 interface AgentWorkspacesIndex {
   version: number
@@ -334,7 +341,7 @@ export async function createAgentWorkspace(input: string | CreateAgentWorkspaceI
 /** 更新工作区名称（slug 和目录不变） */
 export async function updateAgentWorkspace(
   id: string,
-  updates: { name: string },
+  updates: { name?: string; archived?: boolean },
 ): Promise<AgentWorkspace> {
   const index = readIndex()
   const idx = index.workspaces.findIndex((w) => w.id === id)
@@ -345,14 +352,20 @@ export async function updateAgentWorkspace(
 
   const existing = index.workspaces[idx]!
 
-  const duplicate = index.workspaces.find((w) => w.id !== id && w.name === updates.name)
+  const nextName = updates.name ?? existing.name
+  if (nextName.trim().length === 0) {
+    throw new Error('项目名称不能为空')
+  }
+  const duplicate = index.workspaces.find((w) => w.id !== id && w.name === nextName)
   if (duplicate) {
-    throw new Error(`项目名称「${updates.name}」已存在`)
+    throw new Error(`项目名称「${nextName}」已存在`)
   }
 
   const updated: AgentWorkspace = {
     ...existing,
-    name: updates.name,
+    name: nextName,
+    // 归档只是展示层标记：不动会话、目录、技能与项目配置。
+    ...(updates.archived === undefined ? {} : { archived: updates.archived ? true : undefined }),
     updatedAt: Date.now(),
   }
 
@@ -565,6 +578,11 @@ export function upgradeDefaultSkillsInWorkspaces(): void {
       const inactivePath = join(inactiveDir, slug)
 
       if (existsSync(activePath)) {
+        // 企业库 Skill 由企业库发布/更新，默认 Skills 同步不得覆盖其内容。
+        if (readEnterpriseSkillSource(activePath)) {
+          console.log(`[Agent 工作区] 跳过企业库 Skill 的默认版本覆盖: ${workspace.slug}/${slug} (active)`)
+          continue
+        }
         const currentVer = parseSkillVersion(activePath)
         if (compareSemver(info.version, currentVer) > 0) {
           if (safeReplaceSkillDir(info.sourcePath, activePath)) {
@@ -581,6 +599,10 @@ export function upgradeDefaultSkillsInWorkspaces(): void {
       }
 
       if (existsSync(inactivePath)) {
+        if (readEnterpriseSkillSource(inactivePath)) {
+          console.log(`[Agent 工作区] 跳过企业库 Skill 的默认版本覆盖: ${workspace.slug}/${slug} (inactive)`)
+          continue
+        }
         const currentVer = parseSkillVersion(inactivePath)
         if (compareSemver(info.version, currentVer) > 0) {
           if (safeReplaceSkillDir(info.sourcePath, inactivePath)) {
@@ -842,6 +864,8 @@ function scanSkillsInDir(dir: string, enabled: boolean): SkillMeta[] {
     const entries = readdirSync(dir, { withFileTypes: true })
 
     for (const entry of entries) {
+      // 跳过隐藏目录：企业 Skill 的暂存/备份残留、导入中的临时目录都以 `.` 开头。
+      if (entry.name.startsWith('.')) continue
       if (!isSkillDirectoryEntry(dir, entry)) continue
 
       const skillMdPath = join(dir, entry.name, 'SKILL.md')
@@ -851,14 +875,16 @@ function scanSkillsInDir(dir: string, enabled: boolean): SkillMeta[] {
         const content = readFileSync(skillMdPath, 'utf-8')
         const meta = parseSkillFrontmatter(content, entry.name, enabled)
 
-        // 如果是导入的 Skill，读取来源信息并检测更新
-        const importSource = readSkillImportSource(join(dir, entry.name))
-        if (importSource) {
-          meta.importSource = importSource
-          const sourceSkillDir = resolveSkillDir(importSource.sourceWorkspaceSlug, entry.name)
+        // 企业库 Skill 只带企业来源，不参与“从其他项目导入”的更新检测。
+        const source = readSkillImportSource(join(dir, entry.name))
+        if (isEnterpriseSkillSource(source)) {
+          meta.enterpriseSource = source
+        } else if (source) {
+          meta.importSource = source
+          const sourceSkillDir = resolveSkillDir(source.sourceWorkspaceSlug, entry.name)
           if (sourceSkillDir) {
             const currentSourceVersion = parseSkillVersion(sourceSkillDir)
-            meta.hasUpdate = isNewerVersion(currentSourceVersion, importSource.sourceVersion)
+            meta.hasUpdate = isNewerVersion(currentSourceVersion, source.sourceVersion)
           }
         }
 
@@ -996,6 +1022,11 @@ export async function importSkillFromWorkspace(
     throw new Error(`源 Skill 缺少 SKILL.md: ${skillSlug}`)
   }
 
+  // 企业库 Skill 的版本与来源由企业库管理，跨工作区复制会丢失版本绑定。
+  if (isEnterpriseSkillSource(readSkillImportSource(sourcePath))) {
+    throw new Error(`企业库 Skill 不支持从其他工作区导入: ${skillSlug}`)
+  }
+
   const targetSkillsDir = getWorkspaceSkillsDir(targetSlug)
   const targetPath = join(targetSkillsDir, skillSlug)
   const targetInactivePath = join(getInactiveSkillsDir(targetSlug), skillSlug)
@@ -1105,6 +1136,9 @@ export function updateSkillFromSource(
   if (!existingSource) {
     throw new Error(`Skill ${skillSlug} 不是从其他项目导入的，无法从源更新`)
   }
+  if (isEnterpriseSkillSource(existingSource)) {
+    throw new Error(`企业库 Skill 不支持从其他项目更新，请使用企业库的更新检查: ${skillSlug}`)
+  }
 
   const sourcePath = resolveSkillDir(existingSource.sourceWorkspaceSlug, skillSlug)
   if (!sourcePath) {
@@ -1152,11 +1186,26 @@ export function updateSkillFromSource(
 
 const SOURCE_META_FILE = '.source.json'
 
-function readSkillImportSource(skillDir: string): SkillImportSource | undefined {
+/**
+ * 读取 Skill 来源标记。
+ *
+ * `.source.json` 有两种互斥形态：
+ * - 企业库来源（`type: 'enterprise-library'` + `schemaVersion: 2`）
+ * - 跨工作区导入来源（`sourceWorkspaceSlug` / `sourceWorkspaceName`）
+ */
+function readSkillImportSource(skillDir: string): SkillImportSource | EnterpriseSkillSource | undefined {
   const p = join(skillDir, SOURCE_META_FILE)
   if (!existsSync(p)) return undefined
   try {
-    return JSON.parse(readFileSync(p, 'utf-8')) as SkillImportSource
+    const parsed: unknown = JSON.parse(readFileSync(p, 'utf-8'))
+    if (isEnterpriseSkillSource(parsed)) return parsed
+    if (parsed && typeof parsed === 'object') {
+      const candidate = parsed as Partial<SkillImportSource>
+      if (typeof candidate.sourceWorkspaceSlug === 'string' && typeof candidate.sourceWorkspaceName === 'string') {
+        return candidate as SkillImportSource
+      }
+    }
+    return undefined
   } catch {
     return undefined
   }
@@ -1386,275 +1435,194 @@ export function migrateWorkspaceAutoMemoryDirectories(): void {
   }
 }
 
-function fileSummary(absPath: string): WorkspaceMemorySummary['agentsMd'] {
-  if (!existsSync(absPath)) {
-    return { exists: false, path: absPath, size: 0 }
-  }
-  const st = statSync(absPath)
-  return {
-    exists: st.isFile(),
-    path: absPath,
-    size: st.isFile() ? st.size : 0,
-    updatedAt: st.mtimeMs,
-  }
+/** 验证注册表中的确切slug，不因一次读取而创建未知工作区或迁移历史目录。 */
+export function getKnownKnowledgeWorkspace(workspaceSlug: string): AgentWorkspace {
+  if (typeof workspaceSlug !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(workspaceSlug) || WINDOWS_RESERVED_SLUGS.has(workspaceSlug.toLowerCase())) throw new Error('非法工作区标识')
+  const workspaceRoot = resolveAgentWorkspaceDirPath(workspaceSlug)
+  const indexPath = join(dirname(dirname(workspaceRoot)), 'agent-workspaces.json')
+  const index = readJsonFileSafe<AgentWorkspacesIndex>(indexPath)
+  const workspace = index?.workspaces?.find(item => item.slug === workspaceSlug)
+  if (!workspace) throw new Error('工作区不存在，不能访问其知识文件')
+  // 先验证管理目录，再读取其附加目录配置，避免跟随被替换的管理目录。
+  resolveWorkspaceKnowledgePath({ anchor: workspaceRoot, logicalRoot: workspaceRoot, authorizedDirectories: [] }, '', { allowRoot: true })
+  return workspace
+}
+
+/** 每次访问取得当前授权；不复用会话附件、不扩大到工作区聚合根。 */
+/** 只计算项目根，不创建任何目录；供只读分类/审计使用。 */
+export function resolveWorkspaceProjectRoot(workspaceSlug: string): string {
+  const workspace = getKnownKnowledgeWorkspace(workspaceSlug)
+  return workspace.projectRootPath ?? join(resolveAgentWorkspaceDirPath(workspace.slug), 'workspace-files')
+}
+
+export function getWorkspaceKnowledgePolicy(workspaceSlug: string, kind: 'memory' | 'workspace_agents' | 'project_agents' = 'memory'): KnowledgeAccessPolicy {
+  const workspace = getKnownKnowledgeWorkspace(workspaceSlug)
+  const workspaceRoot = resolveAgentWorkspaceDirPath(workspaceSlug)
+  const projectRoot = workspace.projectRootPath ?? join(workspaceRoot, 'workspace-files')
+  const anchor = kind === 'project_agents' ? projectRoot : workspaceRoot
+  return { anchor, logicalRoot: kind === 'memory' ? join(workspaceRoot, AUTO_MEMORY_DIR) : anchor, authorizedDirectories: getWorkspaceAttachedDirectories(workspaceSlug) }
+}
+
+function fileSummary(policy: KnowledgeAccessPolicy, relativePath: string): WorkspaceMemorySummary['agentsMd'] {
+  const path = join(policy.logicalRoot, relativePath)
+  try {
+    const target = resolveWorkspaceKnowledgePath(policy, relativePath, { allowMissing: true })
+    return { exists: target.kind === 'file', path, size: target.kind === 'file' ? target.size : 0, updatedAt: target.modifiedAt, ...(target.linked && { isSymbolicLink: true, linkState: 'authorized' }) }
+  } catch (error) { return { exists: false, path, size: 0, ...knowledgeAccessState(error) } }
 }
 
 export function getWorkspaceAgentsMdPath(workspaceSlug: string): string {
-  return join(getAgentWorkspacePath(workspaceSlug), WORKSPACE_AGENTS_MD)
+  getKnownKnowledgeWorkspace(workspaceSlug)
+  return join(resolveAgentWorkspaceDirPath(workspaceSlug), WORKSPACE_AGENTS_MD)
 }
 
 function getWorkspaceAutoMemoryPath(workspaceSlug: string): string {
-  migrateWorkspaceAutoMemoryDirectory(workspaceSlug)
-  return join(getAgentWorkspacePath(workspaceSlug), AUTO_MEMORY_DIR)
+  getKnownKnowledgeWorkspace(workspaceSlug)
+  return join(resolveAgentWorkspaceDirPath(workspaceSlug), AUTO_MEMORY_DIR)
 }
 
 export function getWorkspaceAutoMemoryDir(workspaceSlug: string): string {
-  const dir = getWorkspaceAutoMemoryPath(workspaceSlug)
-  if (!existsSync(dir)) {
-    mkdirSync(dir, { recursive: true })
-  } else if (!isRegularDirectory(dir)) {
-    throw new Error(`长期记忆路径不是目录: ${dir}`)
-  }
-  return dir
+  const policy = getWorkspaceKnowledgePolicy(workspaceSlug)
+  const target = resolveWorkspaceKnowledgePath(policy, '', { allowRoot: true, allowMissing: true })
+  if (target.kind === 'missing') {
+    mkdirSync(target.physicalPath, { recursive: true })
+    resolveWorkspaceKnowledgePath(getWorkspaceKnowledgePolicy(workspaceSlug), '', { allowRoot: true })
+  } else if (target.kind !== 'directory') throw new Error('长期记忆路径不是目录')
+  return policy.logicalRoot
 }
 
-function resolveAutoMemoryFilePath(memoryDir: string, relativePath: string): string {
-  if (typeof relativePath !== 'string' || relativePath.length === 0) {
-    throw new Error('相对路径不能为空')
-  }
-  if (isAbsolute(relativePath)) {
-    throw new Error('禁止传入绝对路径')
-  }
-  const normalized = relativePath.replace(/\\/g, '/')
-  const resolved = resolve(memoryDir, normalized)
-  const rel = relative(memoryDir, resolved)
-  if (rel === '' || rel.startsWith('..') || isAbsolute(rel)) {
-    throw new Error('非法路径：禁止访问 auto memory 目录外')
-  }
-  // 防御 symlink 逃逸：字符串层面的 relative 检查无法识别目录内指向外部的软链接。
-  // 对真实存在的最近祖先做 realpath 校验，确保解析后仍落在 memoryDir 之内。
-  const memoryRealDir = existsSync(memoryDir) ? realpathSync(memoryDir) : memoryDir
-  let probe = resolved
-  while (probe !== memoryDir && !existsSync(probe)) {
-    const parent = dirname(probe)
-    if (parent === probe) break
-    probe = parent
-  }
-  if (existsSync(probe)) {
-    const realProbe = realpathSync(probe)
-    const realRel = relative(memoryRealDir, realProbe)
-    if (realRel.startsWith('..') || isAbsolute(realRel)) {
-      throw new Error('非法路径：禁止通过软链接访问 auto memory 目录外')
-    }
-  }
-  return resolved
-}
-
-function collectAutoMemorySummary(memoryDir: string): WorkspaceMemorySummary['autoMemory'] {
-  let fileCount = 0
-  let totalSize = 0
-  let updatedAt: number | undefined
-
-  const walk = (dir: string, depth: number): void => {
-    if (depth > SKILL_TREE_MAX_DEPTH) return
-    let entries: import('node:fs').Dirent[]
-    try {
-      entries = readdirSync(dir, { withFileTypes: true })
-    } catch {
-      return
-    }
-    for (const entry of entries) {
-      if (entry.name.startsWith('.')) continue
-      const absPath = join(dir, entry.name)
-      if (entry.isDirectory()) {
-        walk(absPath, depth + 1)
-      } else if (entry.isFile()) {
-        const st = statSync(absPath)
-        if (isLikelyBinaryFile(absPath, st.size)) continue
-        fileCount += 1
-        totalSize += st.size
-        updatedAt = updatedAt == null ? st.mtimeMs : Math.max(updatedAt, st.mtimeMs)
-      }
-    }
-  }
-
-  walk(memoryDir, 0)
-  return {
-    directory: memoryDir,
-    memoryMdExists: existsSync(join(memoryDir, AUTO_MEMORY_INDEX)),
-    fileCount,
-    totalSize,
-    updatedAt,
-  }
-}
-
-function buildMemoryFileTree(rootDir: string, currentDir: string, depth: number): SkillFileNode[] {
-  if (depth > SKILL_TREE_MAX_DEPTH) return []
-  let entries: import('node:fs').Dirent[]
-  try {
-    entries = readdirSync(currentDir, { withFileTypes: true })
-  } catch {
-    return []
-  }
-
-  const nodes: SkillFileNode[] = []
-  for (const entry of entries) {
-    if (entry.name.startsWith('.')) continue
-    const absPath = join(currentDir, entry.name)
-    const rel = relative(rootDir, absPath).split(/[\\/]/).join('/')
-
-    if (entry.isDirectory()) {
-      nodes.push({
-        relativePath: rel,
-        name: entry.name,
-        type: 'directory',
-        children: buildMemoryFileTree(rootDir, absPath, depth + 1),
-      })
-    } else if (entry.isFile()) {
-      let size = 0
-      let modifiedAt: number | undefined
-      try {
-        const stat = statSync(absPath)
-        size = stat.size
-        modifiedAt = stat.mtimeMs
-      } catch {
-        // ignore
-      }
-      nodes.push({
-        relativePath: rel,
-        name: entry.name,
-        type: 'file',
-        size,
-        modifiedAt,
-        isText: !isLikelyBinaryFile(absPath, size),
-      })
-    }
-  }
-
-  nodes.sort((a, b) => {
-    if (a.type !== b.type) return a.type === 'directory' ? -1 : 1
-    if (a.relativePath === AUTO_MEMORY_INDEX) return -1
-    if (b.relativePath === AUTO_MEMORY_INDEX) return 1
-    return a.name.localeCompare(b.name)
-  })
-  return nodes
+/** 树、摘要、监听共用有界扫描和链接授权，不在只读路径做历史迁移。 */
+export function getWorkspaceMemoryTreeSnapshot(workspaceSlug: string, limits: WorkspaceMemoryTreeLimits = {}): WorkspaceMemoryTreeSnapshot {
+  return scanWorkspaceMemoryTree(getWorkspaceKnowledgePolicy(workspaceSlug), limits)
 }
 
 function getWorkspaceInstructionConflict(workspaceSlug: string): WorkspaceMemorySummary['instructionConflict'] {
-  const workspaceRoot = getAgentWorkspacePath(workspaceSlug)
+  const workspaceRoot = resolveAgentWorkspaceDirPath(workspaceSlug)
   const legacyPath = join(workspaceRoot, LEGACY_WORKSPACE_CLAUDE_MD)
   const agentsPath = join(workspaceRoot, WORKSPACE_AGENTS_MD)
   if (!isRegularFile(legacyPath) || !isRegularFile(agentsPath)) return undefined
-
-  try {
-    return readFileSync(legacyPath).equals(readFileSync(agentsPath))
-      ? undefined
-      : { legacyPath, agentsPath }
-  } catch (error) {
-    console.warn(`[Agent 工作区] 读取指令迁移冲突状态失败 (${workspaceSlug}):`, error)
-    return undefined
-  }
+  try { return readFileSync(legacyPath).equals(readFileSync(agentsPath)) ? undefined : { legacyPath, agentsPath } } catch { return undefined }
 }
 
 export function getWorkspaceMemorySummary(workspaceSlug: string): WorkspaceMemorySummary {
-  const workspaceRoot = getAgentWorkspacePath(workspaceSlug)
-  const memoryDir = getWorkspaceAutoMemoryPath(workspaceSlug)
-  const legacyDir = join(workspaceRoot, LEGACY_AUTO_MEMORY_DIR)
-  const legacyMigration = existsSync(legacyDir) ? migrateWorkspaceAutoMemoryDirectory(workspaceSlug) : undefined
+  const policy = getWorkspaceKnowledgePolicy(workspaceSlug)
+  const snapshot = scanWorkspaceMemoryTree(policy)
+  const files = new Map(snapshot.files.filter(file => file.isText).map(file => [knowledgePathKey(file.target.physicalPath), file]))
+  let totalSize = 0
+  let updatedAt: number | undefined
+  for (const { target } of files.values()) { totalSize += target.size; updatedAt = Math.max(updatedAt ?? 0, target.modifiedAt ?? 0) }
+  const legacyDir = join(resolveAgentWorkspaceDirPath(workspaceSlug), LEGACY_AUTO_MEMORY_DIR)
+  // 只报告仍存在的历史目录。迁移仍由既有显式启动流程负责，不在摘要读取中移动文件。
+  const legacyPresent = (() => { try { return lstatSync(legacyDir).isDirectory() } catch { return false } })()
   const instructionConflict = getWorkspaceInstructionConflict(workspaceSlug)
   return {
-    agentsMd: fileSummary(getWorkspaceAgentsMdPath(workspaceSlug)),
+    agentsMd: fileSummary(getWorkspaceKnowledgePolicy(workspaceSlug, 'workspace_agents'), WORKSPACE_AGENTS_MD),
     ...(instructionConflict && { instructionConflict }),
-    ...(legacyMigration && {
-      legacyAutoMemory: {
-        directory: legacyDir,
-        conflictingPaths: legacyMigration.conflictingPaths,
-        ...(legacyMigration.issue && { migrationIssue: legacyMigration.issue }),
-        ...(legacyMigration.symbolicLinkPath && { symbolicLinkPath: legacyMigration.symbolicLinkPath }),
-      },
-    }),
-    autoMemory: collectAutoMemorySummary(memoryDir),
+    ...(legacyPresent && { legacyAutoMemory: { directory: legacyDir, conflictingPaths: [] } }),
+    authorizedDirectories: [...policy.authorizedDirectories],
+    autoMemory: { directory: policy.logicalRoot, memoryMdExists: fileSummary(policy, AUTO_MEMORY_INDEX).exists, fileCount: files.size, totalSize, updatedAt, access: snapshot.rootAccess, truncated: snapshot.truncated },
   }
+}
+
+function readWorkspaceKnowledgeFile(workspaceSlug: string, relativePath: string, kind: 'memory' | 'workspace_agents'): SkillFileContent {
+  const path = normalizeKnowledgeRelativePath(relativePath)
+  const target = resolveWorkspaceKnowledgePath(getWorkspaceKnowledgePolicy(workspaceSlug, kind), path, { allowMissing: true })
+  const missingAllowed = kind === 'workspace_agents' || path === AUTO_MEMORY_INDEX
+  if (target.kind === 'missing' && !missingAllowed) throw new Error(`文件不存在: ${path}`)
+  if (target.kind === 'directory') throw new Error(`目标不是文件: ${path}`)
+  if (target.size > SKILL_FILE_SIZE_LIMIT) throw new Error('知识文件过大，超过 10 MB 限制')
+  const binary = target.kind === 'file' && isLikelyBinaryFile(target.physicalPath, target.size)
+  const content = target.kind === 'file' && !binary ? readFileSync(target.physicalPath, 'utf8') : ''
+  // 读票据绑定本次解析的物理目标与授权边界，使read→save间隙的别名换向不能写错文件。
+  const revision = createKnowledgeReadTicket({
+    workspaceSlug, kind, relativePath: path,
+    physicalPathKey: knowledgePathKey(target.physicalPath), boundaryIdentity: JSON.stringify(captureKnowledgeBoundary(target)), content,
+  })
+  return { relativePath: path, isText: !binary, size: target.kind === 'missing' ? 0 : target.size, isSymbolicLink: target.linked, linkState: target.linked ? 'authorized' : undefined, revision, ...(target.kind === 'file' && !binary && { content }) }
+}
+
+/** 保存时可附读票据；票据在首次使用即消费，且仍在提交前重验目标与正文。 */
+function validateReadRevision(workspaceSlug: string, relativePath: string, kind: 'memory' | 'workspace_agents', revision: string | undefined, content: string): ((current: string) => void) | undefined {
+  if (!revision) return undefined
+  const ticket = consumeKnowledgeReadTicket(revision, { workspaceSlug, kind, relativePath })
+  return (current: string): void => {
+    if (ticket.contentSha256 !== createHash('sha256').update(current, 'utf8').digest('hex')) throw new Error('记忆文件已在磁盘上更新，请重新载入')
+  }
+}
+
+function assertRevisionTarget(ticket: KnowledgeReadTicket | undefined, target: ReturnType<typeof resolveWorkspaceKnowledgePath>): void {
+  if (!ticket) return
+  let snapshot: KnowledgeBoundarySnapshot | undefined
+  try { snapshot = JSON.parse(ticket.boundaryIdentity) as KnowledgeBoundarySnapshot } catch { snapshot = undefined }
+  // 受控保存自己新建的中间目录允许出现；已观察目录/link换身份、授权或物理目标变化仍拒绝。
+  if (ticket.physicalPathKey !== knowledgePathKey(target.physicalPath)
+    || !snapshot || !knowledgeBoundaryMatches(snapshot, target, ticket.physicalPathKey)
+    || target.kind === 'directory') {
+    throw new Error('记忆文件路径已变化或授权已撤销，请重新打开')
+  }
+}
+
+function assertRevisionContent(ticket: KnowledgeReadTicket | undefined, current: string): void {
+  if (!ticket) return
+  if (ticket.contentSha256 !== createHash('sha256').update(current, 'utf8').digest('hex')) throw new Error('记忆文件已在磁盘上更新，请重新载入')
 }
 
 export function readWorkspaceAgentsMd(workspaceSlug: string): SkillFileContent {
-  const abs = getWorkspaceAgentsMdPath(workspaceSlug)
-  if (!existsSync(abs)) {
-    return { relativePath: WORKSPACE_AGENTS_MD, isText: true, size: 0, content: '' }
-  }
-  const st = statSync(abs)
-  if (!st.isFile()) throw new Error(`${WORKSPACE_AGENTS_MD} 不是文件`)
-  if (st.size > SKILL_FILE_SIZE_LIMIT) {
-    throw new Error(`文件过大（${(st.size / 1024 / 1024).toFixed(2)} MB），超过 10 MB 限制`)
-  }
-  const binary = isLikelyBinaryFile(abs, st.size)
-  return {
-    relativePath: WORKSPACE_AGENTS_MD,
-    isText: !binary,
-    size: st.size,
-    content: binary ? undefined : readFileSync(abs, 'utf-8'),
-  }
+  return readWorkspaceKnowledgeFile(workspaceSlug, WORKSPACE_AGENTS_MD, 'workspace_agents')
 }
 
-export function writeWorkspaceAgentsMd(workspaceSlug: string, content: string, expectedContent?: string): void {
-  const path = getWorkspaceAgentsMdPath(workspaceSlug)
-  const currentContent = existsSync(path) ? readFileSync(path, 'utf-8') : ''
-  if (expectedContent !== undefined && currentContent !== expectedContent) {
-    throw new Error('文件已被外部更新。请刷新后再处理你的修改。')
-  }
-  const byteLen = Buffer.byteLength(content, 'utf-8')
-  if (byteLen > SKILL_FILE_SIZE_LIMIT) {
-    throw new Error(`内容过大（${(byteLen / 1024 / 1024).toFixed(2)} MB），超过 10 MB 限制`)
-  }
-  writeTextFileAtomic(path, content)
-  console.log(`[Agent 工作区] 已更新工作区 AGENTS.md: ${workspaceSlug}`)
+export function writeWorkspaceAgentsMd(workspaceSlug: string, content: string, expectedContent?: string, revision?: string): KnowledgeWriteResult {
+  return writeKnowledgeWithRevision(workspaceSlug, 'workspace_agents', WORKSPACE_AGENTS_MD, content, expectedContent, revision)
 }
 
-export function listWorkspaceAutoMemoryFiles(workspaceSlug: string): SkillFileNode[] {
-  const dir = getWorkspaceAutoMemoryDir(workspaceSlug)
-  return buildMemoryFileTree(dir, dir, 0)
+export function listWorkspaceAutoMemoryFiles(workspaceSlug: string): WorkspaceMemoryFileNode[] {
+  return getWorkspaceMemoryTreeSnapshot(workspaceSlug).nodes
 }
 
 export function readWorkspaceAutoMemoryFile(workspaceSlug: string, relativePath: string): SkillFileContent {
-  const dir = getWorkspaceAutoMemoryDir(workspaceSlug)
-  const abs = resolveAutoMemoryFilePath(dir, relativePath)
-  if (!existsSync(abs) && relativePath === AUTO_MEMORY_INDEX) {
-    return { relativePath: AUTO_MEMORY_INDEX, isText: true, size: 0, content: '' }
-  }
-  if (!existsSync(abs)) throw new Error(`文件不存在: ${relativePath}`)
-
-  const st = statSync(abs)
-  if (!st.isFile()) throw new Error(`目标不是文件: ${relativePath}`)
-  if (st.size > SKILL_FILE_SIZE_LIMIT) {
-    throw new Error(`文件过大（${(st.size / 1024 / 1024).toFixed(2)} MB），超过 10 MB 限制`)
-  }
-
-  const binary = isLikelyBinaryFile(abs, st.size)
-  return {
-    relativePath: relative(dir, abs).split(/[\\/]/).join('/'),
-    isText: !binary,
-    size: st.size,
-    content: binary ? undefined : readFileSync(abs, 'utf-8'),
-  }
+  return readWorkspaceKnowledgeFile(workspaceSlug, relativePath, 'memory')
 }
 
-export function writeWorkspaceAutoMemoryFile(workspaceSlug: string, relativePath: string, content: string, expectedContent?: string): void {
-  const dir = getWorkspaceAutoMemoryDir(workspaceSlug)
-  const abs = resolveAutoMemoryFilePath(dir, relativePath)
-  const currentContent = existsSync(abs) ? readFileSync(abs, 'utf-8') : ''
-  if (expectedContent !== undefined && currentContent !== expectedContent) {
-    throw new Error('文件已被外部更新。请刷新后再处理你的修改。')
+export function writeWorkspaceAutoMemoryFile(workspaceSlug: string, relativePath: string, content: string, expectedContent?: string, revision?: string): KnowledgeWriteResult {
+  return writeKnowledgeWithRevision(workspaceSlug, 'memory', relativePath, content, expectedContent, revision)
+}
+
+/**
+ * 保存返回“下一张票据”，并且只在提交后目标仍是同一物理目标/授权边界时签发。
+ * 这样 UI 不需要后台重读就能继续保存，也不会因重读把同一编辑周期静默换绑到另一个文件。
+ */
+export interface KnowledgeWriteResult {
+  /** 成功后可直接用于下一次保存的票据；未签发表示目标已变化，必须让用户重新打开。 */
+  revision?: string
+  requiresReopen?: boolean
+  physicalPath?: string
+}
+
+function writeKnowledgeWithRevision(workspaceSlug: string, kind: 'memory' | 'workspace_agents', relativePath: string, content: string, expectedContent?: string, revision?: string): KnowledgeWriteResult {
+  const path = normalizeKnowledgeRelativePath(relativePath)
+  const getPolicy = (): KnowledgeAccessPolicy => getWorkspaceKnowledgePolicy(workspaceSlug, kind)
+  // 票据在写入口即消费：先证明逻辑目标仍是打开时的物理目标/授权边界，再进入原子写。
+  const ticket = revision ? consumeKnowledgeReadTicket(revision, { workspaceSlug, kind, relativePath: path }) : undefined
+  assertRevisionTarget(ticket, resolveWorkspaceKnowledgePath(getPolicy(), path, { allowMissing: true }))
+  const validateRevisionTarget = (): void => {
+    if (!ticket) return
+    const current = resolveWorkspaceKnowledgePath(getPolicy(), path, { allowMissing: true })
+    assertRevisionTarget(ticket, current)
+    const currentContent = current.kind === 'file' ? readFileSync(current.physicalPath, 'utf8') : ''
+    assertRevisionContent(ticket, currentContent)
   }
-  const byteLen = Buffer.byteLength(content, 'utf-8')
-  if (byteLen > SKILL_FILE_SIZE_LIMIT) {
-    throw new Error(`内容过大（${(byteLen / 1024 / 1024).toFixed(2)} MB），超过 10 MB 限制`)
-  }
-  const parent = dirname(abs)
-  if (!existsSync(parent)) {
-    mkdirSync(parent, { recursive: true })
-  }
-  writeTextFileAtomic(abs, content)
-  console.log(`[Agent 工作区] 已更新长期记忆文件: ${workspaceSlug}/${relativePath}`)
+  const written = writeWorkspaceKnowledgeFileAtomic({ getPolicy, relativePath: path, content, expectedContent, maxBytes: SKILL_FILE_SIZE_LIMIT, validateRevisionTarget })
+  // 提交后再解析一次：只有目标与授权边界仍是实际写入目标，才能为同一编辑周期续票。
+  let committed: ReturnType<typeof resolveWorkspaceKnowledgePath>
+  try { committed = resolveWorkspaceKnowledgePath(getPolicy(), path, { allowMissing: true }) } catch { return { requiresReopen: true } }
+  if (committed.kind === 'directory') return { requiresReopen: true }
+  if (knowledgePathKey(written.physicalPath) !== knowledgePathKey(committed.physicalPath)
+    || !knowledgeBoundaryMatches(captureKnowledgeBoundary(written), committed)) return { requiresReopen: true }
+  const nextRevision = createKnowledgeReadTicket({
+    workspaceSlug, kind, relativePath: path,
+    physicalPathKey: knowledgePathKey(committed.physicalPath), boundaryIdentity: JSON.stringify(captureKnowledgeBoundary(committed)), content,
+  })
+  return { revision: nextRevision, physicalPath: committed.physicalPath }
 }
 
 /** 把相对路径限制在 Skill 根目录内，并拒绝直接覆盖 SKILL.md */
@@ -1978,9 +1946,8 @@ export interface WorkspaceMemoryGuidance {
 }
 
 export function getWorkspaceMemoryGuidance(workspaceSlug: string): WorkspaceMemoryGuidance {
-  const memoryDir = getWorkspaceAutoMemoryPath(workspaceSlug)
   return {
-    needsCollaborationProfile: !isRegularFile(join(memoryDir, 'user-profile.md')),
+    needsCollaborationProfile: !fileSummary(getWorkspaceKnowledgePolicy(workspaceSlug), 'user-profile.md').exists,
   }
 }
 
@@ -1992,6 +1959,7 @@ export function getWorkspaceAttachedDirectories(workspaceSlug: string): string[]
 }
 
 export function attachWorkspaceDirectory(workspaceSlug: string, directoryPath: string): string[] {
+  getKnownKnowledgeWorkspace(workspaceSlug)
   const config = readWorkspaceConfig(workspaceSlug)
   const existing = config.attachedDirectories ?? []
 
@@ -2001,15 +1969,20 @@ export function attachWorkspaceDirectory(workspaceSlug: string, directoryPath: s
 
   const updated = [...existing, directoryPath]
   writeWorkspaceConfig(workspaceSlug, { ...config, attachedDirectories: updated })
+  // 授权变化立即作废旧读票据：撤销再授权不能让旧编辑复活。
+  invalidateKnowledgeReadTickets(workspaceSlug)
+  notifyWorkspaceKnowledgePolicyChanged(workspaceSlug)
   console.log(`[Agent 工作区] 已附加工作区目录: ${directoryPath} → ${workspaceSlug}`)
   return updated
 }
 
 export function detachWorkspaceDirectory(workspaceSlug: string, directoryPath: string): string[] {
+  getKnownKnowledgeWorkspace(workspaceSlug)
   const config = readWorkspaceConfig(workspaceSlug)
   const existing = config.attachedDirectories ?? []
   const updated = existing.filter((d) => d !== directoryPath)
   writeWorkspaceConfig(workspaceSlug, { ...config, attachedDirectories: updated })
+  if (updated.length !== existing.length) { invalidateKnowledgeReadTickets(workspaceSlug); notifyWorkspaceKnowledgePolicyChanged(workspaceSlug) }
   console.log(`[Agent 工作区] 已移除工作区目录: ${directoryPath} ← ${workspaceSlug}`)
   return updated
 }

@@ -256,20 +256,28 @@ export function highlightCodeSync(options: HighlightOptions): HighlightResult | 
 export function highlightToTokens(options: HighlightOptions): HighlightTokensResult | null {
   if (!cachedHighlighter) return null
 
-  const { code, language, theme = 'github-dark' } = options
-  const lang = resolveLoadedLanguage(cachedHighlighter, language)
+  try {
+    const { code, language, theme = 'github-dark' } = options
+    const lang = resolveLoadedLanguage(cachedHighlighter, language)
 
-  const result = cachedHighlighter.codeToTokens(code, {
-    lang: lang as BundledLanguage,
-    theme: theme as BundledTheme,
-  })
+    const result = cachedHighlighter.codeToTokens(code, {
+      lang: lang as BundledLanguage,
+      theme: theme as BundledTheme,
+    })
 
-  return {
-    lines: result.tokens.map((line) =>
-      line.map((token) => ({ content: token.content, color: token.color }))
-    ),
-    bgColor: result.bg ?? '#24292e',
-    fgColor: result.fg ?? '#e1e4e8',
-    language: lang,
+    return {
+      lines: result.tokens.map((line) =>
+        line.map((token) => ({ content: token.content, color: token.color }))
+      ),
+      bgColor: result.bg ?? '#24292e',
+      fgColor: result.fg ?? '#e1e4e8',
+      language: lang,
+    }
+  } catch (error) {
+    console.warn('[Shiki] 高亮失败，使用纯文本:', error)
+    return {
+      lines: options.code.split('\n').map((content) => [{ content, color: 'inherit' }]),
+      bgColor: 'transparent', fgColor: 'inherit', language: 'text',
+    }
   }
 }

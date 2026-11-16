@@ -1,0 +1,115 @@
+diff --git a/dist/api/lazy.js b/dist/api/lazy.js
+index 6df3bca..31d1485 100644
+--- a/dist/api/lazy.js
++++ b/dist/api/lazy.js
+@@ -22,20 +22,51 @@ function createSetupErrorMessage(model, error, timestamp, stopReason) {
+ function hasResult(source) {
+     return typeof source.result === "function";
+ }
+-async function forwardStream(target, source, observer, observeResult) {
+-    let result;
++async function forwardStream(target, source, observer, observeResult, model, startedAt) {
++    let partial;
+     for await (const event of source) {
++        if ("partial" in event)
++            partial = event.partial;
+         target.push(event);
+         observer?.onEvent?.(event);
+-        if (event.type === "done")
+-            result = event.message;
+-        else if (event.type === "error")
+-            result = event.error;
++        // Proma：可信终态优先，不能再等待悬空的 source.result()。
++        if (event.type === "done" || event.type === "error") {
++            const result = event.type === "done" ? event.message : event.error;
++            target.end(result);
++            observeResult(result);
++            return;
++        }
++    }
++    if (!hasResult(source)) {
++        target.end();
++        observeResult(undefined);
++        return;
++    }
++    // 必须在真实 EOF 边界计时；外层包装无法看到被 result() 阻塞的 EOF。
++    let timer;
++    try {
++        const result = await Promise.race([
++            source.result(),
++            new Promise((_, reject) => {
++                timer = setTimeout(() => reject(new Error("stream_finalization_timeout: provider stream ended without a final result")), 10_000);
++            }),
++        ]);
++        target.end(result);
++        observeResult(result);
++    } catch (error) {
++        const message = {
++            ...(partial ?? createSetupErrorMessage(model, error, startedAt, "error")),
++            stopReason: "error",
++            errorMessage: error instanceof Error ? error.message : String(error),
++        };
++        const event = { type: "error", reason: "error", error: message };
++        target.push(event);
++        observer?.onEvent?.(event);
++        target.end(message);
++        observeResult(message);
++    } finally {
++        if (timer) clearTimeout(timer);
+     }
+-    if (hasResult(source))
+-        result = await source.result();
+-    target.end(result);
+-    observeResult(result);
+ }
+ /**
+  * Returns a stream synchronously while running async setup (auth resolution,
+@@ -53,8 +84,10 @@ export function lazyStream(model, setup, observer, signal) {
+         observer?.onResult?.(result);
+     };
+     setup()
+-        .then((inner) => forwardStream(outer, inner, observer, observeResult))
++        .then((inner) => forwardStream(outer, inner, observer, observeResult, model, startedAt))
+         .catch((error) => {
++        // 终态后的迭代器清理失败不能再发第二个 error，observer 必须保持一致。
++        if (observedResult) return;
+         const reason = signal?.aborted ? "aborted" : "error";
+         const message = createSetupErrorMessage(model, error, startedAt, reason);
+         const event = { type: "error", reason, error: message };
+diff --git a/dist/utils/retry.js b/dist/utils/retry.js
+index dae863c..841fb41 100644
+--- a/dist/utils/retry.js
++++ b/dist/utils/retry.js
+@@ -14,7 +14,8 @@ const NON_RETRYABLE_PROVIDER_LIMIT_ERROR_PATTERN = buildProviderErrorPattern([
+     // quota/billing error code; the other strings cover common gateway wording.
+     "insufficient_quota",
+     "out of budget",
+-    "quota exceeded",
++    // Proma：AWS 客户端重试令牌耗尽不等于账户额度耗尽。
++    "(?<!retry )quota exceeded",
+     "billing",
+     // Sign in with ChatGPT: the subscription's shared usage limit, which resets
+     // after hours rather than seconds.
+@@ -35,6 +36,8 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
+     "model is at capacity",
+     "rate.?limit",
+     "too many requests",
++    "throttlingexception",
++    "throttl(?:ed|ing)",
+     // Status codes must not be part of a longer word or number, e.g. a request id or byte count (#11057).
+     "(?<![a-z0-9])(?:429|500|502|503|504|520|524)(?![a-z0-9])",
+     // Also matches "The service is temporarily unavailable" (#10965).
+@@ -85,6 +88,13 @@ const RETRYABLE_PROVIDER_ERROR_PATTERN = buildProviderErrorPattern([
+     "ended without",
+     "stream ended before message_stop",
+     "stream ended before a terminal response event",
++    // Proma：沿同一 transcript 重试流中断，不重投用户 prompt。
++    "unexpected non-whitespace character after JSON",
++    "peer closed connection",
++    "incomplete chunked read",
++    "failed to fetch",
++    // 兼容 OpenAI Responses / 兼容网关省略 response 的终止事件文案。
++    "stream ended before (?:a )?terminal(?: response)? event",
+     "http2 request did not get a response",
+     // Codex CLI mid-stream disconnect, relayed by proxies that wrap the Codex CLI,
+     // e.g. "stream disconnected before completion: stream closed before response.completed" (#11057).

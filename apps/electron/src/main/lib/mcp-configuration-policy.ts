@@ -6,6 +6,7 @@
 
 import type { McpOAuthConfiguration, McpServerEntry, McpTransportType } from '@proma/shared'
 import { RESERVED_BUILTIN_KEYS } from './builtin-mcp/baseline'
+import { parseMcpRemoteUrl } from './network/mcp-transport'
 
 export interface ConfigureWorkspaceMcpInput {
   name: string
@@ -82,8 +83,10 @@ export function buildWorkspaceMcpEntry(input: ConfigureWorkspaceMcpInput): McpSe
 
   const url = input.url?.trim()
   if (!url) throw new Error(`${input.type} MCP 需要 url`)
+  // 远程 MCP 只接受 http/https，且不允许 URL 内嵌凭据；与运行时 transport
+  // 保持同一套校验，避免“保存成功、运行必然失败”的配置进入工作区。
   try {
-    new URL(url)
+    parseMcpRemoteUrl(url)
   } catch {
     throw new Error(`无效的 MCP URL: ${url}`)
   }

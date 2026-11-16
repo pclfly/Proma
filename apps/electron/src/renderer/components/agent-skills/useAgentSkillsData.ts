@@ -15,7 +15,7 @@ import {
   currentAgentWorkspaceIdAtom,
   workspaceCapabilitiesVersionAtom,
 } from '@/atoms/agent-atoms'
-import type { BuiltinMcpServerSummary, CliIntegrationStatus, McpServerEntry, SkillMeta, WorkspaceCapabilities, WorkspaceMcpConfig } from '@proma/shared'
+import type { BuiltinMcpServerSummary, CliIntegrationStatus, McpServerEntry, SkillMeta, WorkspaceCapabilities, WorkspaceMcpConfig, WorkspaceSkillUsageResult } from '@proma/shared'
 import type { CatalogCliProbeState } from './integration-catalog'
 
 const CLI_STATUS_CACHE_TTL_MS = 5 * 60 * 1000
@@ -59,6 +59,8 @@ export interface AgentSkillsData {
   builtinMcpServers: BuiltinMcpServerSummary[]
   cliIntegrationStatuses: CliIntegrationStatus[]
   cliIntegrationProbeState: CatalogCliProbeState
+  skillUsage: WorkspaceSkillUsageResult | null
+  disableSkills: (slugs: string[]) => Promise<void>
   updatingSkill: string | null
   setCliIntegrationEnabled: (id: string, enabled: boolean) => Promise<void>
   toggleSkill: (slug: string, enabled: boolean) => Promise<void>
@@ -71,8 +73,8 @@ export interface AgentSkillsData {
 }
 
 /**
- * workspaceId 指定时用于右侧 Component Workspace：数据归属必须锁定到宿主 Agent
- * 会话的项目，不能跟随全局项目选择器切换。
+ * workspaceId 指定时用于右侧 Component Workspace：数据归属由调用方锁定，
+ * 默认是宿主 Agent 会话的项目；调用方切换项目时显式传入新 id。
  */
 export function useAgentSkillsData(workspaceId?: string): AgentSkillsData {
   const workspaces = useAtomValue(agentWorkspacesAtom)
@@ -95,6 +97,7 @@ export function useAgentSkillsData(workspaceId?: string): AgentSkillsData {
   const [cliIntegrationStatuses, setCliIntegrationStatuses] = React.useState<CliIntegrationStatus[]>([])
   const [cliIntegrationProbeState, setCliIntegrationProbeState] = React.useState<CatalogCliProbeState>('loading')
   const [updatingSkill, setUpdatingSkill] = React.useState<string | null>(null)
+  const [skillUsage, setSkillUsage] = React.useState<WorkspaceSkillUsageResult | null>(null)
   const loadRequestRef = React.useRef(0)
   const cliProbeRequestRef = React.useRef(0)
   /** 用户最近一次开关意图覆盖验证期间写入磁盘的临时 disabled 状态。 */
@@ -187,6 +190,33 @@ export function useAgentSkillsData(workspaceId?: string): AgentSkillsData {
     observedCapabilitiesVersionRef.current = capabilitiesVersion
     void loadData()
   }, [capabilitiesVersion, loadData])
+
+  // 使用统计需要扫描会话，放在首屏数据之后异步加载；失败只降级为不可断言。
+  React.useEffect(() => {
+    if (!workspaceSlug) {
+      setSkillUsage(null)
+      return
+    }
+    let cancelled = false
+    void window.electronAPI.getWorkspaceSkillUsage(workspaceSlug)
+      .then((result) => { if (!cancelled) setSkillUsage(result) })
+      .catch((error) => {
+        if (!cancelled) setSkillUsage(null)
+        console.warn('[Agent 技能] 读取使用统计失败:', error)
+      })
+    return () => { cancelled = true }
+  }, [workspaceSlug, capabilitiesVersion])
+
+  const disableSkills = React.useCallback(async (slugs: string[]): Promise<void> => {
+    const targets = [...new Set(slugs)]
+    if (targets.length === 0) return
+    for (const slug of targets) {
+      await window.electronAPI.toggleWorkspaceSkill(workspaceSlug, slug, false)
+    }
+    setSkills((prev) => prev.map((skill) => targets.includes(skill.slug) ? { ...skill, enabled: false } : skill))
+    bumpCapabilitiesVersion((v) => v + 1)
+    toast.success(`已停用 ${targets.length} 个闲置 Skill`)
+  }, [workspaceSlug, bumpCapabilitiesVersion])
 
   const setCliIntegrationEnabled = React.useCallback(async (id: string, enabled: boolean): Promise<void> => {
     const cliProbeRequestId = ++cliProbeRequestRef.current
@@ -366,6 +396,8 @@ export function useAgentSkillsData(workspaceId?: string): AgentSkillsData {
     toggleSkill,
     deleteSkill,
     updateSkill,
+    skillUsage,
+    disableSkills,
     refreshMcpConfig,
     toggleMcp,
     installMcp,

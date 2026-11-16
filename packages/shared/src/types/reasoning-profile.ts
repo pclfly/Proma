@@ -90,6 +90,8 @@ export interface ResolveReasoningCapabilityInput {
 export interface ResolveReasoningProfileInput {
   modelId: string | undefined
   transport: ReasoningTransport
+  /** 本轮完整配置快照；显式传入（包括 []）时不读取全局配置或硬编码回退。 */
+  profiles?: readonly ReasoningProfileConfigData[]
 }
 
 /**
@@ -142,7 +144,7 @@ export interface ReasoningProfileConfigData {
 export interface ReasoningProfilesConfig {
   /** 配置版本号 */
   version: number
-  /** 用户自定义 profile 列表（与内置默认按 id 合并，用户覆盖同名 id） */
+  /** v1 为用户覆盖列表；v2 起为完整列表，空列表表示删除全部。 */
   profiles: ReasoningProfileConfigData[]
 }
 
@@ -333,6 +335,43 @@ const K3_PROFILE: ReasoningProfile = {
   },
 }
 
+/**
+ * Kimi K3.1 与官方 0.21.88 对齐：只有 low / high / max 三档，没有 off。
+ * `off` 按官方 normalize 映射为 low（思考强制开启），API 与 Coding Plan 默认档不同。
+ */
+const K3_31_EFFORT_MAP: ReasoningEffortMap = {
+  ...K3_EFFORT_MAP,
+  off: 'low',
+}
+
+function createKimiK31Profile(coding: boolean): ReasoningProfile {
+  const defaultLevel: AgentThinkingLevel = coding ? 'high' : 'max'
+  return {
+    id: coding ? 'kimi-k3.1-coding' : 'kimi-k3.1-api',
+    levels: ['low', 'high', 'max'],
+    defaultLevel,
+    normalize: (level) => level === undefined ? defaultLevel : level === 'off' ? 'low' : normalizeK3Level(level),
+    encodings: {
+      'anthropic-messages': { kind: 'adaptive-effort', effortMap: K3_31_EFFORT_MAP },
+      'openai-completions': { kind: 'openai-reasoning-effort', effortMap: K3_31_EFFORT_MAP },
+    },
+  }
+}
+
+const KIMI_K31_API_PROFILE = createKimiK31Profile(false)
+const KIMI_K31_CODING_PROFILE = createKimiK31Profile(true)
+
+/** K3.1 的模型 ID 判定：兼容本地 profile 别名与官方 K3.1 Pro 模型 ID。 */
+function isKimiK31Model(modelId: string): boolean {
+  return modelId.startsWith('kimi-k3.1')
+    || /^(?:kimi-)?k3\.1-pro(?:-highspeed)?$/.test(modelId)
+}
+
+/** Coding Plan 的 K3.1：本地 `kimi-k3.1-coding` 或官方无前缀 `k3.1-pro*`。 */
+function isKimiK31CodingModel(modelId: string): boolean {
+  return modelId.startsWith('kimi-k3.1-coding') || /^k3\.1-pro(?:-highspeed)?$/.test(modelId)
+}
+
 const GLM_53_PROFILE: ReasoningProfile = {
   id: 'glm-5.3',
   levels: GLM_53_LEVELS,
@@ -388,6 +427,12 @@ const OPENAI_ASTRA_PROFILE: ReasoningProfile = {
   },
 }
 
+/** 官方 0.21.67-01：GPT-6.1 Terra 沿用 Astra 的档位集合，仅 profile id 不同。 */
+const OPENAI_TERRA_PROFILE: ReasoningProfile = {
+  ...OPENAI_ASTRA_PROFILE,
+  id: 'openai-reasoning-terra',
+}
+
 /** GPT-6 Sol/Luna allow disabling reasoning and default to medium effort. */
 const OPENAI_SOL_LUNA_PROFILE: ReasoningProfile = {
   id: 'openai-reasoning-sol-luna',
@@ -405,23 +450,38 @@ export const REASONING_PROFILES: readonly ReasoningProfile[] = [
   DEEPSEEK_FLASH_PROFILE,
   DEEPSEEK_V4_PRO_PROFILE,
   K3_PROFILE,
+  KIMI_K31_API_PROFILE,
+  KIMI_K31_CODING_PROFILE,
   GLM_52_PROFILE,
   GLM_53_PROFILE,
   OPENAI_STANDARD_PROFILE,
   OPENAI_MAX_PROFILE,
   OPENAI_ASTRA_PROFILE,
+  OPENAI_TERRA_PROFILE,
   OPENAI_SOL_LUNA_PROFILE,
 ]
 
 /** 内置 profile 的缺省匹配规则（与 resolveReasoningProfile 的内置匹配逻辑一致）。 */
 const BUILTIN_PROFILE_MATCH_RULES: Record<string, ReasoningMatchRule[]> = {
-  'deepseek-v4-flash': [{ type: 'prefix', value: 'deepseek-v4-flash' }],
-  'deepseek-v4-pro': [{ type: 'prefix', value: 'deepseek-v4-pro' }],
+  'deepseek-flash': [{ type: 'regex', value: '^deepseek-flash(?:-|$)' }],
+  'deepseek-v4-flash': [{ type: 'regex', value: '^deepseek-v4-flash(?:-|$)' }],
+  'deepseek-v4-pro': [{ type: 'regex', value: '^deepseek-v4-pro(?:-|$)' }],
   'kimi-k3': [{ type: 'regex', value: '^(?:k3(?:-256k)?|kimi-k3)$' }],
-  'glm-5.3': [{ type: 'exact', value: 'glm-5.3' }],
+  'kimi-k3.1-api': [
+    { type: 'exact', value: 'kimi-k3.1-api' },
+    { type: 'regex', value: '^kimi-k3\\.1-pro(?:-highspeed)?$' },
+  ],
+  'kimi-k3.1-coding': [
+    { type: 'exact', value: 'kimi-k3.1-coding' },
+    { type: 'regex', value: '^k3\\.1-pro(?:-highspeed)?$' },
+  ],
+  'glm-5.3': [{ type: 'regex', value: '^glm-5\\.3(?:-flashx?)?$' }],
   'glm-5.2': [{ type: 'exact', value: 'glm-5.2' }],
-  'openai-reasoning-standard': [{ type: 'prefix', value: 'gpt-5' }, { type: 'regex', value: '^(?:o1|o3|o4)(?:-|$)' }],
-  'openai-reasoning-max': [{ type: 'prefix', value: 'gpt-5.6' }],
+  'openai-reasoning-standard': [{ type: 'regex', value: '^gpt-5(?!.*-chat-latest$)(?!\\.6(?:-|$))' }, { type: 'regex', value: '^(?:o1|o3|o4)(?:-|$)' }],
+  'openai-reasoning-max': [{ type: 'regex', value: '^gpt-5\\.6(?!.*-chat-latest$)(?:-|$)' }],
+  'openai-reasoning-astra': [{ type: 'regex', value: '^gpt-6-astra(?:-[a-z0-9]+(?:-[a-z0-9]+)*)?$' }],
+  'openai-reasoning-terra': [{ type: 'exact', value: 'gpt-6.1-terra' }, { type: 'exact', value: 'gpt-6.1-terra-1' }],
+  'openai-reasoning-sol-luna': [{ type: 'regex', value: '^gpt-6-(?:sol|luna)$' }],
 }
 
 /**
@@ -452,26 +512,37 @@ export function getDefaultReasoningProfileConfigData(): ReasoningProfileConfigDa
 
 /** 仅按模型 ID 匹配，再以实际 transport 确认该模型是否有已验证的协议 encoding。
  *
- * 优先使用通过 setReasoningProfileConfig 注入的用户配置 profile（按 matchRules 命中）；
- * 未命中或未注入时回退到内置硬编码 profile，保证向后兼容。
+ * 默认兼容覆盖模式：未命中时回退硬编码。传入 profiles 快照或使用 authoritative
+ * 全局配置时，将完整列表作为唯一 profile 来源，不会补回已删除条目。
  */
 export function resolveReasoningProfile(input: ResolveReasoningProfileInput): ReasoningProfile | undefined {
   const modelId = input.modelId?.toLowerCase()
   if (!modelId) return undefined
+  if (input.profiles !== undefined) {
+    return resolveConfiguredProfileForModel(modelId, input.transport, input.profiles)
+  }
 
-  // 1) 用户注入配置优先：按 matchRules 命中即返回对应 profile（重建后带 normalize/encodings）
-  const configuredProfile = resolveConfiguredProfileForModel(modelId, input.transport)
-  if (configuredProfile) return configuredProfile
+  // 完整配置是权威列表，删除的内置规则不得通过硬编码重新启用。
+  const configuredProfile = resolveConfiguredProfileForModel(modelId, input.transport, _configuredProfiles, _authoritativeProfiles)
+  if (configuredProfile || _authoritativeProfiles) return configuredProfile
 
   // 2) 内置硬编码 profile（以下保持原逻辑）
   const isOpenAITransport = input.transport === 'openai-completions' || input.transport === 'openai-responses'
   const isOpenAIReasoningModel = !modelId.endsWith('-chat-latest')
     && (modelId.startsWith('gpt-5') || /^(o1|o3|o4)(?:-|$)/.test(modelId))
+  if (modelId === 'gpt-6.1-terra' || modelId === 'gpt-6.1-terra-1') {
+    return OPENAI_TERRA_PROFILE.encodings[input.transport] ? OPENAI_TERRA_PROFILE : undefined
+  }
   if (isGpt6AstraFamily(modelId)) {
     return OPENAI_ASTRA_PROFILE.encodings[input.transport] ? OPENAI_ASTRA_PROFILE : undefined
   }
   if (isGpt6SolFamily(modelId) || isGpt6LunaFamily(modelId)) {
     return OPENAI_SOL_LUNA_PROFILE.encodings[input.transport] ? OPENAI_SOL_LUNA_PROFILE : undefined
+  }
+  // K3.1 与 K3 是不同档位集合，必须先判定，避免被 kimi-k3 前缀规则吞掉。
+  if (isKimiK31Model(modelId)) {
+    const k31 = isKimiK31CodingModel(modelId) ? KIMI_K31_CODING_PROFILE : KIMI_K31_API_PROFILE
+    return k31.encodings[input.transport] ? k31 : undefined
   }
   const profile = /^deepseek-flash(?:-|$)/.test(modelId)
     ? DEEPSEEK_FLASH_PROFILE
@@ -547,7 +618,7 @@ export function normalizeReasoningCapabilityLevel(
   // Some models (for example Fable 5.1) always reason and do not expose an off
   // mode. Preserve the product's "disabled" legacy setting as a safe, explicit
   // high-effort request instead of silently downgrading it to minimal.
-  if (requested === 'off') {
+  if (requested === 'off' && capability.source === 'pi-catalog') {
     return capability.levels.includes('high') ? 'high' : capability.defaultLevel
   }
 
@@ -568,6 +639,7 @@ export function normalizeReasoningLevel(
   profile: ReasoningProfile | undefined,
   level: AgentThinkingLevel | undefined,
 ): AgentThinkingLevel | undefined {
+  if (profile?.reasoning === false) return 'off'
   return profile ? profile.normalize(level) : level
 }
 
@@ -579,7 +651,8 @@ export function normalizeReasoningLevel(
 // 未命中再回退内置硬编码 profile。
 // ============================================================================
 
-let _configuredProfiles: readonly { data: ReasoningProfileConfigData, profile: ReasoningProfile }[] = []
+let _configuredProfiles: readonly ReasoningProfileConfigData[] = []
+let _authoritativeProfiles = false
 
 /** 全局可用的思考档位全集（供配置 UI 展示候选）。 */
 export const ALL_THINKING_LEVELS: readonly AgentThinkingLevel[] = PI_EXTENDED_THINKING_LEVELS
@@ -645,8 +718,12 @@ export function doesMatchReasoningProfile(
  */
 export function buildReasoningProfileFromConfig(
   data: ReasoningProfileConfigData,
+  transport?: ReasoningTransport,
 ): ReasoningProfile {
-  const levels = data.levels.length > 0 ? data.levels : [data.defaultLevel ?? 'high']
+  const configuredLevels = data.levels.length > 0 ? data.levels : [data.defaultLevel ?? 'high']
+  const effortMap = transport ? data.encodings[transport]?.effortMap : undefined
+  const availableLevels = configuredLevels.filter((level) => effortMap?.[level] !== null)
+  const levels: readonly AgentThinkingLevel[] = availableLevels.length > 0 ? availableLevels : ['off']
   const defaultLevel = levels.includes(data.defaultLevel)
     ? data.defaultLevel
     : (levels[0] ?? data.defaultLevel ?? 'high')
@@ -654,7 +731,7 @@ export function buildReasoningProfileFromConfig(
     id: data.id,
     levels,
     defaultLevel,
-    reasoning: data.reasoning,
+    reasoning: data.reasoning && availableLevels.length > 0,
     normalize: (level) => normalizeConfiguredProfileLevel(levels, level, defaultLevel),
     encodings: { ...data.encodings },
   }
@@ -662,50 +739,48 @@ export function buildReasoningProfileFromConfig(
 
 /** 返回当前已注入的用户配置 profile 对应的数据（只读）。 */
 export function getConfiguredReasoningProfiles(): readonly ReasoningProfileConfigData[] {
-  return _configuredProfiles.map((entry) => entry.data)
+  return _configuredProfiles
 }
 
 /**
  * 注入用户自定义推理能力配置。
  *
- * 由主进程启动时（及配置变更后）调用；传入 null/空数组则清空，恢复纯内置。
- * 同一 id 的配置按匹配顺序保留，作为后续 resolve 的候选。
+ * authoritative 模式接受完整列表，[] 表示没有任何 profile；null 恢复未注入状态。
+ * 缺省兼容旧版的部分覆盖模式。
  */
 export function setReasoningProfileConfig(
   profiles: readonly ReasoningProfileConfigData[] | null | undefined,
+  options?: { authoritative?: boolean },
 ): void {
-  if (!profiles || profiles.length === 0) {
-    _configuredProfiles = []
-    return
-  }
-  _configuredProfiles = profiles.map((data) => ({ data, profile: buildReasoningProfileFromConfig(data) }))
+  _configuredProfiles = profiles ? structuredClone(profiles) : []
+  _authoritativeProfiles = profiles != null && options?.authoritative === true
 }
 
 /** 按模型 id 与 transport 匹配注入配置中的 profile。 */
 function resolveConfiguredProfileForModel(
   modelId: string,
   transport: ReasoningTransport,
+  profiles: readonly ReasoningProfileConfigData[],
+  authoritative = true,
 ): ReasoningProfile | undefined {
-  // 多个 profile 均命中时，选“匹配规则更具体”的那个（value 最长），
-  // 避免宽的通用规则（如 standard 的 gpt-5 前缀）抢先捕获更专属的
-  // 子系列（如 gpt-5.6 应命中 openai-reasoning-max）。
+  // 精确匹配优先于前缀，前缀优先于正则；不能把正则语法长度当成具体度。
+  // 同类型前缀选择最长项，正则并列时保持配置顺序。
   let bestProfile: ReasoningProfile | undefined
+  let bestRank = -1
   let bestLength = -1
-  for (const { data, profile } of _configuredProfiles) {
+  for (const data of profiles) {
     // 仅当该 profile 声明了此 transport 的 encoding，才参与命中
     const encoding = data.encodings[transport]
     if (!encoding) continue
-    // 该 profile 内所有命中规则里最长的 value 长度，作为“具体度”评分
-    let profileLength = -1
     for (const rule of data.matchRules) {
-      if (matchesRule(modelId, rule)) {
-        profileLength = Math.max(profileLength, rule.value.length)
+      if (!matchesRule(modelId, rule)) continue
+      const rank = rule.type === 'exact' ? 3 : rule.type === 'prefix' ? 2 : 1
+      const length = rule.type === 'regex' ? 0 : rule.value.length
+      if (rank > bestRank || (rank === bestRank && length > bestLength)) {
+        bestRank = rank
+        bestLength = length
+        bestProfile = buildReasoningProfileFromConfig(data, authoritative ? transport : undefined)
       }
-    }
-    // 并列时保留先出现者（维持配置顺序偏好），仅选取更具体的 profile
-    if (profileLength >= 0 && profileLength > bestLength) {
-      bestLength = profileLength
-      bestProfile = profile
     }
   }
   return bestProfile

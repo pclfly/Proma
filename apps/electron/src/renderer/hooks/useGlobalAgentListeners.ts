@@ -1,3 +1,4 @@
+import { blockedKnowledgeRunsAtom } from '@/atoms/memory-change-atoms'
 /**
  * useGlobalAgentListeners — 全局 Agent IPC 监听器
  *
@@ -33,7 +34,6 @@ import {
   agentModelIdAtom,
   agentChannelIdAtom,
   agentPermissionModeMapAtom,
-  agentDefaultPermissionModeAtom,
   stoppedByUserSessionsAtom,
   agentPlanModeSessionsAtom,
   currentAgentSessionIdAtom,
@@ -63,13 +63,18 @@ import {
   notificationSoundEnabledAtom,
   notificationSoundsAtom,
   sendDesktopNotification,
-  playNotificationSoundForType,
 } from '@/atoms/notifications'
 import { appModeAtom } from '@/atoms/app-mode'
-import { tabsAtom, activeTabIdAtom, activeSessionIdAtom, openTab, updateTabTitle } from '@/atoms/tab-atoms'
+import {
+  tabsAtom,
+  activeTabIdAtom,
+  activeSessionIdAtom,
+  openTab,
+  updateTabTitle,
+} from '@/atoms/tab-atoms'
 import type { AgentStreamState } from '@/atoms/agent-atoms'
-import { agentDiffUnseenChangesAtom, agentDiffUnseenFilesAtom } from '@/atoms/agent-atoms'
-import { channelsAtom } from '@/atoms/chat-atoms'
+import { agentDiffUnseenChangesAtom, agentDiffUnseenFilesAtom, agentSidePanelOpenMapAtom } from '@/atoms/agent-atoms'
+import { channelsAtom } from '@/atoms/channel-atoms'
 import {
   getPreviewContentRefreshKey,
   previewContentRefreshVersionAtom,
@@ -80,15 +85,30 @@ import {
 } from '@/atoms/preview-atoms'
 import type { NotificationSoundType } from '@/types/settings'
 import { toast } from 'sonner'
-import type { AgentStreamEvent, AgentStreamCompletePayload, AgentEvent, AgentStreamPayload, AgentAssistantDelta, AgentAssistantDeltaPayload, AgentStreamErrorPayload, SDKAssistantMessage, SDKMessage, SDKUserMessage, SDKSystemMessage, PromaEvent, AgentSessionMeta, ProviderType, SDKContentBlock, SDKUserContentBlock } from '@proma/shared'
+import type {
+  AgentStreamEvent,
+  AgentStreamCompletePayload,
+  AgentEvent,
+  AgentStreamPayload,
+  AgentAssistantDelta,
+  AgentAssistantDeltaPayload,
+  AgentStreamErrorPayload,
+  SDKAssistantMessage,
+  SDKMessage,
+  SDKUserMessage,
+  SDKSystemMessage,
+  PromaEvent,
+  AgentSessionMeta,
+  ProviderType,
+  SDKContentBlock,
+  SDKUserContentBlock,
+} from '@proma/shared'
 import { inferContextWindow } from '@proma/shared'
-import {
-  buildExternalAgentRunActivation,
-  createExternalAgentRunUserMessage,
-  shouldActivateExternalAgentRun,
-  shouldRevealDelegatedSession,
-} from '@/lib/external-agent-run'
+import { buildExternalAgentRunActivation, createExternalAgentRunUserMessage, shouldActivateExternalAgentRun, shouldRevealDelegatedSession } from '@/lib/external-agent-run'
 import { upsertAgentSession, mergeFetchedAgentSessions, selectDelegatedSession } from '@/lib/agent-session-list'
+import { shouldAutoRevealChanges } from '@/lib/agent-change-reveal'
+import { applySessionKnowledgeChange } from '@/lib/session-knowledge-changes'
+import { sessionKnowledgeChangesAtom } from '@/atoms/memory-change-atoms'
 import {
   getAgentCompletionMarkers,
   getDelegatedCompletionAttention,
@@ -98,19 +118,22 @@ import {
 } from '@/lib/agent-completion-presence'
 import { getPlanModeChangeFromToolName, updatePlanModeSessionSet } from '@/lib/agent-plan-mode'
 import { detectIsWindows } from '@/lib/platform'
-import { arePathsEqual, getInactiveSessionFileChangePaths, getSessionFileChangeKind, getOwnedSessionWatcherPaths, removeSessionFileChange, upsertSessionFileChange, type SessionFileChange } from '@/lib/session-file-changes'
+import {
+  arePathsEqual,
+  getInactiveSessionFileChangePaths,
+  getSessionFileChangeKind,
+  getOwnedSessionWatcherPaths,
+  removeSessionFileChange,
+  upsertSessionFileChange,
+  type SessionFileChange,
+} from '@/lib/session-file-changes'
 import { rememberStopGenerationTarget } from '@/lib/stop-generation-target'
 import { doesWorkspaceChangeAffectPreview } from '@/components/diff/preview-open-path'
 import { openPreviewInStore } from '@/components/diff/preview-opener'
 import { removeQueuedMessage, createQueuedAgentStreamState, createAgentQueuedMessage } from '@/lib/agent-message-queue'
 import { createAgentStreamEventBatcher } from '@/lib/agent-stream-event-batcher'
 import { getChangedWorkspaceComponentFromSdkMessage, shouldRevealChangedWorkspaceComponentImmediately } from '@/lib/agent-component-activation'
-import {
-  isSameOrNewerRun,
-  isTerminalEventForCurrentRun,
-  mergeActiveAgentSessionSnapshot,
-  type AgentRunMarker,
-} from '@/lib/agent-active-session-snapshot'
+import { isSameOrNewerRun, isTerminalEventForCurrentRun, mergeActiveAgentSessionSnapshot, type AgentRunMarker } from '@/lib/agent-active-session-snapshot'
 
 /** 触发右侧文件浏览器自动定位的写入类工具集合 */
 const WRITE_TOOLS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Update'])
@@ -1199,6 +1222,17 @@ export function useGlobalAgentListeners(): void {
           activateExternalAgentRun(payload.event)
         }
 
+        // 只有主进程核验过的 write/edit 提交会到达这里；按 session + 代际隔离保存。
+        if (payload.kind === 'proma_event' && payload.event.type === 'knowledge_file_changed') {
+          const knowledgeChange = payload.event.change
+          store.set(sessionKnowledgeChangesAtom, (prev) => applySessionKnowledgeChange(prev, {
+            sessionId,
+            change: knowledgeChange,
+            activeRunGeneration: store.get(agentStreamingStatesAtom).get(sessionId)?.runGeneration,
+            blockedRunGeneration: store.get(blockedKnowledgeRunsAtom).get(sessionId),
+          }))
+        }
+
         const runStartedEvent = payload.kind === 'proma_event' && payload.event.type === 'run_started'
           ? payload.event
           : null
@@ -1841,13 +1875,32 @@ export function useGlobalAgentListeners(): void {
           session: completionSession,
           documentHasFocus: document.hasFocus(),
         })
+        // 官方 0.22.0：当前会话结束时若存在未查看改动，自动展开右侧改动区。
+        // 只处理用户正在查看的会话，后台任务与未聚焦窗口不抢焦点。
+        // 右侧已经打开时不再切 Tab（否则连续对话每轮都被拽回「改动」）。
+        const unseenChanges = store.get(agentDiffUnseenChangesAtom).get(data.sessionId) === true
+        const nonGitChanges = (store.get(agentNonGitFileChangesAtom).get(data.sessionId) ?? []).length > 0
+        if (shouldAutoRevealChanges({
+          currentSessionId,
+          sessionId: data.sessionId,
+          backgroundTasksPending,
+          documentHasFocus: document.hasFocus(),
+          hasUnseenChanges: unseenChanges,
+          hasNonGitChanges: nonGitChanges,
+          sidePanelOpen: store.get(agentSidePanelOpenAtomFamily(data.sessionId)),
+        })) {
+          store.set(agentSidePanelOpenMapAtom, (prev) => ({ ...prev, [data.sessionId]: true }))
+          store.set(agentDiffPanelTabAtom, (prev) => {
+            const next = new Map(prev)
+            next.set(data.sessionId, 'changes')
+            return next
+          })
+        }
+
         if (completionMarkers.markUnviewedCompleted && !backgroundTasksPending) {
           store.set(unviewedCompletedSessionIdsAtom, (prev: Set<string>) => (
             markSessionCompletionUnviewed(prev, data.sessionId)
           ))
-        } else if (!backgroundTasksPending) {
-          // 当前聚焦会话已在主应用可见；同步确认，避免灵动岛把这次完成继续当未读。
-          void window.electronAPI.agentIsland.markSessionViewed(data.sessionId).catch(console.error)
         }
 
         // 对齐本次会话的主动打断状态，无需借助全量列表刷新重建整个 Set。
@@ -2014,11 +2067,12 @@ export function useGlobalAgentListeners(): void {
       store.set(tabsAtom, (tabs) => updateTabTitle(tabs, sessionId, title))
       const existing = store.get(agentSessionsAtom).find((session) => session.id === sessionId)
       if (existing) {
-        // 标题写入会更新 updatedAt；本地以当前时刻维持与后端一致的“最近会话”排序，
-        // 不再为一行标题变化传输整个会话索引。
+        // 标题写入只推进 updatedAt，必须保留 lastActivityAt，
+        // 否则一行标题变化就会把会话顶到侧栏最前面。
         store.set(agentSessionsAtom, (prev) => upsertAgentSession(prev, {
           ...existing,
           title,
+          lastActivityAt: existing.lastActivityAt ?? existing.updatedAt,
           updatedAt: Date.now(),
         }))
         return
@@ -2038,12 +2092,6 @@ export function useGlobalAgentListeners(): void {
         else next.delete(session.id)
         return next
       })
-    })
-
-    // ===== 5. Windows Agent Island 提示音委托 =====
-    const cleanupPlaySound = window.electronAPI.onWindowsAgentIslandPlaySound(({ type }) => {
-      const sounds = store.get(notificationSoundsAtom)
-      void playNotificationSoundForType(type, sounds)
     })
 
     // 定期清理 60s 前的「最近修改」标记，避免 atom 无限增长
@@ -2158,7 +2206,6 @@ export function useGlobalAgentListeners(): void {
       cleanupError()
       cleanupTitleUpdated()
       cleanupActiveWorktreeUpdated()
-      cleanupPlaySound()
       cleanupWatchedFileChanges()
       cleanupQueuedMessageStatus()
       clearInterval(pruneTimer)

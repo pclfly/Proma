@@ -4,7 +4,17 @@
  * 主题模式、IPC 通道等设置相关定义。
  */
 
-import type { EnvironmentCheckResult, ThinkingConfig, AgentEffort, AgentThinkingLevel, FeishuSessionMirrorSettings, TerminalProfile, WindowsShellPreference } from '@proma/shared'
+import type {
+  EnvironmentCheckResult,
+  ThinkingConfig,
+  AgentEffort,
+  AgentThinkingLevel,
+  CodexSpeed,
+  ComputerUseControlAuthorization,
+  FeishuSessionMirrorSettings,
+  TerminalProfile,
+  WindowsShellPreference,
+} from '@proma/shared'
 
 /** 通知音场景类型 */
 export type NotificationSoundType = 'taskComplete' | 'permissionRequest' | 'exitPlanMode' | 'planningReminder'
@@ -245,26 +255,66 @@ export const DEFAULT_THEME_MODE: ThemeMode = 'dark'
 /** 默认特殊风格 */
 export const DEFAULT_THEME_STYLE: ThemeStyle = 'default'
 
+/** 三条可调字号轴：内容、代码、终端。 */
+export type FontRole = 'content' | 'code' | 'terminal'
+
+export interface FontSizeAxis {
+  field: 'contentFontSize' | 'codeFontSize' | 'terminalFontSize'
+  min: number
+  max: number
+  default: number
+}
+
+/** 官方 0.22.0 基线：Cmd+0 回到默认值，Cmd+= / Cmd+- 每次步进 1px。 */
+export const FONT_SIZE_AXES: Record<FontRole, FontSizeAxis> = {
+  content: { field: 'contentFontSize', min: 10, max: 22, default: 15 },
+  code: { field: 'codeFontSize', min: 10, max: 16, default: 12 },
+  terminal: { field: 'terminalFontSize', min: 10, max: 20, default: 14 },
+}
+
+export const DEFAULT_FONT_SIZES: Record<FontRole, number> = {
+  content: FONT_SIZE_AXES.content.default,
+  code: FONT_SIZE_AXES.code.default,
+  terminal: FONT_SIZE_AXES.terminal.default,
+}
+
+export interface AppFontSizes {
+  content: number
+  code: number
+  terminal: number
+}
+
+export function clampFontSize(role: FontRole, value: unknown): number {
+  const axis = FONT_SIZE_AXES[role]
+  const px = typeof value === 'number' && Number.isFinite(value) ? Math.round(value) : axis.default
+  return Math.min(axis.max, Math.max(axis.min, px))
+}
+
+export function resolveFontSizes(input?: {
+  contentFontSize?: number
+  codeFontSize?: number
+  terminalFontSize?: number
+}): AppFontSizes {
+  return {
+    content: clampFontSize('content', input?.contentFontSize),
+    code: clampFontSize('code', input?.codeFontSize),
+    terminal: clampFontSize('terminal', input?.terminalFontSize),
+  }
+}
+
 /** Markdown 预览字号档位 */
 export type MarkdownFontSize = 'small' | 'medium' | 'large'
 
 /** 默认 Markdown 字号档位 */
 export const DEFAULT_MARKDOWN_FONT_SIZE: MarkdownFontSize = 'medium'
 
-/** macOS 原生 Agent 灵动岛偏好。 */
-export interface AgentIslandSettings {
-  /** 是否启用 Agent / 近期 Todo 日程的灵动岛提醒，默认 true。 */
-  enabled?: boolean
+/** 已持久化的阅读设置快照；独立窗口与发起窗口使用同一份权威值。 */
+export interface ReadingSettingsChangedEvent {
+  markdownFontSize: MarkdownFontSize
 }
 
-/**
- * 给无视觉输入能力的 Agent 使用的独立视觉模型路由。
- * 仅保存用户已有渠道和模型的 ID，凭据继续由渠道加密存储管理。
- */
-export interface VisionRelaySettings {
-  enabled: boolean
-  channelId?: string
-  modelId?: string
+export function isMarkdownFontSize(value: unknown): value is MarkdownFontSize {
+  return value === 'small' || value === 'medium' || value === 'large'
 }
 
 /** 可在通用设置中关闭的本地生产力工具；缺省保持开启以兼容已有用户。 */
@@ -289,9 +339,6 @@ export function normalizeProductivityToolsSettings(input: unknown): Productivity
     obsidianEnabled: typeof raw.obsidianEnabled === 'boolean' ? raw.obsidianEnabled : true,
   }
 }
-
-/** 提升此版本可要求用户重新确认更新后的受管浏览器风险告知。 */
-export const BROWSER_RISK_DISCLAIMER_VERSION = 1
 
 /** 应用设置 */
 export interface AppSettings {
@@ -333,10 +380,22 @@ export interface AppSettings {
   agentEffort?: AgentEffort
   /** OpenAI 新会话默认思考深度 */
   defaultOpenAIThinkingLevel?: AgentThinkingLevel
+  /**
+   * 新会话默认 Codex 速度档（standard / fast / ultrafast）。
+   * 与 defaultOpenAIThinkingLevel 同构：只在建会话时写入，之后可按会话单独调整。
+   */
+  defaultCodexSpeed?: CodexSpeed
   /** Agent 最大预算（美元/次） */
   agentMaxBudgetUsd?: number
   /** Agent 最大轮次（0 或 undefined = SDK 默认） */
   agentMaxTurns?: number
+  /**
+   * Agent 模型请求的 HTTP 空闲超时（毫秒）。
+   *
+   * 同时作用于「等待响应头」和「流式响应相邻数据块之间」的空闲判定。
+   * 缺省或 0 表示不设置上限（交给传输层默认行为），用于长思考、慢吐字的渠道。
+   */
+  agentHttpIdleTimeoutMs?: number
   /** 自动归档天数（0 = 禁用，默认 7） */
   archiveAfterDays?: number
   /** 发送消息快捷键模式：true = Cmd/Ctrl+Enter 发送，false(默认) = Enter 发送 */
@@ -351,16 +410,18 @@ export interface AppSettings {
   richTextRenderingEnabled?: boolean
   /** Markdown 预览字号档位（默认 'medium'，对应 15px） */
   markdownFontSize?: MarkdownFontSize
+  /** 内容区字号（px，默认 15） */
+  contentFontSize?: number
+  /** 代码字号（px，默认 12） */
+  codeFontSize?: number
+  /** 终端字号（px，默认 14） */
+  terminalFontSize?: number
   /** 应用图标变体 ID（dock + window icon），'default' 或 logo 变体 id */
   appIconVariant?: string
   /** 语音输入设置（Access Token 以加密态存储，由专用服务解密后返回渲染进程） */
   voiceDictation?: VoiceDictationPersistedSettings
   /** 飞书 Session 镜像设置：每个 Proma Session 可创建一个仅包含用户与指定 Bot 的飞书群 */
   feishuSessionMirror?: FeishuSessionMirrorSettings
-  /** 无视觉输入能力 Agent 的视觉助手路由 */
-  visionRelay?: VisionRelaySettings
-  /** 已确认的受管浏览器风险告知版本；低于当前版本时首次使用会再次要求确认。 */
-  browserRiskDisclaimerVersion?: number
   /** Todo、日程与 Obsidian 的可见性和 Agent 工具注入开关，默认全部开启。 */
   productivityTools: ProductivityToolsSettings
   /** 启动时自动清理临时文件（proma-preview、proma-installers），默认 true */
@@ -373,8 +434,10 @@ export interface AppSettings {
    * 关闭后不注入任何 Proma 归因，并覆盖 Claude SDK 默认 Co-Authored-By。
    */
   gitAttributionEnabled?: boolean
-  /** macOS 原生 Agent 灵动岛偏好。 */
-  agentIsland?: AgentIslandSettings
+  /** Computer Use 自动控制授权；只有 granted 才允许真正操作桌面。 */
+  computerUseAuthorization?: ComputerUseControlAuthorization
+  /** 用户显式指定的 Cua Driver 可执行文件路径。 */
+  computerUseDriverPath?: string
   /** Agent「破甲」个人指令：开启后会把正文整段追加进 Agent 系统提示词。默认关闭。
    * 正文来源优先级：markdownPath 指向的 .md 文件 > content。 */
   personalDirective?: AgentPersonalDirective
@@ -394,6 +457,78 @@ export interface AgentPersonalDirective {
    * 兼容 gen-3 的 prompts/*.md 工作流——直接把 gen-3 的 md 文件指过来即可。
    */
   markdownPath?: string
+  /**
+   * 可选：破甲开启时额外挂载的外部技能目录（**Seep 官方技能根，只读**）。
+   * 每个条目是一个「技能根」：自身或任意深度的子目录含 SKILL.md 均会被扫描，
+   * 与 Seep 的 `Tool/skill/`、`local-skills/` 这种按子目录分技能的结构兼容。
+   * 仅在 enabled 时生效；关闭破甲后这些技能不再出现在会话里。
+   * 支持绝对路径，或相对于 settings.json 所在目录的相对路径。
+   *
+   * 这些目录在任何情况下都不允许 Agent 写入（包括用户逐次授权也不行）：
+   * 它们是 Seep 工作台的官方资产，被多个 Agent 共用。要沉淀新经验请写
+   * `localSkillRootPath` 或 Proma 工作区 `skills/`。
+   */
+  skillPaths?: string[]
+  /**
+   * 可选：本地技能源根目录（**可写**），默认 `D:/Ai/ide/ZCode/reverse-lab/local-skills`。
+   * 与 `skillPaths` 同为破甲技能根，但语义不同：这里是用户自己的经验沉淀区，
+   * 新技能落在 `<localSkillRootPath>/<唯一技能名>/SKILL.md`。
+   * 不配置时不挂载任何本地技能根。
+   */
+  localSkillRootPath?: string
+  /**
+   * 破甲开启时是否同时启用 Seep 的底座级 provider 放行扩展。
+   *
+   * 对应 Seep 工作台的 `Tool/prompts/extensions/security-audit-interceptor.ts`，
+   * 但 Proma 版只移植其中真正起作用的部分：对 **Google/Gemini 端点**注入
+   * `safetySettings = BLOCK_NONE`。不移植该扩展的另外两个钩子——
+   * `input` 会改写用户原始输入，`context` 会清洗历史消息，二者都会破坏
+   * Proma 的会话语义与用户可见的输入原文。
+   *
+   * 仅破甲开启时生效；非 Google 端点原样透传（注入会触发 UNKNOWN_FIELD 400）。
+   * 默认 true。
+   */
+  seepProviderSafetyEnabled?: boolean
+  /**
+   * 破甲开启时是否启用 Seep 的 input/context 管线扩展。
+   *
+   * - `input`：把用户输入里的口语词转译为白盒审计术语，并对审计类请求加合规包裹。
+   *   只作用于用户输入：斜杠命令、Agent 自注入的上下文（`<system-reminder>`、
+   *   Proma 的动态上下文标签等）整条跳过，不改写。
+   * - `context`：生成前清洗历史消息里的模型阻断残留，避免连锁拒绝。
+   *
+   * 与 Seep 原实现的差异：不移植 `lab：` 开关口令（Proma 用破甲开关表达该状态），
+   * 不移植 `check`/`doctor`/`体检`/`检查`（它们指向 Seep 的 setup/verify.ps1，
+   * Proma 无此脚本）。
+   *
+   * 仅破甲开启时生效。默认 true。
+   */
+  seepInputPipelineEnabled?: boolean
+  /**
+   * Seep 作战纪律正文的源文件路径（v1.8.2+ 架构：`Tool/prompts/SYSTEM.md`）。
+   *
+   * Seep 侧由 pi 扩展在 `before_agent_start` 时动态追加到系统提示词；
+   * Proma 没有那个扩展钩子，改为在每轮构建系统提示词时**现读**该文件并注入。
+   * 现读而非复制，保证上游更新后无需同步副本。
+   *
+   * 仅在 `enabled` 时读取。支持绝对路径或相对于 settings.json 的路径。
+   * 留空则不注入 Seep 作战纪律（只跑 Proma 自己的接线层）。
+   */
+  seepSystemPromptPath?: string
+  /**
+   * 破甲开启时额外挂载的 MCP 服务器配置文件。
+   *
+   * 指向一个 JSON 文件，兼容两种顶层键：
+   * - `{ "servers": {...} }`    —— Proma 工作区 mcp.json 的形状
+   * - `{ "mcpServers": {...} }` —— Claude / Seep 模板的形状
+   *
+   * 与 `seepSystemPromptPath` 同构：仅在 `enabled` 时读取，每轮 MCP 装配时现读，
+   * 关闭破甲后这些 server 立刻从会话里消失。工作区 mcp.json 里的同名 server
+   * 优先，破甲层只补空缺，便于用户随时覆盖单个条目。
+   *
+   * 支持绝对路径或相对于 settings.json 的路径。留空则不挂载任何破甲 MCP。
+   */
+  seepMcpConfigPath?: string
 }
 
 /** Agent「破甲」个人指令的默认正文（来自 dsh-infinite-gen-3 v0.5.0 的 prompts/infinite-gen-3.md，保留原文）。 */
@@ -668,6 +803,12 @@ export const SETTINGS_IPC_CHANNELS = {
   ON_SYSTEM_THEME_CHANGED: 'settings:system-theme-changed',
   /** 用户手动切换主题时广播给所有窗口 */
   ON_THEME_SETTINGS_CHANGED: 'settings:theme-settings-changed',
+  /** 阅读字号保存后广播给所有存活窗口。 */
+  ON_READING_SETTINGS_CHANGED: 'settings:reading-settings-changed',
+  /** 三条字号轴的完整快照在窗口之间同步。 */
+  ON_FONT_SETTINGS_CHANGED: 'settings:font-settings-changed',
+  /** 首帧前同步读取字号（preload 在模块加载阶段调用，避免字号闪变）。 */
+  GET_FONT_SETTINGS_SYNC: 'settings:get-font-settings-sync',
   /** 检查破甲 markdownPath 指向的 .md 文件是否存在（开启破甲前校验） */
   CHECK_PERSONAL_DIRECTIVE_FILE: 'settings:check-personal-directive-file',
 } as const
@@ -722,6 +863,16 @@ export const QUICK_TASK_IPC_CHANNELS = {
   REREGISTER_GLOBAL_SHORTCUTS: 'quick-task:reregister-global-shortcuts',
   /** 查询当前已成功注册的全局快捷键 */
   GET_GLOBAL_SHORTCUT_REGISTRATION_STATUS: 'quick-task:get-global-shortcut-registration-status',
+  /** 主窗口回报是否已接收该次提交（接收后才允许清空快速任务输入） */
+  ACK_OPEN_SESSION: 'quick-task:ack-open-session',
+} as const
+
+/** 清单快速捕获窗口 IPC 通道 */
+export const QUICK_CAPTURE_TODO_IPC_CHANNELS = {
+  /** 隐藏捕获窗口 */
+  HIDE: 'quick-capture-todo:hide',
+  /** 通知渲染进程聚焦输入框并重置表单 */
+  FOCUS: 'quick-capture-todo:focus',
 } as const
 
 /** 语音输入 IPC 通道 */
@@ -782,8 +933,6 @@ export const VOICE_DICTATION_IPC_CHANNELS = {
 export interface QuickTaskSubmitInput {
   /** 任务文本内容 */
   text: string
-  /** 目标模式 */
-  mode: 'chat' | 'agent'
   /** 附件列表（base64 编码或本地路径引用） */
   files?: QuickTaskFile[]
 }
@@ -799,9 +948,25 @@ export interface QuickTaskFile {
 
 /** 主窗口接收的快速任务打开会话数据 */
 export interface QuickTaskOpenSessionData {
-  mode: 'chat' | 'agent'
+  /** 本次提交的关联 ID；主窗口必须用同一 ID 回报 ACK。 */
+  requestId: string
   text: string
   files?: QuickTaskFile[]
+}
+
+/** 主窗口对一次快速任务提交的接收确认。 */
+export interface QuickTaskOpenSessionAck {
+  requestId: string
+  accepted: boolean
+  /** 未接收时的用户可读原因；不用于自动重试。 */
+  reason?: string
+}
+
+/** 快速任务提交结果：只有 accepted 才允许清空输入，避免失败丢稿。 */
+export interface QuickTaskSubmitResult {
+  accepted: boolean
+  requestId: string
+  reason?: string
 }
 
 /** 菜单栏打开 Agent 会话事件 */
@@ -815,7 +980,7 @@ export interface TrayOpenAgentSessionData {
 /** 菜单栏创建会话事件 */
 export interface TrayCreateSessionData {
   /** 目标模式 */
-  mode: 'chat' | 'agent'
+  mode: 'agent'
 }
 
 /** 菜单栏 IPC 事件通道 */
@@ -824,20 +989,6 @@ export const TRAY_IPC_CHANNELS = {
   OPEN_AGENT_SESSION: 'tray:open-agent-session',
   /** 创建新会话 */
   CREATE_SESSION: 'tray:create-session',
-} as const
-
-/** Windows Agent Island IPC 通道（主进程 ↔ 渲染进程） */
-export const WINDOWS_AGENT_ISLAND_IPC_CHANNELS = {
-  /** 主进程 → 渲染进程：委托播放提示音 */
-  PLAY_SOUND: 'windows-agent-island:play-sound',
-  /** 渲染进程（悬停窗）→ 主进程：点击跳转到会话 */
-  OPEN_SESSION: 'windows-agent-island:open-session',
-  /** 主进程 → 渲染进程（悬停窗）：推送全量 snapshot */
-  PUSH_SNAPSHOT: 'windows-agent-island:push-snapshot',
-  /** 渲染进程（悬停窗）→ 主进程：鼠标进入气泡区域 */
-  MOUSE_ENTER: 'windows-agent-island:mouse-enter',
-  /** 渲染进程（悬停窗）→ 主进程：鼠标离开气泡区域 */
-  MOUSE_LEAVE: 'windows-agent-island:mouse-leave',
 } as const
 
 /** 存储管理 IPC 通道 */

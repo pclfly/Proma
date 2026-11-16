@@ -1,10 +1,11 @@
 import * as React from 'react'
-import { Check, MoreHorizontal, Pencil, Plus, Trash2, X } from 'lucide-react'
+import { ArrowDown, ArrowUp, Check, MoreHorizontal, Pencil, Plus, Trash2, X } from 'lucide-react'
 import type { PlanningGroup, PlanningGroupScope } from '@proma/shared'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
+import { cn } from '@/lib/utils'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
 
 interface PlanningGroupManagerProps {
@@ -19,14 +20,23 @@ interface PlanningGroupManagerProps {
   onCreate: (name: string) => Promise<PlanningGroup | undefined>
   onRename: (group: PlanningGroup, name: string) => Promise<PlanningGroup | undefined>
   onDelete: (group: PlanningGroup) => Promise<boolean>
+  /** 官方 0.22.0：分组可排序、可换色。 */
+  onReorder?: (group: PlanningGroup, direction: 'up' | 'down') => Promise<void>
+  onSetColor?: (group: PlanningGroup, color: string | null) => Promise<void>
   onCreated?: (group: PlanningGroup) => void
 }
+
+/** 分组色板；null 表示恢复默认色。 */
+export const GROUP_COLORS = [
+  '#ef4444', '#f97316', '#eab308', '#22c55e',
+  '#06b6d4', '#3b82f6', '#a855f7', '#ec4899',
+] as const
 
 /**
  * 轻量分组管理器：不单独占用页面，只在当前工作流中提供新建、重命名与删除。
  * 删除操作仅解除关联，目标 Todo 或日程本身不会被删除。
  */
-export function PlanningGroupManager({ scope, groups, trigger, itemLabel, getUsageCount, hasAssociatedItems, showDeletionCount = true, onCreate, onRename, onDelete, onCreated }: PlanningGroupManagerProps): React.ReactElement {
+export function PlanningGroupManager({ scope, groups, trigger, itemLabel, getUsageCount, hasAssociatedItems, showDeletionCount = true, onCreate, onRename, onDelete, onReorder, onSetColor, onCreated }: PlanningGroupManagerProps): React.ReactElement {
   const [open, setOpen] = React.useState(false)
   const [creating, setCreating] = React.useState(false)
   const [newName, setNewName] = React.useState('')
@@ -124,7 +134,7 @@ export function PlanningGroupManager({ scope, groups, trigger, itemLabel, getUsa
         </div>}
 
         <div className="mt-2 max-h-72 space-y-1 overflow-y-auto scrollbar-thin">
-          {groups.length ? groups.map((group) => {
+          {groups.length ? groups.map((group, groupIndex) => {
             const usageCount = getUsageCount(group.id)
             const renaming = renamingId === group.id
             return <div key={group.id} className="group flex min-h-10 items-center gap-1 rounded-md px-1.5 hover:bg-muted/55 focus-within:bg-muted/55">
@@ -139,8 +149,38 @@ export function PlanningGroupManager({ scope, groups, trigger, itemLabel, getUsa
                 <span className="tabular-nums text-xs text-muted-foreground">{usageCount}</span>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild><Button type="button" variant="ghost" size="icon" className="size-10 text-muted-foreground transition-colors hover:text-foreground focus-visible:text-foreground data-[state=open]:text-foreground" aria-label={`管理分组 ${group.name}`}><MoreHorizontal size={16} /></Button></DropdownMenuTrigger>
-                  <DropdownMenuContent align="end" className="z-[110] min-w-32">
+                  <DropdownMenuContent align="end" className="z-[110] min-w-40">
                     <DropdownMenuItem onSelect={() => startRenaming(group)}><Pencil />重命名</DropdownMenuItem>
+                    {onReorder && <>
+                      <DropdownMenuItem disabled={groupIndex === 0} onSelect={() => void onReorder(group, 'up')}><ArrowUp />上移</DropdownMenuItem>
+                      <DropdownMenuItem disabled={groupIndex === groups.length - 1} onSelect={() => void onReorder(group, 'down')}><ArrowDown />下移</DropdownMenuItem>
+                    </>}
+                    {onSetColor && (
+                      <div className="flex items-center gap-1.5 px-2 py-1.5">
+                        <span className="mr-1 text-xs text-muted-foreground">颜色</span>
+                        {GROUP_COLORS.map((color) => (
+                          <button
+                            key={color}
+                            type="button"
+                            className={cn(
+                              'size-4 rounded-full border border-black/10',
+                              group.color === color && 'ring-2 ring-ring ring-offset-1',
+                            )}
+                            style={{ backgroundColor: color }}
+                            aria-label={`设置分组颜色 ${color}`}
+                            onClick={() => void onSetColor(group, color)}
+                          />
+                        ))}
+                        <button
+                          type="button"
+                          className="ml-1 text-[10px] text-muted-foreground underline underline-offset-2"
+                          onClick={() => void onSetColor(group, null)}
+                        >
+                          默认
+                        </button>
+                      </div>
+                    )}
+                    <DropdownMenuSeparator />
                     <DropdownMenuItem className="text-destructive focus:text-destructive" onSelect={() => { setPendingDeletion(group); setOpen(false) }}><Trash2 />删除</DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>

@@ -15,15 +15,22 @@ export * from './runtime'
 // 渠道（AI 供应商）相关类型
 export * from './channel'
 
+// 输入框常驻额度汇总（多来源快照与 IPC 通道）
+export * from './plan-quota'
+
 // 代理配置相关类型
 export * from './proxy'
 
-// Chat 相关类型
-export * from './chat'
+// 共享消息、附件与搜索类型
+export * from './message'
 
 // Agent 相关类型
 export * from './agent'
+export * from './enterprise-skills'
+export * from './knowledge-change'
 export * from './browser'
+export * from './network'
+export * from './computer-use'
 export * from './reasoning-profile'
 
 // Agent Provider 适配器接口
@@ -63,8 +70,12 @@ export * from './automation'
 // 本地任务与日程（Planning）相关类型
 export * from './planning'
 
-// Agent 灵动岛相关类型
-export * from './agent-island'
-
 // 用户授权的 Markdown Vault 相关类型
 export * from './vault'
+export * from './skill-usage'
+
+// 会话变更请求（GitHub PR）相关类型
+export * from './change-request'
+
+// 每轮文件改动记录（连续改动视图）
+export * from './turn-changes'

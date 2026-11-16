@@ -1,7 +1,18 @@
 import * as React from 'react'
-import { ChevronDown, GitBranch, RotateCw, SquareTerminal } from 'lucide-react'
+import { ArchiveRestore, ChevronDown, GitBranch, RotateCw, SquareTerminal, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { toast } from 'sonner'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import type { WorktreeInfo, WorkspaceWorktreeRepo } from '@proma/shared'
 import { normalizePathForCompare } from '@proma/shared'
 
@@ -39,6 +50,11 @@ export function WorktreeSelector({
   const [isOpen, setIsOpen] = React.useState(false)
   // 初次挂载即保留工具栏高度，避免切回「改动」Tab 后选择器异步出现而推挤文件列表。
   const [isLoading, setIsLoading] = React.useState(true)
+  const [pendingRemoval, setPendingRemoval] = React.useState<{ worktree: WorktreeInfo; repoPath: string } | null>(null)
+  const [isRemoving, setIsRemoving] = React.useState(false)
+  const [restorable, setRestorable] = React.useState<Array<{ path: string; branch?: string; repositoryRoot?: string; recordedAt: number }>>([])
+  const [pendingRestore, setPendingRestore] = React.useState<{ path: string; branch?: string } | null>(null)
+  const [isRestoring, setIsRestoring] = React.useState(false)
   const dropdownRef = React.useRef<HTMLDivElement>(null)
   /** 丢弃较早请求的迟到响应，避免手动刷新后回滚到旧 Worktree 列表。 */
   const fetchSequenceRef = React.useRef(0)
@@ -110,7 +126,73 @@ export function WorktreeSelector({
     }
   }, [isOpen])
 
+  const fetchRestorable = React.useCallback(async () => {
+    try {
+      // 只读取已失效的检出历史；不触发 Git 写操作。
+      const list = await window.electronAPI.getRestorableWorktrees(sessionId)
+      setRestorable(list.map((entry) => ({
+        path: entry.path,
+        branch: entry.branch,
+        repositoryRoot: entry.repositoryRoot,
+        recordedAt: entry.recordedAt,
+      })))
+    } catch {
+      setRestorable([])
+    }
+  }, [sessionId])
+
+  React.useEffect(() => {
+    void fetchRestorable()
+  }, [fetchRestorable])
+
+  const confirmRestoreWorktree = React.useCallback(async (): Promise<void> => {
+    const target = pendingRestore
+    if (!target) return
+    setIsRestoring(true)
+    try {
+      const restored = await window.electronAPI.restoreWorktree({ sessionId, path: target.path, confirmed: true })
+      toast.success(`已恢复 Worktree：${restored.branch ?? target.branch ?? ''}`)
+      await fetchWorktrees()
+      await fetchRestorable()
+      setPendingRestore(null)
+      const next = await window.electronAPI.listWorktrees(restored.path, sessionId).catch(() => [])
+      const match = next.find((wt) => normalizePathKey(wt.path) === normalizePathKey(restored.path))
+      if (match) onSelect(match)
+    } catch (error) {
+      console.error('[Worktree] 恢复失败:', error)
+      toast.error(error instanceof Error ? error.message : '恢复 Worktree 失败')
+    } finally {
+      setIsRestoring(false)
+    }
+  }, [pendingRestore, sessionId, fetchWorktrees, fetchRestorable, onSelect])
+
   const allWorktrees = repoWorktrees.flatMap((rw) => rw.worktrees)
+  const confirmRemoveWorktree = React.useCallback(async (): Promise<void> => {
+    const target = pendingRemoval
+    if (!target) return
+    setIsRemoving(true)
+    try {
+      const result = await window.electronAPI.removeWorktree({
+        repoPath: target.repoPath,
+        worktreePath: target.worktree.path,
+        sessionId,
+        confirmed: true,
+      })
+      if (result.removed) {
+        if (selectedPath && normalizePathKey(selectedPath) === normalizePathKey(target.worktree.path)) {
+          onSelect(null)
+        }
+        toast.success(`已删除 Worktree：${target.worktree.branch}`)
+        await fetchWorktrees()
+      }
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '删除 Worktree 失败')
+    } finally {
+      setIsRemoving(false)
+      setPendingRemoval(null)
+    }
+  }, [fetchWorktrees, onSelect, pendingRemoval, selectedPath, sessionId])
+
   const selectedWorktree = allWorktrees.find((wt) => normalizePathKey(wt.path) === normalizePathKey(selectedPath ?? ''))
   const hasMultipleRepos = repoWorktrees.length > 1
 
@@ -200,6 +282,31 @@ export function WorktreeSelector({
             </span>
           </button>
           <div className="my-1 h-px bg-border/70" />
+          {restorable.length > 0 && (
+            <div className="border-b border-border/60 pb-1">
+              <div className="px-2.5 pb-1 pt-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+                已移除的检出
+              </div>
+              {restorable.map((entry) => (
+                <div key={entry.path} className="group flex items-center gap-1 rounded-lg">
+                  <div className="flex min-w-0 flex-1 items-center gap-2 px-2.5 py-2 text-left text-xs">
+                    <ArchiveRestore className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate font-medium leading-4">{entry.branch ?? '未知分支'}</span>
+                      <span className="block truncate text-[10px] leading-3 text-muted-foreground">{entry.path}</span>
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setPendingRestore({ path: entry.path, branch: entry.branch })}
+                    className="mr-1 inline-flex h-8 shrink-0 items-center justify-center rounded-md px-2 text-[11px] text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+                  >
+                    恢复
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
           <div className="max-h-56 overflow-y-auto">
             {repoWorktrees.map((rw) => (
               <React.Fragment key={rw.repo.repoPath}>
@@ -234,13 +341,22 @@ export function WorktreeSelector({
                         <button
                           type="button"
                           onClick={() => onOpenTerminal(wt)}
-                          className="mr-1 inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-[background-color,color,opacity,transform] hover:bg-background/80 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 active:scale-[0.96]"
+                          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-[background-color,color,opacity,transform] hover:bg-background/80 hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 active:scale-[0.96]"
                           title={`在 ${wt.branch} 打开终端`}
                           aria-label={`在 ${wt.branch} 打开终端`}
                         >
                           <SquareTerminal className="size-3.5" />
                         </button>
                       )}
+                      <button
+                        type="button"
+                        onClick={() => setPendingRemoval({ worktree: wt, repoPath: rw.repo.repoPath })}
+                        className="mr-1 inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-[background-color,color,opacity,transform] hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100 focus-visible:opacity-100 active:scale-[0.96]"
+                        title={`删除 ${wt.branch} Worktree`}
+                        aria-label={`删除 ${wt.branch} Worktree`}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </button>
                     </div>
                   )
                 })}
@@ -249,6 +365,29 @@ export function WorktreeSelector({
           </div>
         </div>
       )}
+
+      <AlertDialog open={pendingRemoval !== null} onOpenChange={(open) => { if (!open && !isRemoving) setPendingRemoval(null) }}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>删除 Worktree？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将执行 <code>git worktree remove --force</code> 删除
+              {' '}<span className="font-medium text-foreground">{pendingRemoval?.worktree.branch}</span>
+              {' '}（{pendingRemoval?.worktree.path}）。未提交的改动会一并丢失，且无法从 Proma 恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={isRemoving}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={isRemoving}
+              onClick={(event) => { event.preventDefault(); void confirmRemoveWorktree() }}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {isRemoving ? '删除中…' : '删除 Worktree'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

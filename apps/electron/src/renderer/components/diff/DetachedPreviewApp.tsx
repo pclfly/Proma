@@ -10,6 +10,7 @@ import { useSetAtom } from 'jotai'
 import type { DetachedPreviewWindowData } from '@proma/shared'
 import { agentDiffRefreshVersionAtom } from '@/atoms/agent-atoms'
 import { cn } from '@/lib/utils'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import { DiffTabContent } from './DiffTabContent'
 import { PreviewContentErrorBoundary } from './PreviewContentErrorBoundary'
 import { DefaultAppOpenButton } from './DefaultAppOpenButton'
@@ -85,6 +86,7 @@ export function DetachedPreviewApp(): React.ReactElement {
   const defaultAppAccess = getPreviewFileAccess(data.sessionId, data, data.dirPath)
 
   return (
+    <TooltipProvider delayDuration={200} disableHoverableContent>
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-content-area text-foreground">
       <div className="h-11 flex items-center gap-2 px-3 border-b border-border/40 shrink-0">
         <div className="min-w-0 flex-1">
@@ -128,5 +130,6 @@ export function DetachedPreviewApp(): React.ReactElement {
         </PreviewContentErrorBoundary>
       </div>
     </div>
+    </TooltipProvider>
   )
 }

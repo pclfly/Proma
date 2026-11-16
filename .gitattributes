@@ -1,0 +1,2 @@
+# 依赖补丁参与 Bun 校验；Windows 检出也必须保持 LF。
+patches/*.patch text eol=lf

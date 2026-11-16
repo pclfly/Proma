@@ -81,7 +81,7 @@ export const PROVIDER_LABELS: Record<ProviderType, string> = {
   openai: 'OpenAI',
   'openai-responses': 'OpenAI Responses 格式',
   deepseek: 'DeepSeek',
-  google: 'Google',
+  google: 'Google AI Studio',
   'kimi-api': 'Kimi API',
   'kimi-coding': 'Kimi Coding Plan',
   'opencode-go-openai': 'OpenCode Go',
@@ -328,6 +328,8 @@ export interface ChannelModel {
   source?: 'manual' | 'fetched'
   /** 可选：用户为单模型配置的上下文窗口（token 数）。不填则按模型名/目录自动推断。 */
   contextWindow?: number
+  /** 内置目录/已知模型规则提供的参考窗口；与用户手动覆盖分开保存。 */
+  builtInContextWindow?: number
 }
 
 /**
@@ -485,6 +487,24 @@ export interface ChannelPlanQuotaWindow {
 }
 
 /**
+ * 积分制 Plan 的余额信息。
+ *
+ * 仅当供应商确实返回积分数据时才存在，不能由百分比窗口折算。
+ */
+export interface ChannelPlanQuotaCredits {
+  /** 剩余积分 */
+  remaining: number
+  /** 总积分；供应商未提供总量时为 0 */
+  total: number
+  /** 展示单位，默认「积分」 */
+  unit: string
+  /** 直接展示的余额文案 */
+  remainingLabel?: string
+  /** 积分重置时间戳（毫秒） */
+  resetAt?: number
+}
+
+/**
  * 渠道订阅 Plan 额度查询结果。
  */
 export interface ChannelPlanQuotaResult {
@@ -494,8 +514,12 @@ export interface ChannelPlanQuotaResult {
   provider: ProviderType
   /** Plan 展示名称 */
   planName?: string
+  /** 会员档位（如 Kimi 返回的 user_level_name） */
+  tier?: string
   /** 查询到的窗口额度列表 */
   windows: ChannelPlanQuotaWindow[]
+  /** 积分制 Plan 的余额；仅当供应商返回时存在 */
+  credits?: ChannelPlanQuotaCredits
   /** 查询时间戳（毫秒） */
   updatedAt: number
   /** 不支持或查询失败时的用户可读原因 */
@@ -528,6 +552,8 @@ export const CHANNEL_IPC_CHANNELS = {
   GET_REASONING_PROFILES: 'channel:get-reasoning-profiles',
   /** 更新推理能力配置 */
   UPDATE_REASONING_PROFILES: 'channel:update-reasoning-profiles',
+  /** 完整推理配置保存成功后广播（包括空列表） */
+  REASONING_PROFILES_CHANGED: 'channel:reasoning-profiles-changed',
   /** 发起 ChatGPT (Codex) OAuth 登录，返回加密凭据与账号信息 */
   CODEX_OAUTH_LOGIN: 'channel:codex-oauth-login',
   /** 取消进行中的 ChatGPT OAuth 登录流程 */

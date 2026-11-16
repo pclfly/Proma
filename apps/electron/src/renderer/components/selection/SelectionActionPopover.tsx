@@ -10,8 +10,6 @@ interface SelectionActionPopoverProps {
   onOpenExplorationBranch?: () => void | Promise<void>
   /** 兼容尚未迁移的临时 Agent 入口。 */
   onOpenTemporaryAgent?: () => void | Promise<void>
-  /** 兼容尚未迁移的文件 / Scratch 选区入口。 */
-  onOpenChat?: () => void | Promise<void>
 }
 
 export function SelectionActionPopover({
@@ -20,9 +18,8 @@ export function SelectionActionPopover({
   onAddToAgent,
   onOpenExplorationBranch,
   onOpenTemporaryAgent,
-  onOpenChat,
 }: SelectionActionPopoverProps): React.ReactElement {
-  const openSideAssistant = onOpenExplorationBranch ?? onOpenTemporaryAgent ?? onOpenChat
+  const openSideAssistant = onOpenExplorationBranch ?? onOpenTemporaryAgent
   // 顶部选区若仍向上展开，浮窗会被窗口边缘裁掉；此时改为在选区下方展示。
   const openBelow = y < 72
   // 浮窗有两个不可换行的动作。靠近视口边缘时改为向内对齐，避免 flex item 收缩后中文逐字竖排。

@@ -63,7 +63,7 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
   {
     id: 'new-session',
     name: '新建对话',
-    description: '根据当前模式创建 Chat 对话或 Agent 会话',
+    description: '创建Agent会话',
     defaultMac: 'Cmd+N',
     defaultWin: 'Ctrl+N',
     category: 'app',
@@ -74,42 +74,6 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     description: '显示或隐藏左侧边栏',
     defaultMac: 'Cmd+B',
     defaultWin: 'Ctrl+Shift+E',
-    category: 'app',
-  },
-  // 由 Electron 原生菜单角色处理，展示但不允许在应用内修改。
-  {
-    id: 'zoom-in',
-    name: '放大界面',
-    description: '提高 Proma 界面的缩放比例',
-    defaultMac: 'Cmd+Plus',
-    defaultWin: 'Ctrl+Plus',
-    category: 'app',
-    readonly: true,
-  },
-  {
-    id: 'zoom-out',
-    name: '缩小界面',
-    description: '降低 Proma 界面的缩放比例',
-    defaultMac: 'Cmd+Minus',
-    defaultWin: 'Ctrl+Minus',
-    category: 'app',
-    readonly: true,
-  },
-  {
-    id: 'reset-zoom',
-    name: '重置界面缩放',
-    description: '恢复 Proma 界面的默认缩放比例',
-    defaultMac: 'Cmd+0',
-    defaultWin: 'Ctrl+0',
-    category: 'app',
-    readonly: true,
-  },
-  {
-    id: 'toggle-mode',
-    name: '切换模式',
-    description: '在 Chat 和 Agent 模式之间切换',
-    defaultMac: 'Cmd+Shift+M',
-    defaultWin: 'Ctrl+Shift+M',
     category: 'app',
   },
   {
@@ -156,16 +120,6 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     category: 'edit',
     readonly: true,
   },
-
-  // 编辑级
-  {
-    id: 'clear-context',
-    name: '清除上下文',
-    description: '清除当前对话的上下文',
-    defaultMac: 'Cmd+K',
-    defaultWin: 'Ctrl+K',
-    category: 'edit',
-  },
   {
     id: 'stop-generation',
     name: '停止 Agent',
@@ -177,7 +131,7 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
   {
     id: 'close-tab',
     name: '关闭当前标签',
-    description: '关闭当前 Chat 标签页，或 Agent 右侧组件、预览、浏览器和终端标签',
+    description: '关闭Agent右侧组件、预览、浏览器或终端标签',
     defaultMac: 'Cmd+W',
     defaultWin: 'Ctrl+W',
     category: 'app',
@@ -206,6 +160,15 @@ export const DEFAULT_SHORTCUTS: ShortcutDefinition[] = [
     description: '唤起浮动快速任务输入窗口',
     defaultMac: 'Alt+Space',
     defaultWin: 'Alt+Space',
+    category: 'global',
+    global: true,
+  },
+  {
+    id: 'quick-capture-todo',
+    name: '快速捕获清单',
+    description: '在任意应用下唤起清单快速捕获浮层',
+    defaultMac: 'Cmd+Shift+T',
+    defaultWin: 'Ctrl+Shift+T',
     category: 'global',
     global: true,
   },

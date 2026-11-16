@@ -54,6 +54,7 @@ import {
   resolveOpenAIChatCompletionsUrl,
   resolveOpenAIResponsesUrl,
 } from '@proma/core'
+import { enableChannelModel, formatBuiltInContextWindow, getBuiltInContextWindow, mergeFetchedChannelModels } from './channel-model-state'
 import { getProviderLogo } from '@/lib/model-logo'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import {
@@ -87,7 +88,7 @@ const PROVIDER_OPTIONS: ProviderType[] = ['anthropic', 'anthropic-compatible', '
 /** 需要用 messages 端点测试的供应商预设模型 */
 const PROVIDER_TEST_MODEL_PRESETS: Partial<Record<ProviderType, string[]>> = {
   deepseek: ['deepseek-v4-pro', 'deepseek-v4-flash', 'deepseek-flash', 'deepseek-v4-flash-vision-exp'],
-  'kimi-api': ['kimi-k3', 'kimi-k2.6'],
+  'kimi-api': ['kimi-k3', 'kimi-k3.1-pro'],
   xiaomi: ['mimo-v2.6-pro', 'mimo-v2.6-flash', 'mimo-v2.6-pro-ultraspeed'],
   'xiaomi-token-plan': ['mimo-v2.6-pro', 'mimo-v2.6-flash', 'mimo-v2.6-pro-ultraspeed'],
   'qwen-token-plan': ['qwen3.8-max-preview', 'qwen3.7-max', 'qwen3.7-flash', 'qwen3.6-flash'],
@@ -211,7 +212,14 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
   const [apiKey, setApiKey] = React.useState('')
   const [zhipuTeamSecret, setZhipuTeamSecret] = React.useState<ZhipuTeamSecretForm>(EMPTY_ZHIPU_TEAM_SECRET)
   const [showApiKey, setShowApiKey] = React.useState(false)
-  const [models, setModels] = React.useState<ChannelModel[]>(channel?.models ?? [])
+  const [models, setModelsState] = React.useState<ChannelModel[]>(channel?.models ?? [])
+  // OAuth 授权期间仍可编辑；回调必须读取最新值，并把同一份合并结果显示和保存。
+  const modelsRef = React.useRef(models)
+  const setModels = React.useCallback((next: React.SetStateAction<ChannelModel[]>) => {
+    const value = typeof next === 'function' ? next(modelsRef.current) : next
+    modelsRef.current = value
+    setModelsState(value)
+  }, [])
   const [enabled, setEnabled] = React.useState(channel?.enabled ?? true)
 
   // 新模型输入
@@ -433,9 +441,10 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
           { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision Exp', enabled: true },
         ])
       } else if (p === 'kimi-api') {
+        // kimi-k2.6 已停售，不再作为新建渠道预置。
         setModels([
+          { id: 'kimi-k3.1-pro', name: 'Kimi K3.1 Pro', enabled: true },
           { id: 'kimi-k3', name: 'Kimi K3', enabled: true },
-          { id: 'kimi-k2.6', name: 'Kimi K2.6', enabled: true },
         ])
       } else if (p === 'kimi-coding') {
         setModels([
@@ -556,7 +565,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
   /** 切换模型启用状态（点击可用模型 → 启用，点击已启用模型 → 禁用） */
   const handleToggleModel = (modelId: string): void => {
     setModels((prev) =>
-      prev.map((m) => (m.id === modelId ? { ...m, enabled: !m.enabled } : m))
+      prev.map((m) => (m.id === modelId ? m.enabled ? { ...m, enabled: false } : enableChannelModel(m) : m))
     )
   }
 
@@ -590,7 +599,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         const modelsResult = await window.electronAPI.fetchModels({ provider, baseUrl, apiKey: credentials })
         setFetchResult(modelsResult)
         if (modelsResult.success && modelsResult.models.length > 0) {
-          codexModels = modelsResult.models.map((m) => ({ ...m, enabled: true }))
+          codexModels = mergeFetchedChannelModels(modelsRef.current, modelsResult.models, true)
           setModels(codexModels)
         }
       } catch (modelErr) {
@@ -655,7 +664,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         }
         // 本次登录返回的模型目录反映当前账号与组织策略。空列表也是权威结果，
         // 不得沿用上一个账号的旧模型，否则选择器会显示无法实际调用的选项。
-        copilotModels = modelsResult.models.map((model) => ({ ...model, enabled: true }))
+        copilotModels = mergeFetchedChannelModels(modelsRef.current.filter((model) => modelsResult.models.some((next) => next.id === model.id)), modelsResult.models, true)
         setModels(copilotModels)
       } catch (modelErr) {
         console.error('[模型配置表单] 拉取 GitHub Copilot 模型失败:', modelErr)
@@ -722,7 +731,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         const modelsResult = await window.electronAPI.fetchModels({ provider, baseUrl, apiKey: credentials })
         setFetchResult(modelsResult)
         if (modelsResult.success && modelsResult.models.length > 0) {
-          xaiModels = modelsResult.models.map((model) => ({ ...model, enabled: true }))
+          xaiModels = mergeFetchedChannelModels(modelsRef.current, modelsResult.models, true)
           setModels(xaiModels)
         }
       } catch (modelErr) {
@@ -731,7 +740,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
 
       // OAuth 登录成功即明确保存意图。编辑模式也立即写入，不能依赖 600ms 的
       // auto-save，避免用户立刻关闭表单而丢失 refresh token。
-      const savedModels = xaiModels.length > 0 ? xaiModels : models
+      const savedModels = xaiModels.length > 0 ? xaiModels : modelsRef.current
       if (isEdit && channel) {
         const saved = await window.electronAPI.updateChannel(channel.id, {
           name,
@@ -789,22 +798,7 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
       // - 既不在新结果里、也不是手动添加的旧模型一律丢弃（清除残留）
       // 拉取失败时保留现有列表，避免 auto-save 持久化空模型列表
       if (!result.success) return
-      const fetchedModels = result.models
-      const fetchedById = new Map(fetchedModels.map((m) => [m.id, m]))
-      setModels((prev) => {
-        const manualKept = prev.filter((m) => m.source === 'manual' && !fetchedById.has(m.id))
-        const merged = fetchedModels.map((m) => {
-          const old = prev.find((p) => p.id === m.id)
-          // ChatGPT (Codex) 是 SDK 内置的少量精选模型，拉取即全部启用，
-          // 与登录自动拉取路径（handleCodexLogin）保持一致，避免新模型（如 gpt-5.6 系列）
-          // 默认未启用而沉到「可用模型」折叠区，被误认为"拉不到"。
-          if (isSubscriptionProvider) return { ...m, enabled: true }
-          return old
-            ? { ...m, enabled: old.enabled, ...(old.contextWindow != null ? { contextWindow: old.contextWindow } : {}) }
-            : { ...m, enabled: false }
-        })
-        return [...manualKept, ...merged]
-      })
+      setModels((prev) => mergeFetchedChannelModels(prev, result.models, isSubscriptionProvider))
     } catch (error) {
       setFetchResult({ success: false, message: '拉取模型请求失败', models: [] })
     } finally {
@@ -1363,6 +1357,9 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
                       <span className="text-muted-foreground ml-1">({model.id})</span>
                     )}
                   </span>
+                  <span className="text-xs text-muted-foreground tabular-nums shrink-0" title={`内置上下文参考：${getBuiltInContextWindow(model)?.toLocaleString('en-US') ?? '未知'} tokens`}>
+                    {formatBuiltInContextWindow(getBuiltInContextWindow(model))}
+                  </span>
                   <Input
                     type="number"
                     min={1}
@@ -1466,6 +1463,9 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
                     {model.name !== model.id && (
                       <span className="text-muted-foreground ml-1">({model.id})</span>
                     )}
+                  </span>
+                  <span className="text-xs text-muted-foreground tabular-nums shrink-0" title={`内置上下文参考：${getBuiltInContextWindow(model)?.toLocaleString('en-US') ?? '未知'} tokens`}>
+                    {formatBuiltInContextWindow(getBuiltInContextWindow(model))}
                   </span>
                   <button
                     type="button"

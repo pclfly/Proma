@@ -1,6 +1,7 @@
 import * as React from 'react'
 import { useAtom, useStore } from 'jotai'
 import { AppShell } from './components/app-shell/AppShell'
+import { ComputerUsePreviewOverlay } from './components/computer-use/ComputerUsePreviewOverlay'
 import { OnboardingView } from './components/onboarding/OnboardingView'
 import { EnvironmentCheckDialog } from './components/environment/EnvironmentCheckDialog'
 import { TooltipProvider } from './components/ui/tooltip'
@@ -15,7 +16,7 @@ import { environmentCheckDialogOpenAtom } from './atoms/environment'
 import { onboardingReplayRequestedAtom } from './atoms/onboarding'
 import { settingsOpenAtom, settingsTabAtom } from './atoms/settings-tab'
 import { hasCompletedCurrentOnboarding } from '../types'
-import { setReasoningProfileConfig } from '@proma/shared'
+import { applyReasoningProfilesAtom } from './atoms/reasoning-profiles'
 import hopperSeasideWhiteHouse from './assets/onboarding/hopper-seaside-white-house.png'
 import promaMarkWhite from './assets/onboarding/proma-mark-white.svg'
 
@@ -33,6 +34,12 @@ export default function App(): React.ReactElement {
   // macOS/Linux 上 SDK 自带 claude native binary 不依赖宿主 Node/Git；
   // Windows 上仍需 Git Bash/WSL，由 Onboarding Step 2 与聊天错误卡片引导用户安装。
   React.useEffect(() => {
+    let disposed = false
+    let receivedProfileUpdate = false
+    const unsubscribe = window.electronAPI.onReasoningProfilesChanged((profiles) => {
+      receivedProfileUpdate = true
+      store.set(applyReasoningProfilesAtom, profiles)
+    })
     const initialize = async () => {
       try {
         const settings = await window.electronAPI.getSettings()
@@ -42,7 +49,7 @@ export default function App(): React.ReactElement {
         // 注入用户自定义推理能力配置（供渲染进程 resolveReasoningProfile 使用）
         try {
           const rp = await window.electronAPI.getReasoningProfiles()
-          setReasoningProfileConfig(rp)
+          if (!disposed && !receivedProfileUpdate) store.set(applyReasoningProfilesAtom, rp)
         } catch (e) {
           console.warn('[App] 加载推理能力配置失败:', e)
         }
@@ -53,8 +60,9 @@ export default function App(): React.ReactElement {
       }
     }
 
-    initialize()
-  }, [])
+    void initialize()
+    return () => { disposed = true; unsubscribe() }
+  }, [store])
 
   // 设置页请求重放时跳过欢迎页，但保留完整的后续 Onboarding 流程。
   React.useEffect(() => {
@@ -101,6 +109,7 @@ export default function App(): React.ReactElement {
   return (
     <TooltipProvider delayDuration={200} disableHoverableContent>
       <AppShell />
+      <ComputerUsePreviewOverlay />
       <PlanningReminderRail />
       <ShortcutGuideDialog />
       <FaqDialog />

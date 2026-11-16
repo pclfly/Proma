@@ -1,16 +1,38 @@
 import * as React from 'react'
+import { createPortal } from 'react-dom'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
-import { BookOpen, ChevronDown, ChevronLeft, ChevronRight, ChevronsUpDown, CircleHelp, Folder, FolderOpen, Loader2, Plus, Trash2 } from 'lucide-react'
+import {
+  BookOpen,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsUpDown,
+  CircleHelp,
+  FolderOpen,
+  Loader2,
+  Plus,
+} from 'lucide-react'
 import { toast } from 'sonner'
-import type { VaultCandidate, VaultFileEntry, VaultFocus, VaultReadResult, VaultSummary, VaultTreeEntry } from '@proma/shared'
+import type {
+  VaultCandidate,
+  VaultFileEntry,
+  VaultFocus,
+  VaultReadResult,
+  VaultSummary,
+} from '@proma/shared'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
-import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
-import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from '@/components/ui/context-menu'
+
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { resolveVaultWikiLink } from './vault-wikilinks'
 import { VaultLiveMarkdownEditor } from './VaultLiveMarkdownEditor'
 import { VaultNoteTitle } from './VaultNoteTitle'
 import { focusVaultBody } from './vault-title-focus'
@@ -19,21 +41,11 @@ import { useVaultScrollMemory } from './useVaultScrollMemory'
 import { getVaultScrollKey } from './vault-scroll-memory'
 import type { LiveMarkdownEditorHandle, LiveMarkdownTextSelection } from '@/components/markdown/LiveMarkdownEditor'
 import { SelectionActionPopover } from '@/components/selection/SelectionActionPopover'
-import { focusChatInput } from '@/components/chat/focus-chat-input'
-import { getOrCreateSideChat } from '@/lib/side-chat'
 import { insertAgentInputQuote } from '@/lib/agent-input-quote'
+import { useVaultPresentation } from '@/hooks/useVaultPresentation'
 import { useFocusAgentSessionInput } from '@/hooks/useFocusAgentSessionInput'
-import {
-  agentDiffPanelTabAtom,
-  agentSidePanelOpenAtomFamily,
-} from '@/atoms/agent-atoms'
-import {
-  agentSideChatMapAtom,
-  conversationsAtom,
-  conversationDraftsAtom,
-  conversationQuotedSelectionMapAtom,
-  selectedModelAtom,
-} from '@/atoms/chat-atoms'
+import { agentDiffPanelTabAtom, agentSidePanelOpenAtomFamily } from '@/atoms/agent-atoms'
+
 import { quotedSelectionMapAtom } from '@/atoms/preview-atoms'
 import {
   focusedVaultFolderAtomFamily,
@@ -41,12 +53,14 @@ import {
   selectedVaultFileAtomFamily,
   vaultReadResultAtomFamily,
   vaultRefreshTokenAtom,
+  vaultSectionSidebarSlotAtom,
 } from '@/atoms/vault-atoms'
 import { cn } from '@/lib/utils'
 import { VaultContentErrorBoundary } from './VaultContentErrorBoundary'
 import { getVaultEditorKey, shouldRemountVaultEditor } from './vault-editor-lifecycle'
 import { getVaultDocumentController } from './vault-document-controller'
-import { buildVaultTree, getInitialVaultExpandedFolders, getVaultFolderAncestors, hasSameVaultTreeEntries, type VaultFolderNode } from './vault-tree-model'
+import { VaultDirectoryController } from './vault-directory-controller'
+import { VaultFileList } from './VaultFileList'
 import { getVaultSidebarDisplayWidth, getVaultSidebarToggleLabel } from './vault-sidebar-layout'
 
 const VAULT_NAME = 'Vault'
@@ -70,188 +84,6 @@ function displayDocumentTitle(filename: string): string {
 
 function isVaultFileNotFoundError(error: unknown): boolean {
   return error instanceof Error && error.message.includes('Vault 文件不存在:')
-}
-
-function VaultFileList({
-  entries,
-  selectedPath,
-  focusedFolder,
-  onSelect,
-  onFocusFolder,
-  onDelete,
-  onCreateNote,
-  onCreateFolder,
-  canCreate,
-  treeAction,
-}: {
-  entries: VaultTreeEntry[]
-  selectedPath: string | null
-  focusedFolder: string | null
-  onSelect: (relativePath: string) => void
-  onFocusFolder: (relativePath: string) => void
-  onDelete: (file: VaultFileEntry) => void
-  onCreateNote: (folderPath: string) => void
-  onCreateFolder: (folderPath: string) => void
-  canCreate: boolean
-  treeAction: { type: 'expand' | 'collapse'; version: number }
-}): React.ReactElement {
-  const tree = React.useMemo(() => buildVaultTree(entries), [entries])
-  const allFolderPaths = React.useMemo(() => {
-    const paths: string[] = []
-    const visit = (folder: VaultFolderNode): void => {
-      for (const child of folder.folders.values()) {
-        paths.push(child.relativePath)
-        visit(child)
-      }
-    }
-    visit(tree)
-    return paths
-  }, [tree])
-  // Start collapsed: this prevents a large nested Vault from mounting every file
-  // row and its Tooltip tree on first paint. Expanded paths survive list refreshes.
-  const [expandedFolders, setExpandedFolders] = React.useState<ReadonlySet<string>>(getInitialVaultExpandedFolders)
-
-  React.useEffect(() => {
-    if (treeAction.version === 0) return
-    setExpandedFolders(treeAction.type === 'expand' ? new Set(allFolderPaths) : new Set())
-  }, [allFolderPaths, treeAction])
-
-  React.useEffect(() => {
-    if (!selectedPath) return
-    const ancestors = getVaultFolderAncestors(selectedPath)
-    if (ancestors.length === 0) return
-    setExpandedFolders((current) => {
-      const next = new Set(current)
-      let changed = false
-      for (const path of ancestors) {
-        if (!next.has(path)) {
-          next.add(path)
-          changed = true
-        }
-      }
-      return changed ? next : current
-    })
-  }, [selectedPath])
-
-  React.useEffect(() => {
-    if (!focusedFolder) return
-    const paths = [...getVaultFolderAncestors(focusedFolder), focusedFolder]
-    setExpandedFolders((current) => {
-      const next = new Set(current)
-      let changed = false
-      for (const path of paths) {
-        if (!next.has(path)) {
-          next.add(path)
-          changed = true
-        }
-      }
-      return changed ? next : current
-    })
-  }, [focusedFolder])
-
-  const renderEntries = (folder: VaultFolderNode, depth: number): React.ReactNode => (
-    <>
-      {Array.from(folder.folders.values())
-        .sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true }))
-        .map((child) => {
-          const expanded = expandedFolders.has(child.relativePath)
-          const focused = focusedFolder === child.relativePath
-          return (
-            <React.Fragment key={child.relativePath}>
-              <ContextMenu>
-                <ContextMenuTrigger asChild>
-                  <button
-                    type="button"
-                    aria-expanded={expanded}
-                    aria-label={`${expanded ? '收起' : '展开'}文件夹 ${child.name}`}
-                    onClick={() => {
-                      onFocusFolder(child.relativePath)
-                      setExpandedFolders((current) => {
-                        const next = new Set(current)
-                        if (next.has(child.relativePath)) next.delete(child.relativePath)
-                        else next.add(child.relativePath)
-                        return next
-                      })
-                    }}
-                    className={cn(
-                      'flex h-8 w-full min-w-0 items-center gap-1 rounded-md pr-2 text-left text-[13px] transition-colors hover:bg-muted/70 hover:text-foreground',
-                      focused ? 'bg-accent text-accent-foreground shadow-sm' : 'text-foreground/80',
-                    )}
-                    style={{ paddingLeft: `${10 + Math.min(depth, 6) * 14}px` }}
-                  >
-                    {expanded ? <ChevronDown size={14} className="shrink-0 text-muted-foreground" /> : <ChevronRight size={14} className="shrink-0 text-muted-foreground" />}
-                    {expanded ? <FolderOpen size={14} className="shrink-0 text-primary/80" /> : <Folder size={14} className="shrink-0 text-primary/80" />}
-                    <span className="min-w-0 truncate">{child.name}</span>
-                  </button>
-                </ContextMenuTrigger>
-                <ContextMenuContent className="z-[9999] w-40 min-w-0 p-0.5">
-                  <ContextMenuItem disabled={!canCreate} onSelect={() => onCreateNote(child.relativePath)}>新建笔记</ContextMenuItem>
-                  <ContextMenuItem disabled={!canCreate} onSelect={() => onCreateFolder(child.relativePath)}>新建文件夹</ContextMenuItem>
-                </ContextMenuContent>
-              </ContextMenu>
-              {expanded && (
-                <div className="relative">
-                  <span
-                    aria-hidden="true"
-                    className="absolute top-0 bottom-0 w-px bg-border/70"
-                    style={{ left: `${17 + Math.min(depth, 6) * 14}px` }}
-                  />
-                  {renderEntries(child, depth + 1)}
-                </div>
-              )}
-            </React.Fragment>
-          )
-        })}
-      {folder.files
-        .slice()
-        .sort((left, right) => left.name.localeCompare(right.name, undefined, { numeric: true }))
-        .map((file) => {
-          const selected = selectedPath === file.relativePath
-          return (
-            <div
-              key={file.relativePath}
-              className={cn(
-                'group flex h-8 w-full min-w-0 items-center rounded-md transition-colors',
-                selected ? 'bg-accent text-accent-foreground shadow-sm' : 'text-foreground/70 hover:bg-muted/70 hover:text-foreground',
-              )}
-              style={{ paddingLeft: `${18 + Math.min(depth, 6) * 14}px` }}
-            >
-              <button
-                type="button"
-                title={file.relativePath}
-                onClick={() => onSelect(file.relativePath)}
-                className="h-full min-w-0 flex-1 truncate text-left text-[13px]"
-              >
-                {displayDocumentTitle(file.name)}
-              </button>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <button
-                    type="button"
-                    aria-label={`删除笔记 ${displayDocumentTitle(file.name)}`}
-                    onClick={() => onDelete(file)}
-                    className="mr-1 flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-[opacity,color,background-color] hover:bg-destructive/10 hover:text-destructive focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover:opacity-100"
-                  >
-                    <Trash2 size={13} />
-                  </button>
-                </TooltipTrigger>
-                <TooltipContent side="right">删除笔记</TooltipContent>
-              </Tooltip>
-            </div>
-          )
-        })}
-    </>
-  )
-
-  const hasEntries = entries.length > 0
-
-  return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-3 scrollbar-thin titlebar-no-drag">
-      {!hasEntries
-        ? <p className="px-4 py-6 text-center text-xs leading-relaxed text-muted-foreground">没有可显示的 Markdown 笔记或文件夹</p>
-        : renderEntries(tree, 0)}
-    </div>
-  )
 }
 
 type VaultSaveRequest = {
@@ -307,15 +139,7 @@ function VaultMarkdownEditor({
   const { draft, saving, conflict: saveConflict } = documentSnapshot
   const editorPageRef = React.useRef<HTMLDivElement>(null)
   const [selection, setSelection] = React.useState<VaultTextSelection | null>(null)
-  const openSelectionChatPendingRef = React.useRef(false)
-  const selectedChatModel = useAtomValue(selectedModelAtom)
   const setQuotedSelectionMap = useSetAtom(quotedSelectionMapAtom)
-  const conversations = useAtomValue(conversationsAtom)
-  const sideChatMap = useAtomValue(agentSideChatMapAtom)
-  const setConversations = useSetAtom(conversationsAtom)
-  const setConversationDrafts = useSetAtom(conversationDraftsAtom)
-  const setChatQuotedSelectionMap = useSetAtom(conversationQuotedSelectionMapAtom)
-  const setSideChatMap = useSetAtom(agentSideChatMapAtom)
   const setSidePanelOpen = useSetAtom(agentSidePanelOpenAtomFamily(sessionId ?? 'standalone'))
   const setSidePanelTabMap = useSetAtom(agentDiffPanelTabAtom)
   const focusAgentSessionInput = useFocusAgentSessionInput()
@@ -374,61 +198,6 @@ function VaultMarkdownEditor({
     clearSelection()
     focusAgentSessionInput(sessionId)
   }, [clearSelection, createQuote, focusAgentSessionInput, sessionId, setQuotedSelectionMap])
-  const openSelectionChat = React.useCallback(async (): Promise<void> => {
-    if (!sessionId) {
-      toast.info('请从 Agent 会话右侧打开 Obsidian 后再发起右侧问答')
-      return
-    }
-    const quote = createQuote()
-    if (!quote || openSelectionChatPendingRef.current) return
-
-    const activeConversationId = sideChatMap.get(sessionId) ?? null
-    // 右侧已绑定有效 Chat 时始终复用，避免因激活 Tab 状态短暂不同步而重复创建会话。
-    if (activeConversationId) {
-      setChatQuotedSelectionMap((previous) => new Map(previous).set(activeConversationId, quote))
-      setSidePanelOpen(true)
-      setSidePanelTabMap((previous) => new Map(previous).set(sessionId, 'chat'))
-      clearSelection()
-      focusChatInput(activeConversationId)
-      return
-    }
-
-    openSelectionChatPendingRef.current = true
-    try {
-      const conversation = await getOrCreateSideChat(sessionId, () => window.electronAPI.createConversation(
-        'Obsidian 选区问答',
-        selectedChatModel?.modelId,
-        selectedChatModel?.channelId,
-      ))
-      setConversations((previous) => previous.some((item) => item.id === conversation.id) ? previous : [conversation, ...previous])
-      setConversationDrafts((previous) => new Map(previous).set(conversation.id, '我的问题：'))
-      setSideChatMap((previous) => new Map(previous).set(sessionId, conversation.id))
-      setSidePanelOpen(true)
-      setSidePanelTabMap((previous) => new Map(previous).set(sessionId, 'chat'))
-      setChatQuotedSelectionMap((previous) => new Map(previous).set(conversation.id, quote))
-      clearSelection()
-      focusChatInput(conversation.id)
-    } catch (error) {
-      console.error('[VaultView] 打开 Obsidian 选区聊天失败:', error)
-      toast.error('打开右侧问答失败')
-    } finally {
-      openSelectionChatPendingRef.current = false
-    }
-  }, [
-    clearSelection,
-    conversations,
-    createQuote,
-    selectedChatModel,
-    sessionId,
-    setConversationDrafts,
-    setConversations,
-    setChatQuotedSelectionMap,
-    setQuotedSelectionMap,
-    setSideChatMap,
-    setSidePanelOpen,
-    setSidePanelTabMap,
-    sideChatMap,
-  ])
 
   const updateDraft = React.useCallback((nextDraft: string): void => {
     documentController.setDraft(nextDraft)
@@ -544,7 +313,6 @@ function VaultMarkdownEditor({
           x={selection.x}
           y={selection.y}
           onAddToAgent={addSelectionToAgent}
-          onOpenChat={openSelectionChat}
         />
       )}
     </div>
@@ -585,12 +353,13 @@ function VaultMarkdownPane({
   if (loading || !readResult || !vaultId) {
     return (
       <section className="flex min-w-0 flex-1 flex-col bg-muted/25">
-        <div className="mx-auto flex h-full w-full max-w-5xl flex-col px-5 py-5">
-          <div className="titlebar-no-drag flex min-w-0 items-center gap-2">
-            <p className="min-w-0 flex-1 truncate px-4 text-sm text-muted-foreground">{loading ? '正在加载笔记' : hasVault ? '选择一篇笔记开始编辑' : '从左下角选择或创建 Vault'}</p>
-          </div>
+        {/* 与截图一致：空 Vault 的提示居中显示在主区顶部。 */}
+        <div className="flex h-full w-full flex-col items-center px-5 pt-9 text-center">
+          <p className="text-sm text-muted-foreground">
+            {loading ? '正在加载笔记' : hasVault ? '选择一篇笔记开始编辑' : '从左下角选择或创建 Vault'}
+          </p>
           {loading && (
-            <div className="flex min-h-0 flex-1 items-center justify-center text-muted-foreground">
+            <div className="mt-6 flex text-muted-foreground">
               <Loader2 className="size-5 animate-spin" />
             </div>
           )}
@@ -621,8 +390,14 @@ function VaultMarkdownPane({
   )
 }
 
-export function VaultView({ embedded = false, sessionId }: { embedded?: boolean; sessionId?: string }): React.ReactElement {
+export function VaultView({ embedded = false, sessionId, shellMode = false }: {
+  embedded?: boolean
+  sessionId?: string
+  /** 官方 0.22.0：侧栏投射到全局分区侧栏，主区只保留编辑器。 */
+  shellMode?: boolean
+}): React.ReactElement {
   const vaultSidebarContentId = React.useId()
+  const sectionSidebarSlot = useAtomValue(vaultSectionSidebarSlotAtom)
   const vaultSessionScope = getVaultSessionScope(sessionId)
   const [config, setConfig] = React.useState<VaultSummary | null>(null)
   const mountedRef = React.useRef(true)
@@ -654,7 +429,11 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
   const [candidates, setCandidates] = React.useState<VaultCandidate[]>([])
   const [vaultSwitcherOpen, setVaultSwitcherOpen] = React.useState(false)
   const [candidatesLoading, setCandidatesLoading] = React.useState(false)
-  const [entries, setEntries] = React.useState<VaultTreeEntry[]>([])
+  const directories = React.useMemo(() => new VaultDirectoryController(
+    (vaultId, relativePath, offset) => window.electronAPI.listVaultDirectory(relativePath, { expectedVaultId: vaultId, offset }),
+  ), [])
+  const refreshRequestRef = React.useRef(0)
+  React.useEffect(() => () => { ++refreshRequestRef.current; ++readRequestRef.current; directories.setVault(null) }, [directories])
   const [loading, setLoading] = React.useState(true)
   const [fileLoading, setFileLoading] = React.useState(false)
   const [editorReopenVersion, setEditorReopenVersion] = React.useState(0)
@@ -762,29 +541,31 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
 
   const refresh = React.useCallback(async ({ showLoading = false }: { showLoading?: boolean } = {}): Promise<void> => {
     if (showLoading) setLoading(true)
+    const refreshId = ++refreshRequestRef.current
+    const noteRequest = readRequestRef.current
     try {
       const nextConfig = await window.electronAPI.getVaultConfig()
+      if (refreshId !== refreshRequestRef.current || !mountedRef.current) return
       setConfig(nextConfig)
-      const nextEntries = nextConfig ? await window.electronAPI.listVaultFiles() : []
-      setEntries((current) => hasSameVaultTreeEntries(current, nextEntries) ? current : nextEntries)
+      directories.setVault(nextConfig?.vaultId ?? null)
+      if (nextConfig) await directories.refresh()
+      if (refreshId !== refreshRequestRef.current || !mountedRef.current) return
       if (!nextConfig) {
         selectFile(null)
         setReadResult(null)
-      } else if (selectedFileRef.current) {
+      } else if (selectedFileRef.current && noteRequest === readRequestRef.current) {
         const relativePath = selectedFileRef.current
-        if (!nextEntries.some((entry) => entry.kind === 'file' && entry.relativePath === relativePath)) {
-          selectFile(null)
-          setReadResult(null)
-          toast.message('已打开的笔记不存在')
-          return
-        }
         const requestId = ++readRequestRef.current
         try {
           const result = await window.electronAPI.readVaultFile(relativePath)
-          if (requestId === readRequestRef.current) setReadResult(result)
+          if (mountedRef.current && requestId === readRequestRef.current && directories.getSnapshot().vaultId === nextConfig.vaultId && selectedFileRef.current === relativePath) setReadResult(result)
         } catch (error) {
           if (requestId === readRequestRef.current) {
-            toast.error(error instanceof Error ? error.message : '无法刷新已打开的笔记')
+            if (isVaultFileNotFoundError(error)) {
+              selectFile(null)
+              setReadResult(null)
+              toast.message('已打开的笔记不存在')
+            } else toast.error(error instanceof Error ? error.message : '无法刷新已打开的笔记')
           }
         } finally {
           // 刷新可能接管尚未完成的导航读取，也负责结束该请求的加载态。
@@ -794,9 +575,9 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
     } catch (error) {
       toast.error(error instanceof Error ? error.message : `无法读取 ${VAULT_NAME}`)
     } finally {
-      if (showLoading) setLoading(false)
+      if (refreshId === refreshRequestRef.current && mountedRef.current) setLoading(false)
     }
-  }, [selectFile, setReadResult])
+  }, [selectFile, setReadResult, directories])
 
   React.useEffect(() => {
     const showLoading = initialRefreshRef.current
@@ -852,14 +633,16 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
     relativePath: string,
     { discardLocalDraft = false, forceReopen = false }: { discardLocalDraft?: boolean; forceReopen?: boolean } = {},
   ): Promise<void> => {
+    const vaultId = directories.getSnapshot().vaultId
     if (!discardLocalDraft && !await flushCurrentEditor()) return
+    if (!mountedRef.current || vaultId !== directories.getSnapshot().vaultId) return
     const remountEditor = shouldRemountVaultEditor(selectedFileRef.current, relativePath, forceReopen)
     const requestId = ++readRequestRef.current
     selectFile(relativePath)
     setFileLoading(true)
     try {
       const result = await window.electronAPI.readVaultFile(relativePath)
-      if (requestId === readRequestRef.current) {
+      if (mountedRef.current && requestId === readRequestRef.current && vaultId === directories.getSnapshot().vaultId && selectedFileRef.current === relativePath) {
         setReadResult(result)
         // Only the explicit conflict-recovery action recreates the editor.
         // Repeated ordinary clicks must preserve its CodeMirror instance.
@@ -876,22 +659,58 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
     } finally {
       if (requestId === readRequestRef.current) setFileLoading(false)
     }
-  }, [flushCurrentEditor, refresh, selectFile, setReadResult])
+  }, [flushCurrentEditor, refresh, selectFile, setReadResult, directories])
+
+  // Agent 的 VaultOpen 请求：只做路由与回执，内容加载复用 openFile 的草稿保护与焦点上报。
+  useVaultPresentation({
+    getState: () => ({
+      canPresent: Boolean(sessionId) && directories.getSnapshot().vaultId !== '',
+      activeVaultSessionId: sessionId,
+    }),
+    openFile: async (relativePath) => { await openFile(relativePath); return true },
+    openFolder: (relativePath) => {
+      setFocusedFolder(relativePath)
+      setSelectedFile(null)
+      updateAgentFocus({ kind: 'folder', relativePath })
+      return true
+    },
+    openRoot: () => {
+      setSelectedFile(null)
+      setFocusedFolder(null)
+      updateAgentFocus(null)
+      return true
+    },
+  })
 
   const openWikiLink = React.useCallback((target: string): void => {
     if (!readResult) return
-    const path = resolveVaultWikiLink(target, readResult.relativePath, entries.filter((entry) => entry.kind === 'file').map((entry) => entry.relativePath))
-    if (!path) {
-      toast.error(`无法定位笔记“${target}”，请检查名称或使用完整的 Vault 内路径`)
-      return
-    }
-    void openFile(path)
-  }, [entries, readResult, openFile])
+    const vaultId = directories.getSnapshot().vaultId
+    if (!vaultId) return
+    const sourcePath = readResult.relativePath
+    // 主进程后台索引解析唯一名称/后缀，不再为一次点击枚举全树。
+    void window.electronAPI.resolveVaultWikiLink({ vaultId, target, sourcePath }).then((result) => {
+      if (vaultId !== directories.getSnapshot().vaultId || selectedFileRef.current !== sourcePath) return
+      if (result.status === 'found') {
+        void openFile(result.relativePath)
+        return
+      }
+      if (result.status === 'indexing') {
+        toast.info('正在建立 Vault 笔记索引，请稍后再次点击双链')
+        return
+      }
+      toast.error(result.status === 'missing'
+        ? `无法定位笔记“${target}”，请检查名称或使用完整的 Vault 内路径`
+        : result.message)
+    }).catch((error: unknown) => toast.error(error instanceof Error ? error.message : '无法查找笔记'))
+  }, [directories, readResult, openFile])
 
   const selectVaultManually = async (): Promise<void> => {
     if (!await flushCurrentEditor()) return
     const selected = await window.electronAPI.selectVault({ inboxPath: 'Proma Inbox', allowAgentWrites: false })
     if (!selected) return
+    ++refreshRequestRef.current
+    ++readRequestRef.current
+    directories.setVault(selected.vaultId)
     setConfig(selected)
     selectFile(null)
     setReadResult(null)
@@ -904,6 +723,9 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
     if (!await flushCurrentEditor()) return
     try {
       const selected = await window.electronAPI.selectDefaultVault()
+      ++refreshRequestRef.current
+      ++readRequestRef.current
+      directories.setVault(selected.vaultId)
       setConfig(selected)
       selectFile(null)
       setReadResult(null)
@@ -921,6 +743,9 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
       const selected = candidate.isPromaManaged
         ? await window.electronAPI.selectDefaultVault()
         : await window.electronAPI.authorizeDiscoveredVault(candidate.path, { inboxPath: 'Proma Inbox', allowAgentWrites: false })
+      ++refreshRequestRef.current
+      ++readRequestRef.current
+      directories.setVault(selected.vaultId)
       setConfig(selected)
       selectFile(null)
       setReadResult(null)
@@ -985,9 +810,11 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
   }
 
   const save = React.useCallback(async (request: VaultSaveRequest, { silent = false }: { silent?: boolean } = {}): Promise<VaultSaveResult> => {
+    const vaultId = directories.getSnapshot().vaultId
     try {
       const result = await window.electronAPI.writeVaultFile(request)
       if (!result.ok) return { ok: false, reason: 'conflict' }
+      if (!mountedRef.current || vaultId !== directories.getSnapshot().vaultId) return result
 
       // A write can finish after the user has opened another note. Never replace
       // that newer view with a stale save acknowledgement.
@@ -997,14 +824,17 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
         sha256: result.sha256,
         modifiedAt: result.modifiedAt,
       } : previous)
-      const nextEntries = await window.electronAPI.listVaultFiles()
-      setEntries((current) => hasSameVaultTreeEntries(current, nextEntries) ? current : nextEntries)
+      directories.updateFile({
+        kind: 'file', relativePath: result.relativePath,
+        name: result.relativePath.split('/').at(-1) ?? result.relativePath,
+        size: new TextEncoder().encode(request.content).length, modifiedAt: result.modifiedAt,
+      })
       if (!silent) toast.success(`已保存到 ${VAULT_NAME}`)
       return result
     } catch (error) {
       return { ok: false, reason: 'error', message: error instanceof Error ? error.message : '保存失败' }
     }
-  }, [setReadResult])
+  }, [setReadResult, directories])
 
   const rename: VaultRename = async (name, flush, shouldFocusBody) => {
     if (!readResult || !config) return false
@@ -1079,19 +909,17 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
   }
 
 
-  return (
-    <>
-      <main className={cn('flex h-full min-h-0 flex-col bg-muted/25', embedded && 'min-w-[360px] bg-content-area')}>
-        {!embedded && <div className="relative z-10 h-[100px] shrink-0 border-b border-border/60 bg-muted/25" />}
-        <div className="relative flex min-h-0 flex-1">
+  const asideCollapsed = !shellMode && vaultSidebarCollapsed
+
+  const asideNode = (
           <aside
             className={cn(
               'relative flex shrink-0 flex-col overflow-hidden bg-muted/25',
-              !vaultSidebarCollapsed && 'border-r border-border/50',
+              !asideCollapsed && !shellMode && 'border-r border-border/50',
             )}
-            style={{ width: getVaultSidebarDisplayWidth(vaultSidebarWidth, vaultSidebarCollapsed) }}
+            style={{ width: shellMode ? '100%' : getVaultSidebarDisplayWidth(vaultSidebarWidth, vaultSidebarCollapsed) }}
           >
-            {vaultSidebarCollapsed && (
+            {asideCollapsed && (
               <header className={cn('flex h-14 shrink-0 items-center justify-center', embedded ? 'titlebar-no-drag' : 'titlebar-drag-region')}>
                 <Tooltip>
                   <TooltipTrigger asChild>
@@ -1113,8 +941,8 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
             )}
             <div
               id={vaultSidebarContentId}
-              aria-hidden={vaultSidebarCollapsed}
-              className={cn('min-h-0 flex-1 flex-col', vaultSidebarCollapsed ? 'hidden' : 'flex')}
+              aria-hidden={asideCollapsed}
+              className={cn('min-h-0 flex-1 flex-col', asideCollapsed ? 'hidden' : 'flex')}
             >
               <header className={cn('flex h-14 items-center gap-2 px-3', embedded ? 'titlebar-no-drag' : 'titlebar-drag-region')}>
                 <div className="min-w-0 flex-1">
@@ -1130,7 +958,7 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
                         aria-expanded="true"
                         aria-label={getVaultSidebarToggleLabel(false)}
                         onClick={() => setVaultSidebarCollapsedWithFocus(true)}
-                        className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                        className={cn('flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted hover:text-foreground', shellMode && 'hidden')}
                       >
                         <ChevronLeft size={15} />
                       </button>
@@ -1166,7 +994,7 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
                 </div>
               </header>
               <VaultFileList
-                entries={entries}
+                controller={directories}
                 selectedPath={selectedFile}
                 focusedFolder={focusedFolder}
                 onSelect={(path) => { setFocusedFolder(null); void openFile(path) }}
@@ -1239,7 +1067,7 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
                 </Popover>
               </div>
             </div>
-            {!vaultSidebarCollapsed && (
+            {!asideCollapsed && !shellMode && (
               <div
                 aria-hidden="true"
                 className="titlebar-no-drag absolute right-0 top-0 bottom-0 z-10 w-3 translate-x-1/2 cursor-col-resize"
@@ -1247,6 +1075,15 @@ export function VaultView({ embedded = false, sessionId }: { embedded?: boolean;
               />
             )}
           </aside>
+  )
+
+  return (
+    <>
+      {shellMode && sectionSidebarSlot && createPortal(asideNode, sectionSidebarSlot)}
+      <main className={cn('flex h-full min-h-0 flex-col bg-muted/25', embedded && 'min-w-[360px] bg-content-area')}>
+        {!embedded && !shellMode && <div className="relative z-10 h-[100px] shrink-0 border-b border-border/60 bg-muted/25" />}
+        <div className="relative flex min-h-0 flex-1">
+          {!shellMode && asideNode}
           <VaultMarkdownPane
             readResult={readResult}
             vaultId={config?.vaultId}

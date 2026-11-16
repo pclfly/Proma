@@ -83,6 +83,18 @@ export interface BrowserViewState {
   activity: BrowserTraceItem | null
 }
 
+/** 用户未直接查看某个标签时，浏览器面板使用该缩略图预览。 */
+export interface BrowserPreviewFrame {
+  tabId: string
+  url: string
+  imageDataUrl: string
+}
+
+export interface BrowserPreviewInput {
+  sessionId: string
+  tabId: string
+}
+
 /** 通知 renderer 当前会话的受管浏览器已销毁。 */
 export interface BrowserSessionClosed {
   sessionId: string

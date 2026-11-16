@@ -24,33 +24,50 @@ export interface ToolValidationFailure {
   message: string
 }
 
-/**
- * 校验工具调用的必需参数是否存在且非空。
- *
- * 未知工具或参数完整时返回 null；
- * 参数缺失时返回 deny 结果，message 中列出缺失的参数名。
- */
-export function validateToolInput(
-  toolName: string,
-  input: Record<string, unknown>,
-): ToolValidationFailure | null {
+/** Pi原生字符串字段和兼容权限输入共享验证，不把空替换文本误判为缺参。 */
+function invalid(tool: string, field: string, requirement: string): ToolValidationFailure {
+  return { behavior: 'deny', message: `Tool "${tool}" 参数 "${field}" ${requirement}。请按工具 schema 补齐后重试。` }
+}
+
+function stringField(tool: string, field: string, value: unknown, allowEmpty = false): ToolValidationFailure | null {
+  if (typeof value !== 'string') return invalid(tool, field, '必须存在且为字符串')
+  if (!allowEmpty && value.length === 0) return invalid(tool, field, '不能为空')
+  return null
+}
+
+export function validateToolInput(toolName: string, input: Record<string, unknown>): ToolValidationFailure | null {
+  const name = toolName.toLowerCase()
+  if (name === 'edit' || name === 'multiedit') {
+    // 原生路径与规范化后的权限输入都保留edits；legacy输入仅用于兼容已有调用。
+    const native = name === 'multiedit' || 'edits' in input || toolName === 'edit'
+    const pathError = stringField(toolName, native ? 'path' : 'file_path', input.path ?? input.file_path)
+    if (pathError) return pathError
+    if (native) {
+      if (!Array.isArray(input.edits) || input.edits.length === 0) return invalid(toolName, 'edits', '必须是至少包含一项的数组')
+      for (const [index, item] of input.edits.entries()) {
+        if (!item || typeof item !== 'object' || Array.isArray(item)) return invalid(toolName, `edits[${index}]`, '必须为替换对象')
+        const edit = item as Record<string, unknown>
+        const error = stringField(toolName, `edits[${index}].oldText`, edit.oldText)
+          ?? stringField(toolName, `edits[${index}].newText`, edit.newText, true)
+        if (error) return error
+      }
+      return null
+    }
+    return stringField(toolName, 'old_string', input.old_string)
+      ?? stringField(toolName, 'new_string', input.new_string, true)
+  }
+  if (name === 'write') {
+    return stringField(toolName, 'path' in input ? 'path' : 'file_path', input.path ?? input.file_path)
+      ?? stringField(toolName, 'content', input.content, true)
+  }
+  if (toolName === 'read') return stringField(toolName, 'path', input.path)
+  if (toolName === 'bash' || toolName === 'powershell') return stringField(toolName, 'command', input.command)
+  if (toolName === 'find' || toolName === 'grep') return stringField(toolName, 'pattern', input.pattern)
   const requiredParams = TOOL_REQUIRED_PARAMS.get(toolName)
   if (!requiredParams) return null
-
-  const missing: string[] = []
   for (const param of requiredParams) {
-    const value = input[param]
-    if (value === undefined || value === null || value === '') {
-      missing.push(param)
-    }
+    const error = stringField(toolName, param, input[param])
+    if (error) return error
   }
-
-  if (missing.length === 0) return null
-
-  const paramList = missing.map((p) => `"${p}"`).join(', ')
-  const message = missing.length === 1
-    ? `Tool "${toolName}" is missing required parameter ${paramList}. Please retry with all required parameters filled in.`
-    : `Tool "${toolName}" is missing required parameters: ${paramList}. Please retry with all required parameters filled in.`
-
-  return { behavior: 'deny' as const, message }
+  return null
 }

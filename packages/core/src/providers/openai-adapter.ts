@@ -141,8 +141,11 @@ function toOpenAIMessages(input: StreamRequestInput): OpenAIMessage[] {
 
 /**
  * 将工具定义转换为 OpenAI 格式
+ *
+ * 导出给同为 OpenAI 兼容协议的其他适配器（如 PromaAdapter）复用，
+ * 避免工具转换逻辑分叉。
  */
-function toOpenAITools(tools: ToolDefinition[]): Array<Record<string, unknown>> {
+export function toOpenAITools(tools: ToolDefinition[]): Array<Record<string, unknown>> {
   return tools.map((tool) => ({
     type: 'function',
     function: {

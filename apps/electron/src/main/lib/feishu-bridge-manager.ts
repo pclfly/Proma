@@ -5,7 +5,7 @@
  * 替代原来的单例 `feishuBridge`。
  */
 
-import { existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import type {
   FeishuBridgeState,
   FeishuChatBinding,
@@ -20,7 +20,6 @@ import { redactSensitiveLogValue } from './bridge-log-redaction'
 import { getFeishuMultiBotConfig, getFeishuBotById } from './feishu-config'
 import { getFeishuBotBindingsPath, getFeishuBotMetadataPath } from './config-paths'
 import { writeJsonFileAtomic } from './safe-file'
-import { isBindingForDeletedWorkspace } from './bridge-binding-store'
 import { getSettings } from './settings-service'
 import { resolveSessionMirrorBot, normalizeSessionMirrorUserOpenId } from './feishu/session-mirror'
 
@@ -188,45 +187,13 @@ class FeishuBridgeManager {
   // ===== 聚合查询 =====
 
   /**
-   * 删除已移除工作区及其会话的聊天绑定，包含当前未启动 Bot 的持久化绑定文件。
+   * 关闭已删除项目的活动路由；离线记录保留为启动时的拒绝路由墓碑，不清空后静默重绑。
    */
   removeBindingsForDeletedWorkspace(workspaceId: string, sessionIds: readonly string[]): number {
     const removedSessionIds = new Set(sessionIds)
-    const shouldRemove = (binding: Pick<FeishuChatBinding, 'workspaceId' | 'sessionId'>) =>
-      isBindingForDeletedWorkspace(binding, workspaceId, removedSessionIds)
     let removed = 0
-
     for (const bridge of this.bridges.values()) {
-      for (const binding of bridge.listBindings()) {
-        if (shouldRemove(binding) && bridge.removeBinding(binding.chatId)) removed += 1
-      }
-    }
-
-    const activeBotIds = new Set(this.bridges.keys())
-    for (const bot of getFeishuMultiBotConfig().bots) {
-      if (activeBotIds.has(bot.id)) continue
-
-      const bindingsPath = getFeishuBotBindingsPath(bot.id)
-      if (!existsSync(bindingsPath)) continue
-      try {
-        const bindings = JSON.parse(readFileSync(bindingsPath, 'utf-8')) as unknown
-        if (!Array.isArray(bindings)) continue
-        const retained = bindings.filter((binding) => {
-          if (!binding || typeof binding !== 'object') return true
-          const candidate = binding as Partial<FeishuChatBinding>
-          return !(
-            typeof candidate.workspaceId === 'string'
-            && typeof candidate.sessionId === 'string'
-            && shouldRemove(candidate as Pick<FeishuChatBinding, 'workspaceId' | 'sessionId'>)
-          )
-        })
-        if (retained.length !== bindings.length) {
-          writeFileSync(bindingsPath, JSON.stringify(retained, null, 2), 'utf-8')
-          removed += bindings.length - retained.length
-        }
-      } catch (error) {
-        console.error(`[飞书 BridgeManager] 清理 Bot ${bot.id} 的失效聊天绑定失败:`, redactSensitiveLogValue(error))
-      }
+      removed += bridge.quarantineBindingsForDeletedWorkspace(workspaceId, removedSessionIds)
     }
 
     return removed
@@ -243,8 +210,7 @@ class FeishuBridgeManager {
     for (const bridge of this.bridges.values()) {
       for (const binding of bridge.listBindings()) {
         if (binding.sessionId === sessionId && binding.workspaceId !== workspaceId) {
-          bridge.updateBinding({ chatId: binding.chatId, workspaceId })
-          updated++
+          if (bridge.updateBinding({ chatId: binding.chatId, workspaceId })) updated++
         }
       }
     }

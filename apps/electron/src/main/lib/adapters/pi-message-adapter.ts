@@ -11,7 +11,9 @@ import type { AssistantMessage, ToolResultMessage, UserMessage } from '@earendil
 import type { SDKAssistantMessage, SDKMessage } from '@proma/shared'
 import type { RuntimeGuardResultOverride } from '../agent-runtime-guards'
 import { isMalformedResponseError, isTransientNetworkError } from '../error-patterns'
+import { isRetryableNetworkFailure } from '../network/retry-classifier'
 import { sanitizeToolResultImageContent } from '../image-content-validation'
+import { getPiAssistantTextPhase } from './pi-text-phase'
 
 function getPiEditItems(input: Record<string, unknown>): Array<Record<string, unknown>> {
   return Array.isArray(input.edits)
@@ -111,21 +113,39 @@ function normalizeToolUseInput(piName: string, input: Record<string, unknown>): 
   }
 }
 
+function approvedValue(original: unknown, candidates: unknown[], field: string): unknown {
+  const changed = candidates.filter((value) => value !== undefined && value !== original)
+  if (changed.some((value) => value !== changed[0])) throw new Error(`权限输入 ${field} 的原生字段与兼容别名冲突；请重新发起工具调用。`)
+  return changed.length ? changed[0] : original
+}
+
 export function restorePiInput(
   piName: string,
   original: Record<string, unknown>,
   updated?: Record<string, unknown>,
 ): Record<string, unknown> {
   if (!updated) return original
-  switch (piName) {
-    case 'read':
-    case 'write':
-      return { ...original, ...updated, path: updated.file_path ?? updated.path ?? original.path }
-    case 'edit':
-      return { ...original, ...updated, path: updated.file_path ?? updated.path ?? original.path }
-    default:
-      return { ...original, ...updated }
+  const restored = { ...original, ...updated }
+  if (['read', 'write', 'edit', 'ls', 'find', 'grep'].includes(piName)) {
+    restored.path = approvedValue(original.path, [updated.path, updated.file_path], 'path')
   }
+  if (piName !== 'edit') return restored
+  if ('edits' in updated && !Array.isArray(updated.edits)) return restored
+  const before = getPiEditItems(original)
+  const after = Array.isArray(updated.edits) ? updated.edits : before
+  if (before.length > 1 && ((updated.old_string !== undefined && updated.old_string !== before[0]?.oldText) || (updated.new_string !== undefined && updated.new_string !== before[0]?.newText))) {
+    throw new Error('MultiEdit权限修改必须逐项使用edits，不能用顶层old_string/new_string表达多项变更。')
+  }
+  restored.edits = after.map((item: unknown, index: number) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item
+    const edit = item as Record<string, unknown>
+    const baseline = before[index]
+    return {
+      oldText: approvedValue(baseline?.oldText, [edit.oldText, edit.old_string, ...(before.length === 1 && index === 0 ? [updated.old_string] : [])], `edits[${index}].oldText`),
+      newText: approvedValue(baseline?.newText, [edit.newText, edit.new_string, ...(before.length === 1 && index === 0 ? [updated.new_string] : [])], `edits[${index}].newText`),
+    }
+  })
+  return restored
 }
 
 function normalizeToolResultContent(content: unknown): unknown {
@@ -240,7 +260,7 @@ export function convertPiMessage(
     const isTerminalError = assistant.stopReason === 'error'
     const errorType = assistant.errorMessage && isMalformedResponseError(assistant.errorMessage)
       ? 'service_error'
-      : assistant.errorMessage && isTransientNetworkError(assistant.errorMessage)
+      : assistant.errorMessage && (isTransientNetworkError(assistant.errorMessage) || isRetryableNetworkFailure(assistant.errorMessage))
         ? 'network_error'
         : 'provider_error'
     if (assistant.errorMessage && !isTerminalError) {
@@ -252,7 +272,11 @@ export function convertPiMessage(
       type: 'assistant',
       message: {
         content: assistant.content.map((block) => {
-          if (block.type === 'text') return { type: 'text', text: block.text }
+          if (block.type === 'text') {
+            // final_answer 必须外置到过程组之外；commentary 仍属于过程。
+            const phase = getPiAssistantTextPhase(assistant.api, block.textSignature)
+            return { type: 'text', text: block.text, ...(phase ? { phase } : {}) }
+          }
           if (block.type === 'thinking') return { type: 'thinking', thinking: block.thinking }
           if (block.type === 'toolCall') {
             return {
@@ -330,6 +354,9 @@ export function convertResultMessage(
   const terminalReason = override?.terminalReason ?? (lastAssistant?.stopReason === 'length' ? 'max_tokens' : 'completed')
   return {
     type: 'result',
+    // result 也带 uuid：实时流与落盘快照是同一对象，renderer 按 uuid 去重才能
+    // 避免同一轮计时/用量被折叠两遍。
+    uuid: randomUUID(),
     subtype: override?.subtype ?? (assistantError ? 'error_during_execution' : terminalReason === 'max_tokens' ? 'max_tokens' : 'success'),
     usage,
     total_cost_usd: costValues.length > 0 ? costValues.reduce((sum, cost) => sum + cost, 0) : undefined,

@@ -16,13 +16,24 @@
 import * as React from 'react'
 import { unstable_batchedUpdates } from 'react-dom'
 import { useAtom, useAtomValue, useSetAtom, useStore } from 'jotai'
+import { reasoningProfilesRevisionAtom } from '@/atoms/reasoning-profiles'
 import { toast } from 'sonner'
-import { CornerDownLeft, Square, Settings, X, Copy, Check, Brain, Sparkles, ListTodo, Paperclip } from 'lucide-react'
+import {
+  CornerDownLeft,
+  Square,
+  Settings,
+  X,
+  Sparkles,
+  ListTodo,
+  Paperclip,
+} from 'lucide-react'
 import { AgentMessages, type AgentHistoryQuoteNavigationRequest } from './AgentMessages'
 import { AgentHeader } from './AgentHeader'
 import { AgentMessageQueue } from './AgentMessageQueue'
 import { SkillMentionNamesProvider } from './SkillMentionNamesProvider'
 import { ContextUsageBadge } from './ContextUsageBadge'
+import { InputQuotaIsland } from '@/components/session-shared/InputQuotaIsland'
+import { SessionStatsBar } from './SessionStatsBar'
 import { PermissionBanner } from './PermissionBanner'
 import { PermissionModeSelector } from './PermissionModeSelector'
 import { PersonalDirectiveToggle } from './PersonalDirectiveToggle'
@@ -30,27 +41,34 @@ import { ArmorRefusalBadge } from './ArmorRefusalBadge'
 import { AskUserBanner } from './AskUserBanner'
 import { ExitPlanModeBanner } from './ExitPlanModeBanner'
 import { PlanModeDashedBorder } from './PlanModeDashedBorder'
-import { ModelSelector } from '@/components/chat/ModelSelector'
-import { AttachmentPreviewItem } from '@/components/chat/AttachmentPreviewItem'
+import { ModelSelector } from '@/components/session-shared/ModelSelector'
+import { AttachmentPreviewItem } from '@/components/session-shared/AttachmentPreviewItem'
 import { QuotedSelectionChip } from '@/components/diff/QuotedSelectionChip'
 import { RichTextInput, type RichTextInputHandle } from '@/components/ai-elements/rich-text-input'
 import { SpeechButton } from '@/components/ai-elements/speech-button'
 import { InputToolbarOverflow, type ToolbarItem } from '@/components/ai-elements/InputToolbarOverflow'
 import {
-  inputToolbarActiveButtonClass,
   inputToolbarButtonClass,
   inputToolbarDangerButtonClass,
   inputToolbarDisabledButtonClass,
   inputToolbarSendButtonClass,
 } from '@/components/ai-elements/input-toolbar-styles'
-import { preventHoverPopoverFocusRestore } from '@/components/ai-elements/input-toolbar-popover-focus'
 import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { Switch } from '@/components/ui/switch'
-import { Slider } from '@/components/ui/slider'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -65,11 +83,7 @@ import { cn } from '@/lib/utils'
 import { getActiveAccelerator, getAcceleratorDisplay } from '@/lib/shortcut-registry'
 import { registerShortcut } from '@/lib/shortcut-registry'
 import { supportsChannelPlanQuota } from '@/lib/channel-plan-quota'
-import {
-  clearStopGenerationTarget,
-  getStopGenerationTarget,
-  rememberStopGenerationTarget,
-} from '@/lib/stop-generation-target'
+import { clearStopGenerationTarget, getStopGenerationTarget, rememberStopGenerationTarget } from '@/lib/stop-generation-target'
 import { previewFileMapAtom, previewPanelOpenMapAtom, quotedSelectionMapAtom, currentQuotedSelectionAtom } from '@/atoms/preview-atoms'
 import type { QuotedSelection } from '@/atoms/preview-atoms'
 import {
@@ -121,15 +135,35 @@ import {
 } from '@/atoms/agent-atoms'
 import { settingsOpenAtom } from '@/atoms/settings-tab'
 import { longTextPasteAsAttachmentEnabledAtom } from '@/atoms/ui-preferences'
-import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
+import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/channel-atoms'
 import { todoPlanningGroupsAtom } from '@/atoms/planning-atoms'
 import { useOpenSession } from '@/hooks/useOpenSession'
 import { draftSessionIdsAtom } from '@/atoms/draft-session-atoms'
 import { sendWithCmdEnterAtom } from '@/atoms/shortcut-atoms'
 import { useOpenPreview } from '@/components/diff/preview-opener'
-import type { AgentDeferredQueueMessageInput, AgentSendInput, AgentPendingFile, AgentThinkingLevel, FileDialogLargeFile, FileDialogResult, ModelOption, ReasoningCapability, SDKMessage, SDKUserMessage } from '@proma/shared'
-import { inferContextWindow, inferReasoningTransport, isCodexFastModeSupportedModel, MAX_ATTACHMENT_SIZE, normalizeReasoningCapabilityLevel, normalizeReasoningLevel, resolveReasoningCapability, resolveReasoningProfile } from '@proma/shared'
+import type {
+  AgentDeferredQueueMessageInput,
+  AgentSendInput,
+  AgentPendingFile,
+  AgentThinkingLevel,
+  FileDialogLargeFile,
+  FileDialogResult,
+  ModelOption,
+  ReasoningCapability,
+  SDKMessage,
+  SDKUserMessage,
+} from '@proma/shared'
+import {
+  inferReasoningTransport,
+  isCodexFastModeSupportedModel,
+  MAX_ATTACHMENT_SIZE,
+  normalizeReasoningCapabilityLevel,
+  normalizeReasoningLevel,
+  resolveReasoningCapability,
+  resolveReasoningProfile,
+} from '@proma/shared'
 import { fileToBase64, formatFileNames, getFileParentPath } from '@/lib/file-utils'
+import { resolveKnownRunContextWindow, resolveRunContextWindow } from '@/lib/agent-context-window'
 import { getFilePanelDragData, INSERT_FILE_MENTION_EVENT, type FilePanelDragItem } from '@/lib/file-panel-drag'
 import {
   canReferenceDraggedSession,
@@ -248,17 +282,6 @@ function createUserSDKMessage(text: string, uuid?: string, createdAt = Date.now(
   return message
 }
 
-function resolveRunContextWindow(
-  modelId: string | undefined,
-  previous: number | undefined,
-  channel?: import('@proma/shared').Channel,
-): number | undefined {
-  // 用户为当前模型手动配置了上下文窗口时，优先采用；
-  // 否则回退到按模型名推断，最后才是历史值。
-  const channelContextWindow = channel?.models.find((m) => m.id === modelId)?.contextWindow
-  return channelContextWindow ?? inferContextWindow(modelId) ?? previous
-}
-
 interface SDKMessageRecord {
   type?: string
   uuid?: string
@@ -304,150 +327,10 @@ function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-// ===== 思考模式 Hover Popover =====
+// ===== 思考档位 =====
 
 const OPENAI_THINKING_LEVELS = ['off', 'low', 'medium', 'high', 'xhigh', 'max'] as const satisfies readonly AgentThinkingLevel[]
 const OPENAI_STANDARD_THINKING_LEVELS = OPENAI_THINKING_LEVELS.slice(0, -1)
-type OpenAIThinkingLevel = AgentThinkingLevel
-const OPENAI_THINKING_LABELS: Record<OpenAIThinkingLevel, string> = {
-  off: '关闭',
-  minimal: '最小',
-  low: '低',
-  medium: '中',
-  high: '高',
-  xhigh: '极高',
-  max: '最大',
-}
-
-function normalizeOpenAIThinkingLevel(
-  level: AgentThinkingLevel | undefined,
-  levels: readonly OpenAIThinkingLevel[],
-): OpenAIThinkingLevel {
-  if (level === 'minimal') return 'low'
-  // max 会话设置在切到非 GPT-5.6 时由主进程降级为 xhigh；UI 同步展示有效档位。
-  if (level === 'max' && !levels.includes('max')) return 'xhigh'
-  return levels.includes(level as OpenAIThinkingLevel) ? level as OpenAIThinkingLevel : 'off'
-}
-
-interface CodexThinkingConfig {
-  thinkingLevel: AgentThinkingLevel
-  levels: readonly OpenAIThinkingLevel[]
-  onThinkingLevelChange: (level: AgentThinkingLevel) => void
-}
-
-interface AgentThinkingPopoverProps {
-  agentThinking: import('@proma/shared').ThinkingConfig | undefined
-  onToggle: () => void
-  codexConfig?: CodexThinkingConfig
-}
-
-function AgentThinkingPopover({ agentThinking, onToggle, codexConfig }: AgentThinkingPopoverProps): React.ReactElement {
-  const [open, setOpen] = React.useState(false)
-  const hoverTimeout = React.useRef<ReturnType<typeof setTimeout> | null>(null)
-  const popoverReceivedFocusRef = React.useRef(false)
-  const isCodex = Boolean(codexConfig)
-  const thinkingLevels = codexConfig?.levels ?? OPENAI_STANDARD_THINKING_LEVELS
-  const normalizedLevel = normalizeOpenAIThinkingLevel(
-    codexConfig?.thinkingLevel,
-    thinkingLevels,
-  )
-  const supportsThinkingToggle = thinkingLevels.includes('off')
-  const isEnabled = isCodex ? !supportsThinkingToggle || normalizedLevel !== 'off' : agentThinking?.type === 'adaptive'
-  const sliderPosition = thinkingLevels.indexOf(normalizedLevel)
-
-  const handleMouseEnter = React.useCallback(() => {
-    if (hoverTimeout.current) clearTimeout(hoverTimeout.current)
-    setOpen(true)
-  }, [])
-
-  const handleMouseLeave = React.useCallback(() => {
-    hoverTimeout.current = setTimeout(() => setOpen(false), 150)
-  }, [])
-
-  React.useEffect(() => {
-    return () => {
-      if (hoverTimeout.current) clearTimeout(hoverTimeout.current)
-    }
-  }, [])
-
-  const handleButtonClick = (): void => {
-    if (codexConfig) {
-      if (!supportsThinkingToggle) return
-      codexConfig.onThinkingLevelChange(isEnabled ? 'off' : 'high')
-      return
-    }
-    onToggle()
-  }
-
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className={cn(inputToolbarButtonClass, isEnabled && inputToolbarActiveButtonClass)}
-          onClick={handleButtonClick}
-          onMouseEnter={handleMouseEnter}
-          onMouseLeave={handleMouseLeave}
-        >
-          <Brain className="size-5" />
-        </Button>
-      </PopoverTrigger>
-      <PopoverContent
-        side="top"
-        align="center"
-        sideOffset={8}
-        className="w-64 p-3"
-        onMouseEnter={handleMouseEnter}
-        onMouseLeave={handleMouseLeave}
-        onFocusCapture={() => {
-          popoverReceivedFocusRef.current = true
-        }}
-        onOpenAutoFocus={(e) => e.preventDefault()}
-        onCloseAutoFocus={(event) => {
-          preventHoverPopoverFocusRestore(event, popoverReceivedFocusRef.current)
-          popoverReceivedFocusRef.current = false
-        }}
-      >
-        <div className="flex flex-col gap-3">
-          {codexConfig ? (
-            <>
-              <div className="space-y-2.5">
-                <div className="flex items-center justify-between gap-4">
-                  <span className="text-xs font-medium text-foreground/80">思考深度</span>
-                  <span className="text-xs tabular-nums text-muted-foreground">
-                    {OPENAI_THINKING_LABELS[normalizedLevel]}
-                  </span>
-                </div>
-                <Slider
-                  value={[sliderPosition]}
-                  onValueChange={([position]) => codexConfig.onThinkingLevelChange(thinkingLevels[position!]!)}
-                  min={0}
-                  max={thinkingLevels.length - 1}
-                  step={1}
-                  aria-label="思考深度"
-                />
-                <div className="flex justify-between text-[10px] text-muted-foreground">
-                  {thinkingLevels.map((level) => <span key={level}>{OPENAI_THINKING_LABELS[level]}</span>)}
-                </div>
-              </div>
-            </>
-          ) : (
-            <div className="flex items-center justify-between gap-4">
-              <span className="text-xs text-foreground/70">思考模式</span>
-              <Switch
-                checked={isEnabled}
-                onCheckedChange={onToggle}
-                className="h-4 w-7 [&>span]:size-3 [&>span]:data-[state=checked]:translate-x-3"
-              />
-            </div>
-          )}
-        </div>
-      </PopoverContent>
-    </Popover>
-  )
-}
 
 interface AgentViewProps {
   sessionId: string
@@ -487,7 +370,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
   const [isStopping, setIsStopping] = React.useState(false)
   const sendWithCmdEnter = useAtomValue(sendWithCmdEnterAtom)
   const longTextPasteAsAttachmentEnabled = useAtomValue(longTextPasteAsAttachmentEnabledAtom)
-  const stoppedByUser = stoppedByUserSessions.has(sessionId)
+  const liveStoppedByUser = stoppedByUserSessions.has(sessionId)
   const setLiveMessagesMap = useSetAtom(liveMessagesMapAtom)
   // Per-session 渠道/模型配置（优先读 session map，回退到全局默认值）
   const sessionChannelMap = useAtomValue(agentSessionChannelMapAtom)
@@ -513,6 +396,8 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     () => sessions.find((s) => s.id === sessionId),
     [sessions, sessionId],
   )
+  // 会话 meta 会持久化 stoppedByUser；重新打开历史时也能把最后一轮标注为「已停止」。
+  const stoppedByUser = liveStoppedByUser || sessionMeta?.stoppedByUser === true
   const sessionMetaChannelId = sessionMeta?.channelId
   const sessionMetaModelId = sessionMeta?.modelId
   const hasSessionMeta = Boolean(sessionMeta)
@@ -795,13 +680,15 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     && agentChannelProvider === 'openai-codex'
     && isCodexFastModeSupportedModel(agentModelId ?? undefined)
   const codexFastModeEnabled = isCodexFastModeAvailable && sessionMeta?.codexFastMode === true
-  const reasoningProfile = hasSessionMeta
+  // Copilot 实际协议由主进程 catalog 决定，不能按渠道名猜成 Anthropic。
+  const reasoningProfile = hasSessionMeta && agentChannelProvider !== 'github-copilot'
     ? resolveReasoningProfile({
       modelId: agentModelId ?? undefined,
       transport: inferReasoningTransport(agentChannelProvider),
     })
     : undefined
-  const reasoningCapabilityKey = `${agentChannelId ?? ''}:${agentModelId ?? ''}`
+  const reasoningProfilesRevision = useAtomValue(reasoningProfilesRevisionAtom)
+  const reasoningCapabilityKey = `${agentChannelId ?? ''}:${agentModelId ?? ''}:${reasoningProfilesRevision}`
   const [piReasoningCapability, setPiReasoningCapability] = React.useState<{
     key: string
     capability: ReasoningCapability | undefined
@@ -1929,14 +1816,25 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         : session
     )))
 
-    // 空闲切换时清除旧的 contextWindow，让下一轮 result 重新提供真实值。
-    // 运行中不能清除：当前轮仍在使用旧模型，旧模型的用量显示应保持稳定。
+    // 空闲切换时把状态栏的上下文窗口切到新模型：能确定就用新值，确定不了就保留上一次
+    // 的真实值（下一轮 result/context_window 事件会带回权威值）。
+    // 之前这里直接清成 undefined，会让下一轮流式 fallback 写回按模型名猜的 200K，
+    // 表现为“换个模型上下文窗口就变成 200K”。
+    // 运行中不能改：当前轮仍在使用旧模型，旧模型的用量显示应保持稳定。
     if (!modelSwitchDeferred) {
+      const targetChannel = globalChannels.find((channel) => channel.id === option.channelId)
+      const knownWindow = resolveKnownRunContextWindow(option.modelId, targetChannel)
       setStreamingStates((prev) => {
         const state = prev.get(sessionId)
         if (!state) return prev
+        if (state.model === option.modelId && (knownWindow === undefined || state.contextWindow === knownWindow)) return prev
         const map = new Map(prev)
-        map.set(sessionId, { ...state, contextWindow: undefined })
+        map.set(sessionId, {
+          ...state,
+          // 状态栏按 streamState.model 解析渠道配置窗口，切换后必须同步模型名
+          model: option.modelId,
+          ...(knownWindow !== undefined ? { contextWindow: knownWindow } : {}),
+        })
         return map
       })
     }
@@ -1962,7 +1860,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     if (modelSwitchDeferred) {
       toast.info('模型已切换，本轮结束后生效')
     }
-  }, [sessionId, streaming, backgroundWaiting, setSessionChannelMap, setSessionModelMap, setDefaultChannelId, setDefaultModelId, setAgentSessions])
+  }, [sessionId, streaming, backgroundWaiting, setSessionChannelMap, setSessionModelMap, setDefaultChannelId, setDefaultModelId, setAgentSessions, globalChannels])
 
   const handleCodexFastModeChange = React.useCallback(async (): Promise<void> => {
     if (!isCodexFastModeAvailable || streaming || backgroundWaiting || !sessionMeta) return
@@ -1970,7 +1868,15 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     const previousSessionMeta = sessionMeta
     const nextEnabled = !codexFastModeEnabled
     setAgentSessions((prev) => prev.map((item) => (
-      item.id === sessionId ? { ...item, codexFastMode: nextEnabled, updatedAt: Date.now() } : item
+      item.id === sessionId
+        ? {
+            ...item,
+            codexFastMode: nextEnabled,
+            // 速度档是元数据，不改变会话的最近活动时间。
+            lastActivityAt: item.lastActivityAt ?? item.updatedAt,
+            updatedAt: Date.now(),
+          }
+        : item
     )))
 
     try {
@@ -1989,7 +1895,15 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
     const reasoningLevelSwitchDeferred = streaming || backgroundWaiting
     const previousSessionMeta = sessionMeta
     setAgentSessions((prev) => prev.map((item) => (
-      item.id === sessionId ? { ...item, reasoningLevel: thinkingLevel, updatedAt: Date.now() } : item
+      item.id === sessionId
+        ? {
+            ...item,
+            reasoningLevel: thinkingLevel,
+            // 思考档位是元数据，不改变会话的最近活动时间。
+            lastActivityAt: item.lastActivityAt ?? item.updatedAt,
+            updatedAt: Date.now(),
+          }
+        : item
     )))
 
     try {
@@ -2682,6 +2596,15 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
           setQueuedMessages((prev) => removeQueuedMessage(prev, messageId))
           return
         }
+        if (result.disposition === 'queued') {
+          // 仍未被运行接受，不追加用户气泡、不删除附件；同步“提升到队首”的展示。
+          setQueuedMessages((prev) => {
+            const pending = prev.find(item => item.id === messageId)
+            return pending ? [pending, ...prev.filter(item => item.id !== messageId)] : prev
+          })
+          toast.info('消息已移到队首，等待上一轮收尾或运行条件恢复')
+          return
+        }
         if (result.disposition === 'not_found') {
           toast.info('消息已开始发送，无法再立即发送')
           return
@@ -2834,27 +2757,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
       ),
     }] : []),
     { key: 'permission-mode', node: <PermissionModeSelector sessionId={sessionId} /> },
-    { key: 'personal-directive', node: <PersonalDirectiveToggle /> },
-    {
-      key: 'thinking',
-      node: (
-        <AgentThinkingPopover
-          agentThinking={agentThinking}
-          onToggle={() => {
-            const next = agentThinking?.type === 'adaptive'
-              ? { type: 'disabled' as const }
-              : { type: 'adaptive' as const }
-            setAgentThinking(next)
-            window.electronAPI.updateSettings({ agentThinking: next })
-          }}
-          codexConfig={isSessionThinkingAvailable ? {
-            thinkingLevel: openAIThinkingLevel,
-            levels: openAIThinkingLevels,
-            onThinkingLevelChange: (level) => { void updateReasoningLevel(level) },
-          } : undefined}
-        />
-      ),
-    },
+    { key: 'personal-directive', node: <PersonalDirectiveToggle sessionId={sessionId} /> },
     { key: 'speech', node: <SpeechButton className={inputToolbarButtonClass} voiceInputId={agentVoiceInputId} /> },
     {
       key: 'attach-content',
@@ -2876,6 +2779,7 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         </Tooltip>
       ),
     },
+    { key: 'input-quota', node: <InputQuotaIsland channelId={planQuotaChannelId} /> },
     {
       key: 'context-usage',
       node: (
@@ -2959,6 +2863,11 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
         <ModelSelector
           externalSelectedModel={externalSelectedModel}
           onModelSelect={handleModelSelect}
+          reasoning={isSessionThinkingAvailable ? {
+            level: openAIThinkingLevel,
+            levels: openAIThinkingLevels,
+            onChange: (level) => { void updateReasoningLevel(level) },
+          } : undefined}
           showChannelInTrigger
           // 全局打开状态只供主会话的“选择模型”引导使用；右侧嵌入会话必须保持独立，
           // 否则任一触发器打开时会同时挂载两侧的 Popover，遮挡并阻断模型切换。
@@ -3168,6 +3077,9 @@ export function AgentView({ sessionId, embedded = false }: AgentViewProps): Reac
             {/* Footer 工具栏 — 容器变窄时尾部按钮自动折叠进「更多」Popover */}
             <InputToolbarOverflow items={inputToolbarItems} trailing={inputTrailingNode} />
           </div>
+
+          {/* 会话用量状态栏 — 速度 / token / 缓存命中 / 上下文占用，常驻输入框下方 */}
+          <SessionStatsBar sessionId={sessionId} embedded={embedded} />
         </div>
         )}
         </div>

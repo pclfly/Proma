@@ -125,6 +125,12 @@ export function showWorkspaceMemoryWindow(workspaceSlug: string, relativePath?: 
 }
 
 
+/** 授权动作只接受该 workspace 已登记的记忆窗口顶层，不按焦点窗口猜测身份。 */
+export function isWorkspaceMemoryWindowRenderer(workspaceSlug: string, webContentsId: number): boolean {
+  const win = windowsByWorkspace.get(workspaceSlug)
+  return !!win && !win.isDestroyed() && win.webContents.id === webContentsId
+}
+
 /** Completes a renderer-confirmed close, scoped to the owning workspace window. */
 export function confirmWorkspaceMemoryWindowClose(workspaceSlug: string, webContentsId: number): boolean {
   const win = windowsByWorkspace.get(workspaceSlug)

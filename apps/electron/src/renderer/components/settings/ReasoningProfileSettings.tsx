@@ -13,6 +13,8 @@
  */
 
 import * as React from 'react'
+import { useSetAtom } from 'jotai'
+import { applyReasoningProfilesAtom } from '@/atoms/reasoning-profiles'
 import { Plus, Trash2, RotateCcw, ChevronDown, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -73,6 +75,8 @@ export function ReasoningProfileSettings(): React.ReactElement {
   const [loading, setLoading] = React.useState(true)
   const [saving, setSaving] = React.useState(false)
   const [expandedId, setExpandedId] = React.useState<string | null>(null)
+  const [saveError, setSaveError] = React.useState<string | null>(null)
+  const applyProfiles = useSetAtom(applyReasoningProfilesAtom)
 
   const loadProfiles = React.useCallback(async (): Promise<void> => {
     try {
@@ -90,8 +94,9 @@ export function ReasoningProfileSettings(): React.ReactElement {
   }, [loadProfiles])
 
   /** 更新某个 profile（按 id 匹配，保留未编辑的字段） */
-  const updateProfile = React.useCallback((updated: ReasoningProfileConfigData): void => {
-    setProfiles((prev) => prev.map((p) => (p.id === updated.id ? updated : p)))
+  const updateProfile = React.useCallback((previousId: string, updated: ReasoningProfileConfigData): void => {
+    setProfiles((prev) => prev.map((p) => (p.id === previousId ? updated : p)))
+    setExpandedId((current) => current === previousId ? updated.id : current)
   }, [])
 
   /** 新增一个 profile */
@@ -114,14 +119,17 @@ export function ReasoningProfileSettings(): React.ReactElement {
     if (!window.confirm('确定恢复为内置默认推理能力配置？自定义修改将被清除。')) return
     try {
       setSaving(true)
-      const merged = await window.electronAPI.updateReasoningProfiles([])
+      setSaveError(null)
+      const merged = await window.electronAPI.updateReasoningProfiles(null)
+      applyProfiles(merged)
       setProfiles(merged)
     } catch (error) {
       console.error('[推理配置] 恢复默认失败:', error)
+      setSaveError(error instanceof Error ? error.message : String(error))
     } finally {
       setSaving(false)
     }
-  }, [])
+  }, [applyProfiles])
 
   /** 保存全部 profile */
   const handleSave = React.useCallback(async (): Promise<void> => {
@@ -134,14 +142,17 @@ export function ReasoningProfileSettings(): React.ReactElement {
     }
     setSaving(true)
     try {
+      setSaveError(null)
       const merged = await window.electronAPI.updateReasoningProfiles(profiles)
+      applyProfiles(merged)
       setProfiles(merged)
     } catch (error) {
       console.error('[推理配置] 保存失败:', error)
+      setSaveError(error instanceof Error ? error.message : String(error))
     } finally {
       setSaving(false)
     }
-  }, [profiles])
+  }, [profiles, applyProfiles])
 
   return (
     <SettingsSection
@@ -176,13 +187,15 @@ export function ReasoningProfileSettings(): React.ReactElement {
               onToggleExpand={() =>
                 setExpandedId((cur) => (cur === profile.id ? null : profile.id))
               }
-              onChange={updateProfile}
+              onChange={(updated) => updateProfile(profile.id, updated)}
               onRemove={() => removeProfile(profile.id)}
             />
           ))
         )}
       </SettingsCard>
 
+      {saveError && <p role="alert" className="text-sm text-destructive">{saveError}</p>}
+      <p className="text-xs text-muted-foreground">删除后需保存。删除 profile 只移除 Proma 适配规则，模型仍可能使用 Pi 内置能力；保存后从下一轮请求生效。</p>
       <div className="flex justify-end pt-2">
         <Button size="sm" onClick={handleSave} disabled={saving}>
           {saving ? '保存中...' : '保存配置'}
@@ -221,7 +234,7 @@ function ReasoningProfileRow({
   const setEncoding = (transport: ReasoningTransport, patch: Partial<{ kind: ReasoningEncodingKind; effortMap: Record<string, string | null> }>): void => {
     const current = profile.encodings[transport]
     const nextCurrent = current
-      ? { ...current, ...patch, effortMap: { ...current.effortMap, ...patch.effortMap } }
+      ? { ...current, ...patch, effortMap: patch.effortMap ?? current.effortMap }
       : { kind: patch.kind ?? 'adaptive-effort', effortMap: { ...(patch.effortMap ?? {}) } }
     set({
       encodings: {
@@ -239,7 +252,7 @@ function ReasoningProfileRow({
     if (value === '') {
       delete effortMap[level]
     } else {
-      effortMap[level] = value
+      effortMap[level] = value === 'null' ? null : value
     }
     setEncoding(transport, { effortMap })
   }
@@ -288,7 +301,7 @@ function ReasoningProfileRow({
 
           <SettingsToggle
             label="支持思考 (reasoning)"
-            description="模型是否支持思考。关闭后该 profile 不参与思考档位映射。"
+            description="关闭后，匹配模型按不支持思考注册到 Pi，后续请求不会因历史档位重新启用思考。"
             checked={profile.reasoning}
             onCheckedChange={(checked) => set({ reasoning: checked })}
           />
@@ -347,7 +360,7 @@ function ProfileEditor({
         <SelectLevel
           value={profile.defaultLevel}
           onChange={(value) => set({ defaultLevel: value })}
-          options={ALL_THINKING_LEVELS}
+          options={profile.levels}
         />
       </SettingsRow>
 
@@ -465,9 +478,9 @@ function EncodingEditor({
               </select>
             </div>
             <div className="space-y-1.5">
-              <div className="text-xs text-muted-foreground">档位 → 上游值（null 表示该档位禁用思考）</div>
+              <div className="text-xs text-muted-foreground">档位 → 上游值（null 表示该档位不可用，不是发送“关闭思考”）</div>
               {profile.levels.map((level) => {
-                const value = enc.effortMap[level] ?? ''
+                const value = enc.effortMap[level] === null ? 'null' : enc.effortMap[level] ?? ''
                 return (
                   <div key={level} className="flex items-center gap-2">
                     <span className="text-xs w-16 text-muted-foreground">{level}</span>

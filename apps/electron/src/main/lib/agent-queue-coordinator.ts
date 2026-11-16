@@ -7,52 +7,63 @@ import type {
   AgentQueuedMessageStatus,
 } from '@proma/shared'
 
-type DispatchedQueueRunInput = AgentDeferredQueueMessageInput & { runGeneration: number }
-
-interface QueueEntry {
-  input: AgentDeferredQueueMessageInput
-  queuedAt: number
+type DispatchedQueueRunInput = AgentDeferredQueueMessageInput & { runGeneration: number; cancelledBeforeStart: boolean }
+interface QueueEntry { input: AgentDeferredQueueMessageInput; queuedAt: number }
+interface QueueDispatch { messageId: string; token: symbol; cancelledBeforeStart: boolean }
+interface QueueControl {
+  paused: boolean
+  revision: number
+  runRevision: number
+  runGeneration?: number
+  backgroundPending: boolean
+  promotion?: { messageId: string; token: symbol }
 }
 
 export interface AgentQueueCoordinatorOptions {
   isActive: (sessionId: string) => boolean
+  /** 镜像准备、完整运行收尾、删除与退出均阻止新 run；不用于判断能否同轮注入。 */
+  isStartBlocked?: (sessionId: string) => boolean
   getWebContents: (sessionId: string) => WebContents | null
   startRun: (input: DispatchedQueueRunInput, webContents: WebContents) => Promise<void>
   sendStarted: (webContents: WebContents, status: AgentQueuedMessageStatus) => void
-  /** 运行身份由生命周期所有者分配，队列只负责调度。 */
   reserveRunGeneration: (sessionId: string) => number
-  /**
-   * 尽力向活跃通道注入消息（promote 专用）。返回 false 表示通道已结束（应降级为直接启动 run），
-   * 抛错表示真实失败（promote 会把消息回滚到队列并向上传播错误）。
-   */
+  /** false 仅说明旧通道未接受消息；消息必须回队列等待统一准入，不能直接开新 run。 */
   inject?: (input: AgentDeferredQueueMessageInput, interrupt: boolean) => Promise<boolean>
 }
 
-/** 主进程持有 deferred queue；renderer 只保留展示投影。 */
+/** 主进程持有 deferred queue；所有新 run 共用准入检查，renderer 只保留展示投影。 */
 export class AgentQueueCoordinator {
   private readonly queues = new Map<string, QueueEntry[]>()
-  private readonly dispatching = new Map<string, string>()
+  private readonly dispatching = new Map<string, QueueDispatch>()
+  private readonly controls = new Map<string, QueueControl>()
+  private shuttingDown = false
 
   constructor(private readonly options: AgentQueueCoordinatorOptions) {}
 
-  enqueue(input: AgentDeferredQueueMessageInput): 'started' | 'queued' {
-    if (this.dispatching.get(input.sessionId) === input.queueMessageId) return 'started'
-    const queue = this.queues.get(input.sessionId) ?? []
-    if (queue.some((entry) => entry.input.queueMessageId === input.queueMessageId)) {
-      const runStarted = this.dispatching.get(input.sessionId) === input.queueMessageId
-      return runStarted ? 'started' : 'queued'
+  private control(sessionId: string): QueueControl {
+    let control = this.controls.get(sessionId)
+    if (!control) {
+      control = { paused: false, revision: 0, runRevision: 0, backgroundPending: false }
+      this.controls.set(sessionId, control)
     }
+    return control
+  }
+
+  enqueue(input: AgentDeferredQueueMessageInput): 'started' | 'queued' {
+    if (this.dispatching.get(input.sessionId)?.messageId === input.queueMessageId) return 'started'
+    if (this.control(input.sessionId).promotion?.messageId === input.queueMessageId) return 'queued'
+    const queue = this.queues.get(input.sessionId) ?? []
+    if (queue.some(entry => entry.input.queueMessageId === input.queueMessageId)) return 'queued'
     queue.push({ input, queuedAt: Date.now() })
     this.queues.set(input.sessionId, queue)
     this.tryDispatch(input.sessionId)
-    const runStarted = this.dispatching.get(input.sessionId) === input.queueMessageId
-    return runStarted ? 'started' : 'queued'
+    return this.dispatching.get(input.sessionId)?.messageId === input.queueMessageId ? 'started' : 'queued'
   }
 
   cancel(input: AgentQueuedMessageControlInput): boolean {
     const queue = this.queues.get(input.sessionId)
     if (!queue) return false
-    const index = queue.findIndex((entry) => entry.input.queueMessageId === input.messageId)
+    const index = queue.findIndex(entry => entry.input.queueMessageId === input.messageId)
     if (index < 0) return false
     queue.splice(index, 1)
     if (queue.length === 0) this.queues.delete(input.sessionId)
@@ -62,148 +73,152 @@ export class AgentQueueCoordinator {
   move(input: AgentMoveQueuedMessageInput): boolean {
     const queue = this.queues.get(input.sessionId)
     if (!queue || input.sourceId === input.targetId) return false
-    const sourceIndex = queue.findIndex((entry) => entry.input.queueMessageId === input.sourceId)
-    const targetIndex = queue.findIndex((entry) => entry.input.queueMessageId === input.targetId)
+    const sourceIndex = queue.findIndex(entry => entry.input.queueMessageId === input.sourceId)
+    const targetIndex = queue.findIndex(entry => entry.input.queueMessageId === input.targetId)
     if (sourceIndex < 0 || targetIndex < 0) return false
     const [source] = queue.splice(sourceIndex, 1)
     if (!source) return false
-    const adjustedTarget = queue.findIndex((entry) => entry.input.queueMessageId === input.targetId)
-    const insertIndex = input.placement === 'after' ? adjustedTarget + 1 : adjustedTarget
-    queue.splice(insertIndex, 0, source)
+    const adjustedTarget = queue.findIndex(entry => entry.input.queueMessageId === input.targetId)
+    queue.splice(input.placement === 'after' ? adjustedTarget + 1 : adjustedTarget, 0, source)
     return true
   }
 
-  onRunComplete(
-    sessionId: string,
-    queueMessageId: string | undefined,
-    backgroundTasksPending: boolean,
-    stoppedByUser: boolean,
-  ): void {
-    if (queueMessageId && this.dispatching.get(sessionId) === queueMessageId) {
-      this.dispatching.delete(sessionId)
-    }
-    if (backgroundTasksPending || stoppedByUser) return
-    this.tryDispatch(sessionId)
+  /** 接受时登记控制版本，不能等预检后才把较新的 stop/resume 当作旧轮意图。 */
+  onRunAccepted(sessionId: string, runGeneration: number): void {
+    const control = this.control(sessionId)
+    if (control.runGeneration != null && control.runGeneration >= runGeneration) return
+    control.runGeneration = runGeneration
+    control.runRevision = control.revision
+    control.backgroundPending = false
   }
 
-  onBackgroundTaskComplete(sessionId: string): void {
-    this.tryDispatch(sessionId)
+  onRunStarted(sessionId: string, runGeneration: number): void {
+    this.onRunAccepted(sessionId, runGeneration)
   }
 
-  /** Renderer/webContents 重新可用后唤醒等待中的队列。tryDispatch 自身负责去重 active/dispatching。 */
-  onTargetAvailable(sessionId: string): void {
+  /** 业务完成不代表 finally 已结束，绝不在此释放 dispatch reservation。 */
+  onRunComplete(sessionId: string, _queueMessageId: string | undefined, backgroundTasksPending: boolean, stoppedByUser: boolean, runGeneration?: number): void {
+    const control = this.control(sessionId)
+    if (runGeneration != null && control.runGeneration != null && control.runGeneration !== runGeneration) return
+    const backgroundSettled = control.backgroundPending && !backgroundTasksPending
+    control.backgroundPending = backgroundTasksPending
+    // 显式 stop/resume 比迟到的旧终态更权威。
+    if (stoppedByUser && control.revision === control.runRevision) control.paused = true
+    // 最终背景完成可能晚于唯一一次 drain；仍由统一准入检查真实运行屏障。
+    if (backgroundSettled) this.tryDispatch(sessionId)
+  }
+
+  onRunDrained(sessionId: string): void {
+    const control = this.control(sessionId)
+    if (control.paused) control.backgroundPending = false
     this.tryDispatch(sessionId)
   }
+  onBackgroundTaskComplete(sessionId: string): void { this.tryDispatch(sessionId) }
+  onTargetAvailable(sessionId: string): void { this.tryDispatch(sessionId) }
+  waitingSessionIds(): string[] { return [...this.queues.keys()] }
+  hasDispatching(): boolean { return this.dispatching.size > 0 || [...this.controls.values()].some(control => !!control.promotion) }
+  isPromoting(sessionId: string): boolean { return !!this.controls.get(sessionId)?.promotion }
+
+  pauseForStop(sessionId: string): void {
+    const control = this.control(sessionId)
+    control.paused = true
+    control.revision++
+    const dispatch = this.dispatching.get(sessionId)
+    if (dispatch) dispatch.cancelledBeforeStart = true
+  }
+  /** 只由显式输入调用；不会绕过仍在进行的 drain/starting。 */
+  resumeForExplicitInput(sessionId: string): void {
+    const control = this.control(sessionId)
+    control.paused = false
+    control.revision++
+  }
+  shutdown(): void { this.shuttingDown = true }
 
   snapshot(sessionId: string): AgentQueuedMessageSnapshot[] {
-    return (this.queues.get(sessionId) ?? []).map((entry) => ({ input: { ...entry.input }, queuedAt: entry.queuedAt }))
+    return (this.queues.get(sessionId) ?? []).map(entry => ({ input: { ...entry.input }, queuedAt: entry.queuedAt }))
   }
-
-  isDispatching(sessionId: string): boolean {
-    return this.dispatching.has(sessionId)
-  }
-
-  hasPending(sessionId: string): boolean {
-    return this.dispatching.has(sessionId) || (this.queues.get(sessionId)?.length ?? 0) > 0
-  }
+  isDispatching(sessionId: string): boolean { return this.dispatching.has(sessionId) }
+  hasPending(sessionId: string): boolean { return this.isDispatching(sessionId) || this.isPromoting(sessionId) || (this.queues.get(sessionId)?.length ?? 0) > 0 }
 
   clear(sessionId: string): void {
     this.queues.delete(sessionId)
-    this.dispatching.delete(sessionId)
+    // 替换控制身份，让旧 promote 的迟到分支不能恢复已经清掉的消息。
+    this.controls.delete(sessionId)
+    // 运行 reservation 只能由自己的 Promise settle 清理，clear 不是 abort/drain。
   }
 
-  /** 把用户选中的队列消息提升为立即发送：优先注入活跃通道，降级为直接启动 run。 */
-  async promote(
-    sessionId: string,
-    messageId: string,
-    interrupt: boolean,
-  ): Promise<'injected' | 'dispatched' | 'not_found'> {
+  async promote(sessionId: string, messageId: string, interrupt: boolean): Promise<'injected' | 'dispatched' | 'queued' | 'not_found'> {
+    const control = this.control(sessionId)
+    if (control.promotion?.messageId === messageId) return 'queued'
     const queue = this.queues.get(sessionId)
-    const index = queue?.findIndex((entry) => entry.input.queueMessageId === messageId) ?? -1
+    const index = queue?.findIndex(entry => entry.input.queueMessageId === messageId) ?? -1
     if (!queue || index < 0) return 'not_found'
+    if (control.promotion) throw new Error('队列消息正在处理，请稍后重试')
+    this.resumeForExplicitInput(sessionId)
     const [entry] = queue.splice(index, 1)
     if (!entry) return 'not_found'
-    if (queue.length === 0) this.queues.delete(sessionId)
-
-    // 1) 活跃通道可用时尽力注入（interrupt=true 会软中断当前 turn）。
-    if (this.options.inject && this.options.isActive(sessionId)) {
-      try {
-        if (await this.options.inject(entry.input, interrupt)) return 'injected'
-        // inject 返回 false：通道刚结束，消息未被接受，降级为直接启动 run。
-      } catch (error) {
-        // 真实失败：把消息回滚到原位置，避免静默丢失。
-        this.restore(sessionId, entry, index)
-        throw error
+    if (!queue.length) this.queues.delete(sessionId)
+    const promotion = { messageId, token: Symbol(messageId) }
+    control.promotion = promotion
+    let injected = false
+    try {
+      if (this.options.inject && this.options.isActive(sessionId)) {
+        injected = await this.options.inject(entry.input, interrupt)
+        if (injected) return 'injected'
       }
+      if (this.controls.get(sessionId) !== control) return 'not_found'
+      this.restore(sessionId, entry, 0)
+    } catch (error) {
+      if (this.controls.get(sessionId) === control) this.restore(sessionId, entry, index)
+      throw error
+    } finally {
+      if (control.promotion === promotion) control.promotion = undefined
+      // 注入等待期间可能已经收到 drain/target 唤醒，事务释放后补一次安全调度。
+      if (this.controls.get(sessionId) === control) this.tryDispatch(sessionId)
     }
-
-    // 2) 作为新一轮 run 启动（started 事件与 runGeneration 由 tryDispatch 流程分配）。
-    this.startRunEntry(sessionId, entry, index)
-    return 'dispatched'
+    this.tryDispatch(sessionId)
+    return this.dispatching.get(sessionId)?.messageId === messageId ? 'dispatched' : 'queued'
   }
 
-  /** 把消息恢复到队列指定下标（超出范围时夹到队尾），并确保队列 Map 存在。 */
   private restore(sessionId: string, entry: QueueEntry, index: number): void {
-    const queue = this.queues.get(sessionId)
-    if (!queue) {
-      this.queues.set(sessionId, [entry])
-      return
-    }
-    const insertAt = Math.min(Math.max(index, 0), queue.length)
-    queue.splice(insertAt, 0, entry)
+    const queue = this.queues.get(sessionId) ?? []
+    queue.splice(Math.min(Math.max(index, 0), queue.length), 0, entry)
+    this.queues.set(sessionId, queue)
   }
 
   private tryDispatch(sessionId: string): void {
-    if (this.dispatching.has(sessionId) || this.options.isActive(sessionId)) return
+    const control = this.control(sessionId)
+    if (this.shuttingDown || control.paused || control.backgroundPending || control.promotion
+      || this.dispatching.has(sessionId) || this.options.isActive(sessionId) || this.options.isStartBlocked?.(sessionId)) return
     const queue = this.queues.get(sessionId)
-    const entry = queue?.shift()
+    const entry = queue?.[0]
     if (!entry) return
-    if (queue?.length === 0) this.queues.delete(sessionId)
-
-    this.startRunEntry(sessionId, entry, 0)
-  }
-
-  private finishDispatch(sessionId: string, messageId: string): void {
-    if (this.dispatching.get(sessionId) === messageId) {
+    const webContents = this.options.getWebContents(sessionId)
+    if (!webContents || webContents.isDestroyed()) return
+    const dispatch = { messageId: entry.input.queueMessageId, token: Symbol(entry.input.queueMessageId), cancelledBeforeStart: false }
+    this.dispatching.set(sessionId, dispatch)
+    let runGeneration: number
+    const startedAt = Date.now()
+    try {
+      runGeneration = this.options.reserveRunGeneration(sessionId)
+      this.onRunAccepted(sessionId, runGeneration)
+      this.options.sendStarted(webContents, {
+        sessionId, messageId: dispatch.messageId, status: 'started',
+        userMessage: entry.input.userMessage, rawUserMessage: entry.input.rawUserMessage, startedAt, runGeneration,
+      })
+    } catch {
+      this.dispatching.delete(sessionId)
+      return // 目标销毁/发送失败不出队，也不假报 started。
+    }
+    queue!.shift()
+    if (!queue!.length) this.queues.delete(sessionId)
+    const finish = (): void => {
+      if (this.dispatching.get(sessionId) !== dispatch) return
       this.dispatching.delete(sessionId)
       this.tryDispatch(sessionId)
     }
-  }
-
-  /** 以指定 entry 启动 run：标记 dispatching、分配 runGeneration、推送 started 投影、执行 startRun。 */
-  private startRunEntry(sessionId: string, entry: QueueEntry, restoreIndex: number): void {
-    const messageId = entry.input.queueMessageId
-    this.dispatching.set(sessionId, messageId)
-    const webContents = this.options.getWebContents(sessionId)
-    if (!webContents || webContents.isDestroyed()) {
-      // 没有可通信的渲染进程：回滚到队列，等待下一次派发。
-      this.restore(sessionId, entry, restoreIndex)
-      this.dispatching.delete(sessionId)
-      return
-    }
-    const runGeneration = this.options.reserveRunGeneration(sessionId)
-    const startedAt = Date.now()
-    try {
-      this.options.sendStarted(webContents, {
-        sessionId,
-        messageId,
-        status: 'started',
-        userMessage: entry.input.userMessage,
-        rawUserMessage: entry.input.rawUserMessage,
-        startedAt,
-        runGeneration,
-      })
-    } catch {
-      // renderer 可能在检查 isDestroyed() 后立即销毁；发送失败时必须保留消息，等待下一次重试。
-      this.restore(sessionId, entry, restoreIndex)
-      this.dispatching.delete(sessionId)
-      return
-    }
     void Promise.resolve()
-      .then(() => this.options.startRun({ ...entry.input, startedAt, runGeneration, userMessageUuid: messageId }, webContents))
-      .then(
-        () => this.finishDispatch(sessionId, messageId),
-        () => this.finishDispatch(sessionId, messageId),
-      )
+      .then(() => this.options.startRun({ ...entry.input, startedAt, runGeneration, userMessageUuid: dispatch.messageId, cancelledBeforeStart: dispatch.cancelledBeforeStart || this.shuttingDown }, webContents))
+      .then(finish, finish)
   }
 }

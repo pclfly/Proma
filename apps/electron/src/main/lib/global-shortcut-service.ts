@@ -21,6 +21,8 @@ const registeredAccelerators = new Map<string, string>()
 /** 默认全局快捷键配置 */
 const GLOBAL_SHORTCUT_DEFAULTS: Record<string, { mac: string; win: string }> = {
   'quick-task': { mac: 'Alt+Space', win: 'Alt+Space' },
+  // 官方 0.22.0：任意应用下唤起清单快速捕获浮层。
+  'quick-capture-todo': { mac: 'CommandOrControl+Shift+T', win: 'CommandOrControl+Shift+T' },
   'show-main-window': { mac: 'CommandOrControl+Shift+P', win: 'CommandOrControl+Shift+P' },
   'voice-dictation': { mac: 'Ctrl+`', win: 'Ctrl+`' },
 }

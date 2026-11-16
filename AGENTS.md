@@ -77,3 +77,11 @@ release-notes/                    版本发布日志
 - 各包版本映射不变：`apps/electron/package.json` 是桌面应用版本；`packages/*/package.json` 是各共享包版本；默认 Skill 改动若需升级，仍需用户确认后递增其 `SKILL.md` frontmatter 的 `version`。
 - 仅在功能行为、安装方式或用户流程发生变化时更新 README / tutorial / release notes；改文档前先取得用户授权。
 - 提交前检查 `git diff`，不要覆盖用户已有改动或提交无关文件。
+
+<!-- proma:memory:start -->
+## 记忆维护
+
+- **个人层（常驻）**：[user_profile.md](<C:\Users\Administrator\.proma\memory\user_profile.md>)，跨项目共享，仅记录换个项目也成立的个人背景与稳定偏好。
+- **项目护栏层（常驻）**：本文件（AGENTS.md，预算 ≤4000 非空白字符），仅保留不看就会在本项目犯错的子项目结构、常用命令与全局红线；具体模块细节、排障经过和某日状态快照一律下沉到项目 memory/。
+- **专题手册层（按需）**：[MEMORY.md](<C:\Users\Administrator\.proma\agent-workspaces\proma-dev\memory\MEMORY.md>) 仅维护一行一条的场景路由索引（预算 ≤3500 字符，不写长篇结论摘要），详细主题按索引按需读取；过期或已合并的存量文件（含历史 project-preferences.md）通过可恢复归档移出有效入口。读取不等于核验，不编造用户事实。
+<!-- proma:memory:end -->

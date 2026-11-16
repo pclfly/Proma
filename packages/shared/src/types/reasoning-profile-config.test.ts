@@ -46,7 +46,7 @@ describe('getDefaultReasoningProfileConfigData', () => {
     const defaults = getDefaultReasoningProfileConfigData()
     const std = defaults.find((p) => p.id === 'openai-reasoning-standard')
     expect(std).toBeDefined()
-    expect(std!.matchRules.some((r) => r.type === 'prefix' && r.value === 'gpt-5')).toBe(true)
+    expect(resolveReasoningProfile({ modelId: 'gpt-5.5', transport: 'openai-responses', profiles: defaults })?.id).toBe(std!.id)
   })
 })
 

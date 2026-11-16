@@ -170,6 +170,17 @@ export function getReasoningProfilesPath(): string {
 }
 
 /**
+ * 获取输入框额度汇总缓存路径。
+ *
+ * 只保存渠道额度展示数据，不含 API Key 或任何登录凭据。
+ *
+ * @returns ~/.proma/plan-quota-cache.json
+ */
+export function getPlanQuotaCachePath(): string {
+  return join(getConfigDir(), 'plan-quota-cache.json')
+}
+
+/**
  * 获取用户授权的 Markdown Vault 配置路径。
  * 内容仅保存 Vault 根目录与用户授予的能力，不保存笔记正文或索引。
  */
@@ -324,6 +335,14 @@ export function getAgentWorkspacesDir(): string {
  * @param slug 工作区 slug
  * @returns ~/.proma/agent-workspaces/{slug}/
  */
+/**
+ * 只计算工作区目录路径，不创建任何目录、也不触发记忆迁移。
+ * 供只读观察与审计使用：它们不能因为想读取就改变磁盘状态。
+ */
+export function resolveAgentWorkspaceDirPath(slug: string): string {
+  return join(homedir(), getConfigDirName(), 'agent-workspaces', slug)
+}
+
 export function getAgentWorkspacePath(slug: string): string {
   const dir = join(getAgentWorkspacesDir(), slug)
 
@@ -514,6 +533,11 @@ function compareSemver(a: string, b: string): number {
 export const RETIRED_DEFAULT_SKILL_SLUGS: readonly string[] = [
   'brainstorming',
   'vault',
+  // 0.19.78-01 / 0.20.0-07：Chat 模式退役后 tool-builder 指向的自定义 HTTP 工具能力已移除，
+  // 由 proma-build-in-proma-app 承接「把流程做成可反复使用的应用」这一诉求。
+  'tool-builder',
+  // 生图通过 Proma Cloud 账户余额计费，默认不再向 Agent 提供该能力。
+  'proma-gpt-image-25',
 ]
 
 const RETIRED_DEFAULT_SKILL_SLUG_SET = new Set(RETIRED_DEFAULT_SKILL_SLUGS)

@@ -21,9 +21,25 @@ export * from './user-agent.ts'
 
 // 导出适配器类
 export { AnthropicAdapter } from './anthropic-adapter.ts'
-export { OpenAIAdapter } from './openai-adapter.ts'
+export { OpenAIAdapter, toOpenAITools } from './openai-adapter.ts'
 export { OpenAIResponsesAdapter } from './openai-responses-adapter.ts'
 export { GoogleAdapter } from './google-adapter.ts'
+
+// Proma 官方渠道适配器（Cloud）
+// 注意：本轮只导出协议实现，不注册进 adapterRegistry，也不扩展 ProviderType；
+// 等主进程 Cloud 登录态与官方渠道同步落地后再接入注册表。
+export {
+  PromaAdapter,
+  appendPromaContinuationMessages,
+  buildImageBlocks,
+  buildMessageContent,
+  buildPromaStreamRequest,
+  buildPromaTitleRequest,
+  parseOpenAICompatSSE,
+  parsePromaTitleResponse,
+  toPromaMessages,
+} from './proma-adapter.ts'
+export type { PromaMessage, PromaProviderAdapter } from './proma-adapter.ts'
 
 /** 供应商适配器注册表 */
 const adapterRegistry = new Map<ProviderType, ProviderAdapter>([

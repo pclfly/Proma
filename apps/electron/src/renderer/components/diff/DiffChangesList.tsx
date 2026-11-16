@@ -1,3 +1,4 @@
+import { createChangesScrollController } from './changes-scroll-controller'
 /**
  * DiffChangesList — 代码改动文件列表
  *
@@ -6,7 +7,8 @@
 
 import * as React from 'react'
 import { Box, ChevronDown, ChevronRight, FolderSearch, Search, SquareTerminal, Undo2, X } from 'lucide-react'
-import { useAtomValue, useSetAtom } from 'jotai'
+import { useAtomValue, useSetAtom, useStore } from 'jotai'
+import { changesViewStatesAtom, updateChangesViewAtom, EMPTY_CHANGES_VIEW } from '@/atoms/changes-view-state'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
@@ -20,6 +22,9 @@ import type { SessionFileChange } from '@/lib/session-file-changes'
 import { buildDiffFileTree } from './diff-file-tree'
 import type { DiffFileTreeNode } from './diff-file-tree'
 import { collectDiffChangeSources, DIFF_CHANGE_SOURCE_CONFIG } from './diff-change-sources'
+import { TurnChangesStream } from './TurnChangesStream'
+import { useTurnChanges } from '@/hooks/use-turn-changes'
+import { filterTurnChanges } from '@/lib/turn-changes-view'
 
 interface GitFileEntry {
   filePath: string
@@ -157,8 +162,34 @@ export const DiffChangesList = React.memo(function DiffChangesList({
   const [isGitRepo, setIsGitRepo] = React.useState(() => cached?.isGitRepo ?? true)
   /** 首次 fetch 是否已返回——区分 loading 与真·空，避免 "没有代码改动" 误闪 */
   const [hasFetched, setHasFetched] = React.useState<boolean>(() => cached !== undefined)
-  const [collapsedDirs, setCollapsedDirs] = React.useState<Set<string>>(new Set())
-  const [searchQuery, setSearchQuery] = React.useState('')
+  const viewKey = JSON.stringify([diffCacheKey, dirPath, sessionPath, workspaceFilesPath, extraPaths])
+  const views = useAtomValue(changesViewStatesAtom)
+  const updateView = useSetAtom(updateChangesViewAtom)
+  const store = useStore()
+  const view = views.get(viewKey) ?? EMPTY_CHANGES_VIEW
+  const { collapsedDirs, searchQuery } = view
+  const { turns: turnChanges, loading: turnChangesLoading } = useTurnChanges(sessionId, refreshVersion)
+  const hasTurnChanges = React.useMemo(
+    () => filterTurnChanges(turnChanges, searchQuery).some((turn) => turn.entries.length > 0),
+    [turnChanges, searchQuery],
+  )
+  const setSearchQuery = (value: string): void => updateView({ key: viewKey, patch: { searchQuery: value } })
+  const scrollRef = React.useRef<HTMLDivElement>(null)
+  const scrollControllerRef = React.useRef<ReturnType<typeof createChangesScrollController> | null>(null)
+  React.useLayoutEffect(() => {
+    const element = scrollRef.current
+    if (!element) return
+    const controller = createChangesScrollController(
+      element,
+      () => store.get(changesViewStatesAtom).get(viewKey)?.scrollTop ?? 0,
+      (scrollTop) => updateView({ key: viewKey, patch: { scrollTop } }),
+      (callback) => requestAnimationFrame(callback), cancelAnimationFrame,
+    )
+    scrollControllerRef.current = controller
+    controller.restore(false)
+    return () => { controller.dispose(); scrollControllerRef.current = null }
+  }, [viewKey, store, updateView])
+  React.useLayoutEffect(() => { scrollControllerRef.current?.restore(hasFetched) }, [viewKey, hasFetched, files, untrackedFiles, nonGitFileChanges])
   /** 单调递增的 fetch 序号，用于丢弃乱序到达的旧响应 */
   const fetchSeqRef = React.useRef(0)
 
@@ -232,16 +263,15 @@ export const DiffChangesList = React.memo(function DiffChangesList({
 
   /** 切换文件夹折叠 */
   const toggleDir = React.useCallback((dirName: string) => {
-    setCollapsedDirs(prev => {
-      const next = new Set(prev)
-      if (next.has(dirName)) {
-        next.delete(dirName)
-      } else {
-        next.add(dirName)
-      }
-      return next
-    })
-  }, [])
+    const prev = store.get(changesViewStatesAtom).get(viewKey)?.collapsedDirs ?? EMPTY_CHANGES_VIEW.collapsedDirs
+    const next = new Set(prev)
+    if (next.has(dirName)) {
+      next.delete(dirName)
+    } else {
+      next.add(dirName)
+    }
+    updateView({ key: viewKey, patch: { collapsedDirs: next } })
+  }, [store, viewKey, updateView])
 
   // 按 Git 仓库分组（在所有 hooks 之后、条件返回之前调用）
   const { fileGroups, matchedFilesCount } = React.useMemo(() => {
@@ -295,7 +325,15 @@ export const DiffChangesList = React.memo(function DiffChangesList({
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div
+        ref={scrollRef}
+        className="min-h-0 flex-1 overflow-y-auto"
+        onWheel={() => scrollControllerRef.current?.takeControl()}
+        onTouchStart={() => scrollControllerRef.current?.takeControl()}
+        onKeyDown={() => scrollControllerRef.current?.takeControl()}
+        onPointerDown={() => scrollControllerRef.current?.takeControl()}
+        onScroll={() => scrollControllerRef.current?.scroll()}
+      >
       {/* Worktree 分支选择器仅作用于 Git 改动。 */}
       {shouldShowWorktreeSelector && (
         <WorktreeSelector
@@ -344,12 +382,23 @@ export const DiffChangesList = React.memo(function DiffChangesList({
         <NonGitChangesList
           changes={nonGitFileChanges}
           currentRunId={currentFileChangeRunId}
+          viewKey={viewKey}
           sessionId={sessionId}
           onFileClick={onPlainFileClick}
         />
       )}
 
-      {!hasAnyVisibleChanges && (
+      {/* 连续改动流：按轮次串联文件改动；默认展开，点击文件才打开预览。 */}
+      <TurnChangesStream
+        sessionId={sessionId}
+        sessionPath={sessionPath}
+        turns={turnChanges}
+        selectedFilePath={selectedFilePath}
+        searchQuery={searchQuery}
+        viewKey={viewKey}
+      />
+
+      {!hasAnyVisibleChanges && !hasTurnChanges && !turnChangesLoading && (
         <div className="flex flex-col items-center justify-center h-full text-muted-foreground p-4">
           <p className="text-[12px] text-center">
             {isGitRepo ? (hasFetched ? '没有文件改动' : '加载中…') : '当前目录不是 Git 仓库，或暂无文件改动'}
@@ -581,11 +630,13 @@ function NonGitChangesList({
   changes,
   currentRunId,
   sessionId,
+  viewKey,
   onFileClick,
 }: {
   changes: SessionFileChange[]
   currentRunId?: string
   sessionId: string
+  viewKey: string
   onFileClick?: (filePath: string) => void
 }): React.ReactElement {
   const { current, earlier } = React.useMemo(
@@ -636,7 +687,9 @@ function NonGitChangesList({
   const title = hasEarlierChanges
     ? `本会话文件变更 · ${changes.length}`
     : `本会话文件变更 · 本轮 · ${current.length}`
-  const [isExpanded, setIsExpanded] = React.useState(true)
+  const views = useAtomValue(changesViewStatesAtom)
+  const updateView = useSetAtom(updateChangesViewAtom)
+  const isExpanded = views.get(viewKey)?.nonGitExpanded ?? true
   const contentId = React.useId()
 
   return (
@@ -646,7 +699,7 @@ function NonGitChangesList({
         aria-expanded={isExpanded}
         aria-controls={contentId}
         className="group flex min-h-9 w-full items-center gap-1.5 px-3 py-2 text-left text-[13px] font-medium text-muted-foreground tabular-nums transition-colors hover:bg-accent/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
-        onClick={() => setIsExpanded((expanded) => !expanded)}
+        onClick={() => updateView({ key: viewKey, patch: { nonGitExpanded: !isExpanded } })}
       >
         {isExpanded ? (
           <ChevronDown className="size-3.5 shrink-0 transition-transform duration-150" aria-hidden="true" />
@@ -661,7 +714,7 @@ function NonGitChangesList({
         {hasEarlierChanges ? (
           <>
             {current.length > 0 && <NonGitRunGroup title="本轮" changes={current} sessionId={sessionId} onFileClick={onFileClick} />}
-            <NonGitRunGroup title="更早" changes={earlier} sessionId={sessionId} onFileClick={onFileClick} collapsible defaultCollapsed />
+            <NonGitRunGroup viewKey={viewKey} title="更早" changes={earlier} sessionId={sessionId} onFileClick={onFileClick} collapsible defaultCollapsed />
           </>
         ) : (
           <NonGitFileList changes={current} sessionId={sessionId} onFileClick={onFileClick} />
@@ -673,6 +726,7 @@ function NonGitChangesList({
 
 function NonGitRunGroup({
   title,
+  viewKey,
   changes,
   sessionId,
   onFileClick,
@@ -680,13 +734,16 @@ function NonGitRunGroup({
   defaultCollapsed = false,
 }: {
   title: string
+  viewKey?: string
   changes: SessionFileChange[]
   sessionId: string
   onFileClick?: (filePath: string) => void
   collapsible?: boolean
   defaultCollapsed?: boolean
 }): React.ReactElement {
-  const [isExpanded, setIsExpanded] = React.useState(!defaultCollapsed)
+  const views = useAtomValue(changesViewStatesAtom)
+  const updateView = useSetAtom(updateChangesViewAtom)
+  const isExpanded = viewKey ? views.get(viewKey)?.earlierExpanded ?? !defaultCollapsed : true
   const contentId = React.useId()
   const headerClassName = "flex w-full items-center gap-1.5 px-3 py-1 text-left text-[11px] font-medium text-muted-foreground tabular-nums"
   const headerContent = (
@@ -709,7 +766,7 @@ function NonGitRunGroup({
           aria-expanded={isExpanded}
           aria-controls={contentId}
           className={cn(headerClassName, 'hover:bg-accent/40 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring')}
-          onClick={() => setIsExpanded((expanded) => !expanded)}
+          onClick={() => { if (viewKey) updateView({ key: viewKey, patch: { earlierExpanded: !isExpanded } }) }}
         >
           {headerContent}
         </button>

@@ -44,8 +44,10 @@ export function injectDeepSeekReasoningLevel(
     return { ...body, thinking: { type: 'disabled' } }
   }
 
-  const effort = encoding.effortMap[normalizedLevel]
-  if (typeof effort !== 'string') return payload
+  const mapped = encoding.effortMap[normalizedLevel]
+  // 留空表示使用档位原值，仍必须完成 DeepSeek 的协议转换，不能退回 budget。
+  const effort = mapped ?? normalizedLevel
+  if (mapped === null) return payload
   return {
     ...body,
     thinking: { type: 'enabled' },

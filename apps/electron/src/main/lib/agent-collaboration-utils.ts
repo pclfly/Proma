@@ -18,10 +18,7 @@ const PERMISSION_RANK: Record<PromaPermissionMode, number> = {
 }
 
 export const MAX_RUNNING_DELEGATIONS_PER_PARENT = 50
-/** 未显式指定时，父会话等待子会话完成的时长。 */
-export const DEFAULT_DELEGATION_WAIT_SECONDS = 60 * 60
-/** 显式指定 timeoutSeconds 时允许的最大等待时长。 */
-export const MAX_DELEGATION_WAIT_SECONDS = 2 * 60 * 60
+export { DEFAULT_DELEGATION_WAIT_SECONDS, MAX_DELEGATION_WAIT_SECONDS } from '@proma/shared'
 
 /**
  * 为具有副作用的工具调用提供进程内幂等保护。
@@ -120,8 +117,8 @@ export function buildRecoveredDelegationState(input: {
     goal: input.session.delegationGoal ?? '',
     permissionMode: input.session.permissionMode ?? input.fallbackPermissionMode ?? PROMA_DEFAULT_PERMISSION_MODE,
     status,
-    startedAt: input.session.createdAt,
-    completedAt: persistedStatus ? input.session.updatedAt : undefined,
+    startedAt: input.session.delegationStartedAt ?? input.session.createdAt,
+    completedAt: input.session.delegationCompletedAt ?? (persistedStatus ? input.session.updatedAt : undefined),
   }
 }
 

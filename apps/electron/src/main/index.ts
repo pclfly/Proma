@@ -1,4 +1,12 @@
-import { app, BrowserWindow, dialog, Menu, nativeTheme, protocol, screen, shell } from 'electron'
+import {
+  app,
+  BrowserWindow,
+  dialog,
+  Menu,
+  protocol,
+  screen,
+  shell,
+} from 'electron'
 import { join } from 'path'
 import { pathToFileURL } from 'url'
 import { existsSync } from 'fs'
@@ -77,16 +85,22 @@ for (const key of Object.keys(process.env)) {
 
 import { createApplicationMenu } from './menu'
 import { registerIpcHandlers } from './ipc'
-import { createTray, destroyTray, getTray, setTrayFlash } from './tray'
+import { createTray, destroyTray, getTray } from './tray'
 import { initializeRuntime } from './lib/runtime-init'
+import {
+  initializeSystemNetwork,
+  installDefaultSessionNetworkGuard,
+  installNetworkRecoveryObservers,
+} from './lib/network/system-network-runtime'
 import { seedDefaultSkills } from './lib/config-paths'
 import { upgradeDefaultSkillsInWorkspaces } from './lib/agent-workspace-manager'
 import { hasActiveAgentSessions, stopAllAgents } from './lib/agent-service'
 import { stopAllTerminals } from './lib/terminal-service'
+import { disposePlanQuotaService } from './lib/plan-quota-service'
 import { disposePiMcpConnections } from './lib/adapters/pi-mcp-tools'
 import { browserController } from './lib/browser-controller'
 import { markRunningDelegationsAsInterrupted } from './lib/agent-session-manager'
-import { stopAllGenerations } from './lib/chat-service'
+
 import { configureUpdater, initAutoUpdater, cleanupUpdater } from './lib/updater/auto-updater'
 import { startWorkspaceWatcher, stopWorkspaceWatcher } from './lib/workspace-watcher'
 import { startChatToolsWatcher, stopChatToolsWatcher } from './lib/chat-tools-watcher'
@@ -110,7 +124,9 @@ import {
   getPersistableMainWindowState,
   hideMacMainWindowAfterClose,
   normalizeWindowBoundsToVisibleArea,
+  resolveWindowCreationBounds,
   type WindowBounds,
+  type WindowWorkArea,
 } from './lib/main-window-lifecycle'
 import { dingtalkBridgeManager } from './lib/dingtalk-bridge-manager'
 import { getDingTalkMultiBotConfig } from './lib/dingtalk-config'
@@ -120,43 +136,16 @@ import { getSlackConfig } from './lib/slack-config'
 import { wechatBridge } from './lib/wechat-bridge'
 import { getWeChatConfig } from './lib/wechat-config'
 import { createQuickTaskWindow, toggleQuickTaskWindow, destroyQuickTaskWindow } from './lib/quick-task-window'
-import { getAgentStatusHoverWindow, destroyAgentStatusHoverWindow } from './agent-status-hover-window'
-import { handleNativeAgentIslandEvent, initAgentIslandService, disposeAgentIslandService, publishAgentIslandNow } from './lib/agent-island-service'
-import { disposeMacAgentIslandNativeHost, startMacAgentIslandNativeHost, isMacAgentIslandNativeHostReady } from './lib/mac-agent-island-native-host'
-import { isAgentIslandServiceSupported, isMacAgentIslandSurfaceSupported } from './lib/macos-version'
-import { getWindowsAgentIslandSurface, processNotification, type SurfaceDeps } from './lib/windows-agent-island-surface'
 import {
-  createVoiceDictationWindow,
-  toggleVoiceDictationWindow,
-  destroyVoiceDictationWindow,
-  shouldSuppressVoiceDictationActivate,
-} from './lib/voice-dictation-window'
+  createQuickCaptureTodoWindow,
+  toggleQuickCaptureTodoWindow,
+  destroyQuickCaptureTodoWindow,
+} from './lib/quick-capture-todo-window'
+import { createVoiceDictationWindow, toggleVoiceDictationWindow, destroyVoiceDictationWindow, shouldSuppressVoiceDictationActivate } from './lib/voice-dictation-window'
 import { registerGlobalShortcut, unregisterAllGlobalShortcuts } from './lib/global-shortcut-service'
 import { setPromaVersion } from '@proma/core'
 import { canRecoverRenderer, RENDERER_RECOVERY_WINDOW_MS } from './lib/renderer-process-recovery'
-import { TRAY_IPC_CHANNELS, WINDOWS_AGENT_ISLAND_IPC_CHANNELS } from '../types'
-
-/** macOS 26+ 使用 Swift/AppKit NSPanel；其他平台不创建 Agent Island surface。 */
-function startAgentIslandSurface(): void {
-  if (!isMacAgentIslandSurfaceSupported()) {
-    console.info('[agent-island] 当前平台或 macOS 版本不支持，已禁用')
-    return
-  }
-
-  const startedNative = startMacAgentIslandNativeHost({
-    onReady: () => {
-      console.info('[agent-island] macOS 原生 NSPanel helper 已就绪')
-      publishAgentIslandNow()
-    },
-    onEvent: handleNativeAgentIslandEvent,
-    onUnavailable: (reason) => {
-      console.warn(`[agent-island] macOS 原生 helper 不可用，已禁用：${reason}`)
-    },
-  })
-  if (!startedNative) {
-    console.warn('[agent-island] macOS 原生 helper 启动失败，已禁用')
-  }
-}
+import { TRAY_IPC_CHANNELS } from '../types'
 
 // ===== Bridge 注册（新增 Bridge 只需在此添加一个 registerBridge 调用） =====
 
@@ -314,9 +303,39 @@ function getInitialMainWindowBounds(
   return getVisibleMainWindowBounds(savedState)
 }
 
+/** 目标显示器的工作区；无保存位置时取主屏。 */
+function getTargetWorkArea(
+  savedState: ReturnType<typeof getSettings>['mainWindowState'],
+): WindowWorkArea {
+  const target = savedState
+    ? { x: savedState.x, y: savedState.y, width: savedState.width, height: savedState.height }
+    : undefined
+  const display = target ? screen.getDisplayMatching(target) : screen.getPrimaryDisplay()
+  return display?.workArea ?? screen.getPrimaryDisplay().workArea
+}
+
 /**
- * 原生启动页不依赖 Renderer bundle 或运行时检测，避免冷启动期间出现空白窗口。
- * dev 由 build:resources 复制到 dist/resources；打包版由 electron-builder extraResources 提供。
+ * 启动页的创建尺寸。
+ *
+ * 启动页是 `resizable: false` 的无边框窗口，Windows 下对它调 maximize() 不会铺满
+ * 屏幕，最大化启动时会先看到一个小窗口、随后才切到全屏的主窗口。这里直接按最终
+ * 尺寸（最大化时为目标显示器工作区）创建，启动页一出现就是全屏。
+ */
+function getStartupSplashBounds(
+  savedState: ReturnType<typeof getSettings>['mainWindowState'],
+): Partial<WindowBounds> {
+  return resolveWindowCreationBounds({
+    savedState: savedState ?? undefined,
+    workArea: getTargetWorkArea(savedState),
+    normalizeVisible: getVisibleMainWindowBounds,
+    fallbackSize: { width: DEFAULT_MAIN_WINDOW_WIDTH, height: DEFAULT_MAIN_WINDOW_HEIGHT },
+  })
+}
+
+/**
+ * 原生启动页不依赖 Renderer bundle 或运行时检测，双击后立刻有反馈，
+ * 运行时检测耗时也不会变成用户可见的空白。dev 由 build:resources 复制到
+ * dist/resources；打包版由 electron-builder extraResources 提供。
  */
 function getStartupSplashPath(): string {
   const resourcesDir = app.isPackaged ? process.resourcesPath : join(__dirname, 'resources')
@@ -334,10 +353,9 @@ function createStartupSplashWindow(): void {
   if (startupSplashWindow && !startupSplashWindow.isDestroyed()) return
 
   const savedState = getSettings().mainWindowState
-  const initialBounds = getInitialMainWindowBounds(savedState)
 
   startupSplashWindow = new BrowserWindow({
-    ...initialBounds,
+    ...getStartupSplashBounds(savedState),
     show: false,
     frame: false,
     resizable: false,
@@ -354,8 +372,8 @@ function createStartupSplashWindow(): void {
   splash.setMenuBarVisibility(false)
   splash.once('ready-to-show', () => {
     if (splash.isDestroyed()) return
-    // 与主窗口使用相同的默认策略，首次启动时也不会出现窗口尺寸跳变。
-    if (savedState?.isMaximized ?? true) splash.maximize()
+    // 已按最终尺寸创建（见 getStartupSplashBounds）：启动页 resizable:false，
+    // Windows 下再调 maximize() 也不会铺满屏幕。
     splash.show()
   })
   splash.once('closed', () => {
@@ -370,22 +388,6 @@ function createStartupSplashWindow(): void {
 /** 获取主窗口实例（供其他模块使用） */
 export function getMainWindow(): BrowserWindow | null {
   return getStoredMainWindow()
-}
-
-function installWindowsZoomInFallback(win: BrowserWindow): void {
-  if (process.platform !== 'win32') return
-
-  win.webContents.on('before-input-event', (event, input) => {
-    if (input.type !== 'keyDown' || !input.control || input.alt || input.meta) return
-
-    // Windows 下主键盘的 Ctrl++ 常会以 Ctrl+= 上报；小键盘加号也需要兜底。
-    const key = input.key.toLowerCase()
-    if (!['=', '+', 'numadd', 'add'].includes(key)) return
-
-    event.preventDefault()
-    const currentZoomLevel = win.webContents.getZoomLevel()
-    win.webContents.setZoomLevel(Math.min(currentZoomLevel + 0.5, 9))
-  })
 }
 
 /**
@@ -490,6 +492,8 @@ function createWindow(): void {
     minHeight: MIN_MAIN_WINDOW_HEIGHT,
     icon: iconExists ? iconPath : undefined,
     show: false,
+    // 与 Renderer 启动画面的底色一致：首帧之前也不会露出桌面或白屏。
+    backgroundColor: '#1b3f2d',
     webPreferences: {
       preload: join(__dirname, 'preload.cjs'),
       contextIsolation: true,
@@ -502,7 +506,6 @@ function createWindow(): void {
     ...titleBarOptions,
   })
   setStoredMainWindow(mainWindow)
-  installWindowsZoomInFallback(mainWindow)
   browserController.setOwnerWindow(mainWindow)
 
   // Load the renderer
@@ -518,7 +521,7 @@ function createWindow(): void {
       : mainWindow.loadFile(rendererPath)
   }
 
-  // 主 Renderer 无法加载或崩溃时，不能让启动页无限停留；优先有限次数自动恢复。
+  // 主 Renderer 无法加载或崩溃时，不能让用户停在空白窗口；优先有限次数自动恢复。
   let hasShownRendererFailure = false
   let rendererRecoveryAttempts: number[] = []
   const showRendererFailure = (reason: string): void => {
@@ -603,9 +606,11 @@ function createWindow(): void {
     if (process.platform === 'darwin' && app.dock) {
       app.dock.show()
     }
-    // 仅在主窗口首帧已完成合成后移除原生启动页，避免冷启动时的空白与闪屏。
-    dismissStartupSplash()
+    // 先让主窗口完成首帧合成，再移除启动页：反过来先销毁会露出一帧桌面（闪一下）。
     mainWindow?.show()
+    if (startupSplashWindow) {
+      setTimeout(() => dismissStartupSplash(), 120)
+    }
   })
 
   // 持久化窗口大小和位置（防抖 500ms，避免频繁写入）
@@ -718,15 +723,20 @@ app.whenReady().then(bootstrap).catch(handleBootstrapFailure)
  * 单点失败不应阻止窗口和托盘的创建（用户至少要能看到界面）。
  */
 async function bootstrap(): Promise<void> {
-  // 初始化 Proma 版本号（供 User-Agent 等全局标识使用）
-  setPromaVersion(app.getVersion())
-
   // 先显示不依赖 Renderer 的静态启动页；运行时检测耗时不会再变成用户可见的空白。
   createStartupSplashWindow()
+
+  // 初始化 Proma 版本号（供 User-Agent 等全局标识使用）
+  setPromaVersion(app.getVersion())
 
   // 注册自定义协议 proma-file:// 用于内联预览本地文件。
   // 协议只接受主进程签发的 opaque token，不解析 renderer 提供的绝对路径。
   protocol.handle('proma-file', handlePromaFileRequest)
+
+  // 系统网络策略：外网请求等待系统代理配置；网络切换后统一恢复并递增 epoch。
+  installDefaultSessionNetworkGuard()
+  installNetworkRecoveryObservers()
+  await safeAwait('initializeSystemNetwork', () => initializeSystemNetwork())
 
   // 初始化运行时环境。Node.js 仅由 npx / npm 型 MCP 在实际连接时使用，
   // 或由用户从设置手动检测；启动时不应将其作为 Agent 的前置要求。
@@ -769,43 +779,15 @@ async function bootstrap(): Promise<void> {
   createWindow()
 
   // Create system tray icon
-  const hoverWin = process.platform === 'win32' ? getAgentStatusHoverWindow() : null
-  if (hoverWin) safeRun('ensureHoverWindow', () => hoverWin.ensureCreated())
-
   createTray({
     showMainWindow: showAndFocusMainWindow,
     openAgentSession: (sessionId, title) => {
       sendToMainWindow(TRAY_IPC_CHANNELS.OPEN_AGENT_SESSION, { sessionId, title })
     },
-    createChatSession: () => {
-      sendToMainWindow(TRAY_IPC_CHANNELS.CREATE_SESSION, { mode: 'chat' })
-    },
     createAgentSession: () => {
       sendToMainWindow(TRAY_IPC_CHANNELS.CREATE_SESSION, { mode: 'agent' })
     },
-    onTrayMouseEnter: hoverWin ? (bounds) => hoverWin.onTrayMouseEnter(bounds) : undefined,
-    onTrayMouseMove: hoverWin ? (bounds) => hoverWin.onTrayMouseMove(bounds) : undefined,
-    onTrayMouseLeave: hoverWin ? () => hoverWin.onTrayMouseLeave() : undefined,
   })
-
-  // Windows: 将 Agent Island surface 的 pill 状态接入托盘图标 + tooltip + 通知
-  if (process.platform === 'win32') {
-    const surface = getWindowsAgentIslandSurface()
-    surface.onTrayFlash = (flashing) => setTrayFlash(flashing)
-
-    const notificationDeps: SurfaceDeps = {
-      sendPlaySound: (type) => {
-        const win = getMainWindow()
-        if (win) win.webContents.send(WINDOWS_AGENT_ISLAND_IPC_CHANNELS.PLAY_SOUND, { type })
-      },
-      soundEnabled: () => getSettings().notificationSoundEnabled ?? true,
-    }
-    surface.onNotification = (transition) => processNotification(transition, notificationDeps)
-
-    if (hoverWin) {
-      surface.onHoverWindowUpdate = (snapshot) => hoverWin.updateSnapshot(snapshot)
-    }
-  }
 
   // 启动工作区文件监听（Agent MCP/Skills + 文件浏览器自动刷新）
   if (mainWindow) {
@@ -823,25 +805,9 @@ async function bootstrap(): Promise<void> {
 
   // 预创建快速任务窗口（隐藏状态，首次唤起秒开）
   safeRun('createQuickTaskWindow', createQuickTaskWindow)
+  safeRun('createQuickCaptureTodoWindow', createQuickCaptureTodoWindow)
   if (getSettings().voiceDictation?.enabled === true) {
     safeRun('createVoiceDictationWindow', createVoiceDictationWindow)
-  }
-
-  // Agent Island 状态机在 macOS 和 Windows 都初始化；Swift surface 仅 macOS 26+。
-  if (isAgentIslandServiceSupported()) {
-    safeRun('initAgentIslandService', () => {
-      initAgentIslandService({
-        showAndFocusMainWindow,
-        openAgentSession: (sessionId, title) => {
-          sendToMainWindow(TRAY_IPC_CHANNELS.OPEN_AGENT_SESSION, { sessionId, title })
-        },
-        enabled: () => getSettings().agentIsland?.enabled !== false,
-      })
-    })
-  }
-
-  if (isMacAgentIslandSurfaceSupported()) {
-    safeRun('startAgentIslandSurface', startAgentIslandSurface)
   }
 
   // 飞书实时同步开启时，默认阻止系统自动休眠，保证远程群内继续可用。
@@ -850,6 +816,9 @@ async function bootstrap(): Promise<void> {
   // 注册全局快捷键
   safeRun('registerGlobalShortcut:quick-task', () =>
     registerGlobalShortcut('quick-task', toggleQuickTaskWindow),
+  )
+  safeRun('registerGlobalShortcut:quick-capture-todo', () =>
+    registerGlobalShortcut('quick-capture-todo', toggleQuickCaptureTodoWindow),
   )
   safeRun('registerGlobalShortcut:show-main-window', () =>
     registerGlobalShortcut('show-main-window', showAndFocusMainWindow),
@@ -950,7 +919,6 @@ app.on('before-quit', () => {
   stopAllAgents()
   void stopAllTerminals()
   browserController.dispose()
-  stopAllGenerations()
   // 清理更新器定时器
   cleanupUpdater()
   // 停止工作区文件监听
@@ -970,11 +938,9 @@ app.on('before-quit', () => {
   unregisterAllGlobalShortcuts()
   // 销毁辅助窗口
   destroyQuickTaskWindow()
+  destroyQuickCaptureTodoWindow()
   destroyVoiceDictationWindow()
-  destroyAgentStatusHoverWindow()
-  // 销毁原生 macOS 灵动岛服务（其他平台从未创建 surface）
-  disposeMacAgentIslandNativeHost()
-  disposeAgentIslandService()
+  disposePlanQuotaService()
   // 关闭 Pi MCP 桥接连接（释放 stdio 子进程）
   disposePiMcpConnections().catch(() => {})
   // Clean up system tray before quitting

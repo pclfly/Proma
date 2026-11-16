@@ -7,15 +7,17 @@
 
 import * as React from 'react'
 import { useAtom } from 'jotai'
-import { Camera, Check, ExternalLink, ImagePlus, Play, Volume2 } from 'lucide-react'
+import {
+  Camera,
+  Check,
+  ExternalLink,
+  ImagePlus,
+  Play,
+  Volume2,
+} from 'lucide-react'
 import Picker from '@emoji-mart/react'
 import data from '@emoji-mart/data'
-import {
-  SettingsSection,
-  SettingsCard,
-  SettingsRow,
-  SettingsToggle,
-} from './primitives'
+import { SettingsSection, SettingsCard, SettingsRow, SettingsToggle } from './primitives'
 import { Popover, PopoverTrigger, PopoverContent } from '../ui/popover'
 import {
   Select,
@@ -24,7 +26,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '../ui/select'
-import { UserAvatar } from '../chat/UserAvatar'
+import { UserAvatar } from '../session-shared/UserAvatar'
 import { userProfileAtom } from '@/atoms/user-profile'
 import {
   notificationsEnabledAtom,
@@ -48,7 +50,6 @@ import {
   updateSessionHoverPreviewEnabled,
 } from '@/atoms/ui-preferences'
 import { cn } from '@/lib/utils'
-import { detectIsMac, detectIsWindows } from '@/lib/platform'
 import { getEffectiveSoundPackId } from '@/lib/notification-sound-selection'
 import type { NotificationSoundId, NotificationSoundType, NotificationSoundSettings, ProductivityToolsSettings } from '@/types/settings'
 
@@ -75,19 +76,18 @@ export function GeneralSettings(): React.ReactElement {
   const [nameInput, setNameInput] = React.useState(userProfile.userName)
   const [showEmojiPicker, setShowEmojiPicker] = React.useState(false)
   const [archiveAfterDays, setArchiveAfterDays] = React.useState<number>(7)
+  /** Agent 请求 HTTP 空闲超时（秒）；0 = 不限制 */
+  const [httpIdleTimeoutSeconds, setHttpIdleTimeoutSeconds] = React.useState<number>(300)
   /** Git/PR 推广标识：默认开启 */
   const [gitAttributionEnabled, setGitAttributionEnabled] = React.useState(true)
-  const [agentIslandEnabled, setAgentIslandEnabled] = React.useState(true)
-  const isMac = React.useMemo(() => detectIsMac(), [])
-  const isWindows = React.useMemo(() => detectIsWindows(), [])
   const fileInputRef = React.useRef<HTMLInputElement>(null)
 
   // 加载归档天数与 Git/PR 标识设置
   React.useEffect(() => {
     window.electronAPI.getSettings().then((settings) => {
       setArchiveAfterDays(settings.archiveAfterDays ?? 7)
+      setHttpIdleTimeoutSeconds(Math.round((settings.agentHttpIdleTimeoutMs ?? 300_000) / 1000))
       setGitAttributionEnabled(settings.gitAttributionEnabled ?? true)
-      setAgentIslandEnabled(settings.agentIsland?.enabled ?? true)
     }).catch(console.error)
   }, [])
 
@@ -114,17 +114,6 @@ export function GeneralSettings(): React.ReactElement {
     }
   }
 
-  /** 更新灵动岛开关 */
-  const handleAgentIslandChange = async (checked: boolean): Promise<void> => {
-    setAgentIslandEnabled(checked)
-    try {
-      await window.electronAPI.updateSettings({ agentIsland: { enabled: checked } })
-    } catch (error) {
-      console.error('[通用设置] 更新 Agent 灵动岛失败:', error)
-      setAgentIslandEnabled(!checked)
-    }
-  }
-
   /** 更新归档天数 */
   const handleArchiveDaysChange = async (value: string): Promise<void> => {
     const days = parseInt(value, 10)
@@ -133,6 +122,18 @@ export function GeneralSettings(): React.ReactElement {
       await window.electronAPI.updateSettings({ archiveAfterDays: days })
     } catch (error) {
       console.error('[通用设置] 更新归档天数失败:', error)
+    }
+  }
+
+  /** 更新 Agent 请求空闲超时；秒数换算成毫秒落盘，0 表示不限制。 */
+  const handleHttpIdleTimeoutChange = async (value: string): Promise<void> => {
+    const seconds = Number.parseInt(value, 10)
+    if (!Number.isFinite(seconds) || seconds < 0) return
+    setHttpIdleTimeoutSeconds(seconds)
+    try {
+      await window.electronAPI.updateSettings({ agentHttpIdleTimeoutMs: seconds * 1000 })
+    } catch (error) {
+      console.error('[通用设置] 更新请求空闲超时失败:', error)
     }
   }
 
@@ -358,17 +359,6 @@ export function GeneralSettings(): React.ReactElement {
               <ExternalLink className="size-3" />
             </a>
           </div>
-          {isWindows && (
-            <SettingsToggle
-              label="Agent 状态通知"
-              description="在任务栏托盘显示 Agent 运行状态，悬停查看会话详情"
-              checked={agentIslandEnabled}
-              disabled={!notificationsEnabled}
-              onCheckedChange={(checked) => {
-                void handleAgentIslandChange(checked)
-              }}
-            />
-          )}
           <SettingsRow
             label="自动归档"
             description="超过指定天数未更新的对话将自动归档（置顶对话除外）"
@@ -383,6 +373,24 @@ export function GeneralSettings(): React.ReactElement {
                 <SelectItem value="14">14 天</SelectItem>
                 <SelectItem value="30">30 天</SelectItem>
                 <SelectItem value="60">60 天</SelectItem>
+              </SelectContent>
+            </Select>
+          </SettingsRow>
+          <SettingsRow
+            label="Agent 请求超时"
+            description="等待响应头及流式响应相邻数据块之间的最大空闲时间；长思考或上游慢吐字被提前断开时调大，0 = 不限制"
+          >
+            <Select value={String(httpIdleTimeoutSeconds)} onValueChange={handleHttpIdleTimeoutChange}>
+              <SelectTrigger className="w-[120px] h-8 text-[13px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="60">1 分钟</SelectItem>
+                <SelectItem value="120">2 分钟</SelectItem>
+                <SelectItem value="300">5 分钟</SelectItem>
+                <SelectItem value="600">10 分钟</SelectItem>
+                <SelectItem value="1800">30 分钟</SelectItem>
+                <SelectItem value="0">不限制</SelectItem>
               </SelectContent>
             </Select>
           </SettingsRow>
@@ -413,16 +421,6 @@ export function GeneralSettings(): React.ReactElement {
               updateSessionHoverPreviewEnabled(checked)
             }}
           />
-          {isMac && (
-            <SettingsToggle
-              label="Agent 灵动岛"
-              description="在 macOS 刘海屏显示需要接手的 Agent 与 1 小时内的待办/日程"
-              checked={agentIslandEnabled}
-              onCheckedChange={(checked) => {
-                void handleAgentIslandChange(checked)
-              }}
-            />
-          )}
           <SettingsToggle
             label="Git/PR 标识"
             description="Agent 代你提交 commit 或创建 PR 时，附加 Made-with: Proma 与官网链接，便于推广；可随时关闭"

@@ -4,13 +4,22 @@
  * Claude runtime 继续使用 Claude Agent SDK 原生 mcpServers；Pi SDK 当前没有等价
  * mcpServers 参数，因此 Proma 在主进程连接用户配置的 MCP server，并把 MCP tools
  * 映射成 Pi customTools。
+ *
+ * 连接管理对齐官方 0.22.0 `src/main/lib/adapters/pi-mcp-tools.ts`：
+ * - 每个 (server, configHash) 一条共享连接，按租约计数，最后一个租约释放后关闭；
+ * - entry 级 AbortController + lifecycleGeneration，dispose 时取消在途握手；
+ * - Streamable HTTP session 失效（404 / 400 session 错误）时自动重新握手；
+ * - remote transport error 时淘汰连接，等待下次调用重建。
+ *
+ * 本地保留：per-server `proxyUrl`（createManagedProxyFetch）与全局代理 fetch。
+ * 默认 manager 已接入系统网络运行时：先 `ensureReady()`，再按 networkEpoch
+ * 淘汰远程连接；配置了 per-server 代理时仍优先使用该代理。
  */
 
 import { createHash } from 'node:crypto'
-import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
+import type { FetchLike, Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
 import { StreamableHTTPClientTransport, StreamableHTTPError } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import type { ToolDefinition } from '@earendil-works/pi-coding-agent'
 import type { AgentToolResult } from '@earendil-works/pi-agent-core'
@@ -19,6 +28,13 @@ import type { TSchema } from 'typebox'
 import { Type } from 'typebox'
 import { createManagedProxyFetch, type ManagedProxyFetch } from '../proxy-fetch'
 import { sanitizeToolResultImageContent } from '../image-content-validation'
+import {
+  connectMcpClient,
+  createRemoteMcpTransport,
+  normalizeMcpTransportError,
+  withMcpSignal,
+} from '../network/mcp-transport'
+import { NetworkRequestError } from '../network/network-errors'
 
 const DEFAULT_MCP_REQUEST_TIMEOUT_MS = 60_000
 const DEFAULT_MCP_STARTUP_TIMEOUT_MS = 30_000
@@ -32,7 +48,6 @@ const REQUIRED_MCP_FAILURE_COOLDOWN_MS = 2 * 60_000
 /** 失败冷却表的防御性上限；超出时淘汰最旧记录，避免配置频繁变更导致无限增长。 */
 const REQUIRED_MCP_FAILURE_CACHE_LIMIT = 64
 const HTTP_SESSION_REJECTION_PATTERN = /missing session id|no valid session id provided|mcp-session-id header is required/i
-const transportProxyFetches = new WeakMap<Transport, ManagedProxyFetch>()
 
 /** required MCP 最近一次工具发现失败的时间（key: serverName + 配置摘要）。 */
 const requiredMcpFailureTimestamps = new Map<string, number>()
@@ -73,7 +88,15 @@ interface McpConnection {
   toolsPromise?: Promise<McpToolInfo[]>
 }
 
+interface McpConnectionState {
+  /** 连接被淘汰/关闭后为 true；fetcher 会据此拒绝新的网络请求。 */
+  retired: boolean
+  controller: AbortController
+}
+
 interface McpConnectionEntry {
+  remote: boolean
+  state: McpConnectionState
   promise: Promise<McpConnection>
   activeLeases: number
   stale: boolean
@@ -92,6 +115,32 @@ interface McpToolBinding {
   tool: McpToolInfo
   manager: PiMcpClientManager
   managerConfig: PiMcpServerConfig
+}
+
+/**
+ * 系统网络运行时最小接口。
+ *
+ * 官方 `systemNetwork` 提供 ensureReady / snapshot().networkEpoch / subscribe。
+ * 本地子集只消费 epoch 订阅；当它变化时淘汰所有远程连接，等待下次调用重建。
+ * 未来接入系统网络时，provider 需先完成 ensureReady 再返回 source。
+ */
+export interface PiMcpNetworkRuntime {
+  /** 等待系统网络策略就绪；旧 runtime 可省略。 */
+  ensureReady?(): Promise<void>
+  snapshot(): { networkEpoch: number }
+  subscribe(listener: () => void): () => void
+}
+
+export interface PiMcpClientManagerDependencies {
+  /** 系统网络 fetcher；未提供时使用 per-server 代理 fetch 或全局 fetch。 */
+  fetcher?: FetchLike
+  /** 系统网络运行时 provider；未提供时使用空实现（本地子集）。 */
+  network?: () => Promise<PiMcpNetworkRuntime>
+}
+
+const idleMcpNetworkRuntime: PiMcpNetworkRuntime = {
+  snapshot: () => ({ networkEpoch: 0 }),
+  subscribe: () => () => undefined,
 }
 
 function stableStringify(value: unknown): string {
@@ -141,7 +190,17 @@ function getProxyFetch(config: PiMcpServerConfig): ManagedProxyFetch | undefined
     : undefined
 }
 
-function createTransport(name: string, config: PiMcpServerConfig): Transport | undefined {
+function isRemoteConfig(config: PiMcpServerConfig): boolean {
+  return config.type === 'http' || config.type === 'sse'
+}
+
+/**
+ * 构造 transport。
+ *
+ * stdio 分支与移植前完全一致；远程分支统一走 `network/mcp-transport`，
+ * 由它负责 URL 校验、headers 注入与 fetch 选择。
+ */
+function createTransport(name: string, config: PiMcpServerConfig, fetcher: FetchLike): Transport | undefined {
   const type = config.type
   if (type === 'stdio') {
     if (typeof config.command !== 'string' || !config.command.trim()) {
@@ -159,43 +218,11 @@ function createTransport(name: string, config: PiMcpServerConfig): Transport | u
     })
   }
 
-  if (type === 'http') {
+  if (type === 'http' || type === 'sse') {
     if (typeof config.url !== 'string' || !config.url.trim()) {
-      console.warn(`[Pi MCP] MCP 服务器 ${name} 缺少 url，已跳过`)
-      return undefined
+      throw new Error('MCP服务器缺少 url')
     }
-    const headers = getHeaders(config)
-    const proxyFetch = getProxyFetch(config)
-    const transport = new StreamableHTTPClientTransport(new URL(config.url), {
-      requestInit: headers ? { headers } : undefined,
-      fetch: proxyFetch?.fetch,
-    })
-    if (proxyFetch) transportProxyFetches.set(transport, proxyFetch)
-    return transport
-  }
-
-  if (type === 'sse') {
-    if (typeof config.url !== 'string' || !config.url.trim()) {
-      console.warn(`[Pi MCP] MCP 服务器 ${name} 缺少 url，已跳过`)
-      return undefined
-    }
-    const headers = getHeaders(config)
-    const proxyFetch = getProxyFetch(config)
-    const transport = new SSEClientTransport(new URL(config.url), {
-      requestInit: headers ? { headers } : undefined,
-      fetch: proxyFetch?.fetch,
-      eventSourceInit: headers || proxyFetch
-        ? ({
-          fetch: (input: RequestInfo | URL, init?: RequestInit) => {
-            const mergedHeaders = new Headers(init?.headers)
-            for (const [key, value] of Object.entries(headers ?? {})) mergedHeaders.set(key, value)
-            return (proxyFetch?.fetch ?? fetch)(input, { ...init, headers: mergedHeaders })
-          },
-        } as any)
-        : undefined,
-    })
-    if (proxyFetch) transportProxyFetches.set(transport, proxyFetch)
-    return transport
+    return createRemoteMcpTransport(type, config.url, getHeaders(config), fetcher)
   }
 
   console.warn(`[Pi MCP] MCP 服务器 ${name} 使用暂不支持的类型 ${String(type)}，已跳过`)
@@ -311,9 +338,72 @@ async function listRequiredMcpTools(
   }
 }
 
-class PiMcpClientManager {
+export class PiMcpClientManager {
+  private readonly dependencies: PiMcpClientManagerDependencies
+  private readonly fetcher: FetchLike
   private readonly connections = new Map<string, McpConnectionEntry>()
+  private readonly allEntries = new Set<McpConnectionEntry>()
   private lifecycleGeneration = 0
+  private networkReady?: Promise<void>
+  private unsubscribeNetwork?: () => void
+
+  constructor(dependencies: PiMcpClientManagerDependencies = {}) {
+    this.dependencies = dependencies
+    this.fetcher = dependencies.fetcher ?? ((input, init) => fetch(input, init))
+  }
+
+  /**
+   * 等待系统网络就绪，并订阅 networkEpoch 变化。
+   * 本地子集：默认 runtime 恒为 epoch 0，不会淘汰连接；接入系统网络后由
+   * provider 返回真实 runtime 即可获得官方的“网络切换后重连”行为。
+   */
+  private ensureNetwork(): Promise<void> {
+    if (!this.networkReady) {
+      const generation = this.lifecycleGeneration
+      this.networkReady = (async () => {
+        const source = this.dependencies.network
+          ? await this.dependencies.network()
+          : idleMcpNetworkRuntime
+        await source.ensureReady?.()
+        if (generation !== this.lifecycleGeneration) throw new Error('MCP生命周期已结束')
+
+        let epoch = source.snapshot().networkEpoch
+        this.unsubscribeNetwork = source.subscribe(() => {
+          const next = source.snapshot().networkEpoch
+          if (next === epoch) return
+          epoch = next
+          for (const [key, entry] of this.connections) {
+            if (entry.remote) this.retireEntry(key, entry)
+          }
+          requiredMcpFailureTimestamps.clear()
+        })
+      })().catch((error: unknown) => {
+        if (generation === this.lifecycleGeneration) this.networkReady = undefined
+        throw error
+      })
+    }
+    return this.networkReady
+  }
+
+  private retireEntry(key: string, entry: McpConnectionEntry): void {
+    entry.stale = true
+    entry.state.retired = true
+    if (this.connections.get(key) === entry) this.connections.delete(key)
+    if (entry.activeLeases === 0) void this.closeEntry(entry)
+  }
+
+  private async closeEntry(entry: McpConnectionEntry): Promise<void> {
+    if (entry.closed) return
+    entry.closed = true
+    entry.state.controller.abort()
+    this.allEntries.delete(entry)
+    try {
+      const connection = await entry.promise
+      await connection.close()
+    } catch {
+      // 连接本身失败或已被服务端关闭，忽略清理错误。
+    }
+  }
 
   /**
    * 关闭所有活跃的 MCP 连接，释放 stdio 子进程和网络资源。
@@ -321,23 +411,22 @@ class PiMcpClientManager {
    */
   async dispose(): Promise<void> {
     this.lifecycleGeneration += 1
-    const entries = [...this.connections.values()]
+    this.unsubscribeNetwork?.()
+    this.unsubscribeNetwork = undefined
+    this.networkReady = undefined
+
+    const entries = [...this.allEntries]
     this.connections.clear()
     requiredMcpFailureTimestamps.clear()
-    await Promise.allSettled(
-      entries.map(async (entry) => {
-        try {
-          const conn = await entry.promise
-          await conn.close()
-        } catch {
-          // 连接本身就失败了，忽略
-        }
-      }),
-    )
+    for (const entry of entries) {
+      entry.stale = true
+      entry.state.retired = true
+    }
+    await Promise.allSettled(entries.map((entry) => this.closeEntry(entry)))
   }
 
   async listTools(serverName: string, config: PiMcpServerConfig): Promise<McpToolInfo[]> {
-    return this.executeWithSessionRecovery(serverName, config, undefined, async (connection) => {
+    return this.executeWithSessionRecovery(serverName, config, undefined, true, async (connection) => {
       if (connection.tools) return connection.tools
       if (!connection.toolsPromise) {
         connection.toolsPromise = connection.client.listTools(undefined, { timeout: DEFAULT_MCP_REQUEST_TIMEOUT_MS })
@@ -355,7 +444,7 @@ class PiMcpClientManager {
   }
 
   async callTool(serverName: string, config: PiMcpServerConfig, toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<McpCallToolResult> {
-    return this.executeWithSessionRecovery(serverName, config, signal, (connection) =>
+    return this.executeWithSessionRecovery(serverName, config, signal, false, (connection) =>
       connection.client.callTool(
         { name: toolName, arguments: args },
         undefined,
@@ -367,15 +456,20 @@ class PiMcpClientManager {
     serverName: string,
     config: PiMcpServerConfig,
     signal: AbortSignal | undefined,
+    allowReplay: boolean,
     operation: (connection: McpConnection) => Promise<T>,
   ): Promise<T> {
     const lifecycleGeneration = this.lifecycleGeneration
-    const lease = await this.acquireConnection(serverName, config)
+    signal?.throwIfAborted()
+    const lease = await this.acquireConnection(serverName, config, signal)
     let leaseReleased = false
     try {
       try {
+        signal?.throwIfAborted()
         return await operation(lease.connection)
       } catch (error) {
+        // 远程连接在任意调用错误后都视为不可复用；stdio 保持原行为。
+        if (lease.entry.remote) this.markConnectionStale(lease)
         if (!this.isRejectedHttpSession(error, lease.connection)) {
           throw error
         }
@@ -383,11 +477,11 @@ class PiMcpClientManager {
         this.markConnectionStale(lease)
         await this.releaseConnection(lease)
         leaseReleased = true
-        if (signal?.aborted || this.lifecycleGeneration !== lifecycleGeneration) throw error
+        if (!allowReplay || signal?.aborted || this.lifecycleGeneration !== lifecycleGeneration) throw error
 
         console.info(`[Pi MCP] MCP 服务器 ${serverName} Session 已失效，正在重新握手`)
 
-        const replacement = await this.acquireConnection(serverName, config)
+        const replacement = await this.acquireConnection(serverName, config, signal)
         try {
           try {
             return await operation(replacement.connection)
@@ -416,26 +510,43 @@ class PiMcpClientManager {
     return error.code === 400 && HTTP_SESSION_REJECTION_PATTERN.test(error.message)
   }
 
-  private async acquireConnection(serverName: string, config: PiMcpServerConfig): Promise<McpConnectionLease> {
+  private async acquireConnection(
+    serverName: string,
+    config: PiMcpServerConfig,
+    signal: AbortSignal | undefined,
+  ): Promise<McpConnectionLease> {
+    const remote = isRemoteConfig(config)
+    if (remote) await withMcpSignal(this.ensureNetwork(), signal)
+    signal?.throwIfAborted()
+
     const key = `${serverName}:${configHash(config)}`
     let entry = this.connections.get(key)
 
     if (!entry) {
       let createdEntry!: McpConnectionEntry
-      const promise = this.createConnection(serverName, config, () => {
+      const state: McpConnectionState = { retired: false, controller: new AbortController() }
+      const promise = this.createConnection(serverName, config, state, () => {
         createdEntry.stale = true
-        createdEntry.closed = true
+        state.retired = true
+        this.allEntries.delete(createdEntry)
         if (this.connections.get(key) === createdEntry) {
           this.connections.delete(key)
         }
-      }).catch((error) => {
+        // transport 已由服务端/自身关闭，但仍需释放 per-server 代理 dispatcher。
+        void this.closeEntry(createdEntry)
+      }, () => {
+        if (remote) this.retireEntry(key, createdEntry)
+      }).catch((error: unknown) => {
         createdEntry.stale = true
+        this.allEntries.delete(createdEntry)
         if (this.connections.get(key) === createdEntry) {
           this.connections.delete(key)
         }
         throw error
       })
       createdEntry = {
+        remote,
+        state,
         promise,
         activeLeases: 0,
         stale: false,
@@ -443,6 +554,7 @@ class PiMcpClientManager {
       }
       entry = createdEntry
       this.connections.set(key, entry)
+      this.allEntries.add(entry)
     }
 
     entry.activeLeases += 1
@@ -450,60 +562,79 @@ class PiMcpClientManager {
       return {
         key,
         entry,
-        connection: await entry.promise,
+        connection: await withMcpSignal(entry.promise, signal),
       }
     } catch (error) {
       entry.activeLeases -= 1
+      if (entry.activeLeases === 0 && signal?.aborted) this.retireEntry(key, entry)
       throw error
     }
   }
 
   private markConnectionStale(lease: McpConnectionLease): void {
-    lease.entry.stale = true
-    if (this.connections.get(lease.key) === lease.entry) {
-      this.connections.delete(lease.key)
-    }
+    this.retireEntry(lease.key, lease.entry)
   }
 
   private async releaseConnection(lease: McpConnectionLease): Promise<void> {
     lease.entry.activeLeases -= 1
-    if (!lease.entry.stale || lease.entry.closed || lease.entry.activeLeases > 0) return
-    try {
-      await lease.connection.close()
-    } catch {
-      // Session 已由服务端终止，关闭旧 transport 失败不影响重新握手。
-    }
+    if (lease.entry.stale && lease.entry.activeLeases === 0) await this.closeEntry(lease.entry)
   }
 
   private async createConnection(
     serverName: string,
     config: PiMcpServerConfig,
+    state: McpConnectionState,
     onClose: () => void,
+    onStale: () => void,
   ): Promise<McpConnection> {
-    const transport = createTransport(serverName, config)
-    if (!transport) throw new Error(`无法创建 MCP transport: ${serverName}`)
-    const proxyFetch = transportProxyFetches.get(transport)
+    const remote = isRemoteConfig(config)
+    const proxyFetch = remote ? getProxyFetch(config) : undefined
+    const baseFetcher: FetchLike = proxyFetch?.fetch ?? this.fetcher
+
+    // 所有远程请求都带上 entry 级 signal：dispose / 淘汰时立即中断在途请求。
+    const entryFetcher: FetchLike = async (input, init) => {
+      if (state.retired) throw new NetworkRequestError('connect', 'mcp')
+      const signals = init?.signal
+        ? [state.controller.signal, init.signal]
+        : [state.controller.signal]
+      return baseFetcher(input, { ...init, signal: AbortSignal.any(signals) })
+    }
+
+    let transport: Transport | undefined
+    try {
+      transport = createTransport(serverName, config, entryFetcher)
+    } catch (error) {
+      await proxyFetch?.close()
+      throw normalizeMcpTransportError(error, 'mcp')
+    }
+    if (!transport) {
+      await proxyFetch?.close()
+      throw new Error(`无法创建 MCP transport: ${serverName}`)
+    }
 
     const client = new Client({ name: 'proma-pi-agent-mcp-bridge', version: '0.1.0' }, { capabilities: {} })
     try {
-      await client.connect(transport, { timeout: getTimeoutMs(config) })
+      await connectMcpClient(client, transport, getTimeoutMs(config), state.controller.signal)
     } catch (error) {
-      try { await transport.close() } catch { /* connection setup already failed */ }
+      // connectMcpClient 已关闭 transport；这里只需释放代理 dispatcher。
       await proxyFetch?.close()
-      throw error
+      throw normalizeMcpTransportError(error, 'mcp')
     }
 
+    const activeTransport = transport
     let closing = false
 
-    const previousOnError = transport.onerror
-    transport.onerror = (error) => {
+    const previousOnError = activeTransport.onerror
+    activeTransport.onerror = (error) => {
       previousOnError?.(error)
       if (!closing) {
-        console.warn(`[Pi MCP] MCP 服务器 ${serverName} transport error:`, error)
+        onStale()
+        // 只记录 name，避免把可能含认证信息的 transport 错误写进日志。
+        console.warn(`[Pi MCP] MCP 服务器 ${serverName} transport error:`, error.name)
       }
     }
-    const previousOnClose = transport.onclose
-    transport.onclose = () => {
+    const previousOnClose = activeTransport.onclose
+    activeTransport.onclose = () => {
       closing = true
       previousOnClose?.()
       onClose()
@@ -511,11 +642,12 @@ class PiMcpClientManager {
 
     return {
       client,
-      transport,
+      transport: activeTransport,
+      proxyFetch,
       close: async () => {
         closing = true
         try {
-          await transport.close()
+          await activeTransport.close()
         } finally {
           await proxyFetch?.close()
         }
@@ -524,7 +656,20 @@ class PiMcpClientManager {
   }
 }
 
-const manager = new PiMcpClientManager()
+const manager = new PiMcpClientManager({
+  network: async () => {
+    const { systemNetwork } = await import('../network/system-network-runtime')
+    return {
+      ensureReady: () => systemNetwork.ensureReady(),
+      snapshot: () => systemNetwork.snapshot(),
+      subscribe: (listener) => systemNetwork.subscribe(() => listener()),
+    }
+  },
+  fetcher: async (input, init) => {
+    const { getSystemFetch } = await import('../network/system-network-runtime')
+    return getSystemFetch('mcp')(input, init)
+  },
+})
 
 function createPiMcpToolDefinition(binding: McpToolBinding): ToolDefinition {
   const toolName = mcpToolName(binding.serverName, binding.originalToolName)

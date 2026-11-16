@@ -13,16 +13,8 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { cn } from '@/lib/utils'
-import {
-  SettingsSection,
-  SettingsCard,
-  SettingsToggle,
-} from './primitives'
-import {
-  promptConfigAtom,
-  selectedPromptIdAtom,
-  defaultPromptIdAtom,
-} from '@/atoms/system-prompt-atoms'
+import { SettingsSection, SettingsCard, SettingsToggle } from './primitives'
+import { promptConfigAtom, selectedPromptIdAtom, defaultPromptIdAtom } from '@/atoms/system-prompt-atoms'
 import type { SystemPrompt, SystemPromptCreateInput, SystemPromptUpdateInput } from '@proma/shared'
 
 /** 防抖保存延迟 (ms) */
@@ -161,7 +153,7 @@ export function PromptSettings(): React.ReactElement {
       {/* 提示词列表 */}
       <SettingsSection
         title="系统提示词"
-        description="管理 Chat 模式的系统提示词"
+        description="管理可复用提示词资料；不会自动注入 Agent 或修改项目指令"
         action={
           <Button size="sm" onClick={handleCreate}>
             <Plus className="size-4 mr-1" />

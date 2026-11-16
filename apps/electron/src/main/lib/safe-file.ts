@@ -41,7 +41,12 @@ export function writeJsonFileAtomic(filePath: string, data: object, skipBackup =
  * directory could pre-create it as a symlink. `wx` creates a private sibling
  * exclusively, and rename replaces the target itself rather than following it.
  */
-export function writeTextFileAtomic(filePath: string, content: string): void {
+export interface AtomicTextWriteOptions {
+  /** 临时内容已写好、替换目标前核验调用方的路径与并发约束；失败时保留目标并清理临时文件。 */
+  beforeCommit?: () => void
+}
+
+export function writeTextFileAtomic(filePath: string, content: string, options?: AtomicTextWriteOptions): void {
   const parent = dirname(filePath)
   const stem = basename(filePath)
   let tmpPath: string | null = null
@@ -62,6 +67,7 @@ export function writeTextFileAtomic(filePath: string, content: string): void {
     writeFileSync(descriptor, content, 'utf-8')
     closeSync(descriptor)
     descriptor = null
+    options?.beforeCommit?.()
     renameSync(tmpPath, filePath)
     tmpPath = null
   } finally {

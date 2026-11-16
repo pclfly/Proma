@@ -19,6 +19,7 @@ import type {
   VaultCandidate,
   VaultConfig,
   VaultDeleteInput,
+  VaultDirectoryListing,
   VaultTreeEntry,
   VaultFocus,
   VaultReadResult,
@@ -30,12 +31,15 @@ import type {
 } from '@proma/shared'
 import { getDefaultVaultDir, getVaultConfigPath, resolveDefaultVaultDir } from './config-paths'
 import { readJsonFileSafe, writeJsonFileAtomic, writeTextFileAtomic } from './safe-file'
+import { invalidateKnowledgeMutation } from './knowledge-mutation-invalidation'
 import { isValidImageBytes } from './image-content-validation'
 
 const MAX_VAULT_FILE_BYTES = 2 * 1024 * 1024
 const MAX_VAULT_FILES = 5_000
 const MAX_VAULT_FOLDERS = 1_000
 const MAX_VAULT_DEPTH = 16
+/** 单层目录条目上限：懒加载按层请求，避免一个巨型目录撑爆渲染层。 */
+const MAX_VAULT_DIRECTORY_ENTRIES = 1_000
 const HIDDEN_DIRECTORY_PREFIX = '.'
 const MAX_VAULT_PASTED_IMAGE_BYTES = 10 * 1024 * 1024
 // Reject oversize renderer IPC before decoding into an additional Node Buffer.
@@ -238,6 +242,7 @@ export function getVaultUserContext(sessionId: string): VaultUserContextSnapshot
 
 export interface VaultFileSystem {
   listFiles(): VaultTreeEntry[]
+  listDirectory(relativePath: string, offset?: number): VaultDirectoryListing
   readFile(relativePath: string): VaultReadResult
   resolveMedia(noteRelativePath: string, src: string): string | null
   savePastedImage(input: VaultSavePastedImageInput): { src: string } | null
@@ -304,6 +309,75 @@ export function createVaultFileSystem(rootPath: string): VaultFileSystem {
 
     walk(root, 0)
     return entries.sort((left, right) => left.relativePath.localeCompare(right.relativePath))
+  }
+
+  /**
+   * 只枚举一层目录。与 `listFiles` 的全树遍历相互独立：打开大型 Vault 时
+   * 侧栏只需顶层条目，用户展开哪一层才读取哪一层。
+   */
+  const listDirectory = (relativePath: string, offset = 0): VaultDirectoryListing => {
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('Vault 分页偏移非法')
+    const normalized = normalizeRelativeVaultFolderPath(relativePath)
+    const depth = normalized ? normalized.split('/').length : 0
+    if (depth > MAX_VAULT_DEPTH) throw new Error('Vault 目录层级超过上限')
+    const absoluteDir = getSafeVaultFolderTarget(root, normalized).absolutePath
+    if (!isWithinRoot(root, absoluteDir)) throw new Error('Vault 目录越界')
+
+    let stats: ReturnType<typeof lstatSync>
+    try {
+      stats = lstatSync(absoluteDir)
+    } catch {
+      throw new Error(`Vault 目录不存在: ${normalized}`)
+    }
+    if (stats.isSymbolicLink() || !stats.isDirectory()) throw new Error('Vault 目标不是普通目录')
+
+    const entries: VaultTreeEntry[] = []
+    let dirEntries: import('node:fs').Dirent[]
+    try {
+      dirEntries = readdirSync(absoluteDir, { withFileTypes: true })
+    } catch {
+      throw new Error(`Vault 目录无法读取: ${normalized}`)
+    }
+
+    // 分页前过滤和稳定排序；只 stat 本页文件，单层上限不再隐藏后续笔记。
+    const visible = dirEntries.filter((entry) => (
+      !entry.name.startsWith(HIDDEN_DIRECTORY_PREFIX) && !entry.isSymbolicLink()
+      && ((entry.isDirectory() && depth < MAX_VAULT_DEPTH) || (entry.isFile() && entry.name.toLowerCase().endsWith('.md')))
+    )).sort((left, right) => (
+      left.isDirectory() === right.isDirectory()
+        ? left.name.localeCompare(right.name, undefined, { numeric: true })
+        : left.isDirectory() ? -1 : 1
+    ))
+    const end = Math.min(offset + MAX_VAULT_DIRECTORY_ENTRIES, visible.length)
+    for (const entry of visible.slice(offset, end)) {
+      const absolutePath = join(absoluteDir, entry.name)
+      if (entry.isDirectory()) {
+        // 到达深度上限的文件夹不产出，避免出现展开后永远为空的节点。
+        if (depth >= MAX_VAULT_DEPTH) continue
+        entries.push({ kind: 'folder', relativePath: toRelativePath(root, absolutePath), name: entry.name })
+        continue
+      }
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue
+      try {
+        const fileStats = statSync(absolutePath)
+        entries.push({
+          kind: 'file',
+          relativePath: toRelativePath(root, absolutePath),
+          name: entry.name,
+          size: fileStats.size,
+          modifiedAt: fileStats.mtimeMs,
+        })
+      } catch {
+        // 枚举期间文件可能消失，跳过该条目。
+      }
+    }
+
+    entries.sort((left, right) => (
+      left.kind === right.kind
+        ? left.name.localeCompare(right.name, undefined, { numeric: true })
+        : left.kind === 'folder' ? -1 : 1
+    ))
+    return { relativePath: normalized, entries, truncated: end < visible.length, ...(end < visible.length ? { nextOffset: end } : {}) }
   }
 
   const readFile = (relativePath: string): VaultReadResult => {
@@ -391,7 +465,8 @@ export function createVaultFileSystem(rootPath: string): VaultFileSystem {
     mkdirSync(dirname(target.absolutePath), { recursive: true })
     // Directory creation introduces new ancestors, so validate again before the atomic write.
     const revalidated = getSafeVaultTarget(root, target.relativePath)
-    writeTextFileAtomic(revalidated.absolutePath, input.content)
+    // Vault 与记忆可能指向同一物理文件；用户手动保存必须先取消 Agent 同目标来源候选。
+    writeTextFileAtomic(revalidated.absolutePath, input.content, { beforeCommit: () => invalidateKnowledgeMutation(revalidated.absolutePath) })
     const result = readFile(revalidated.relativePath)
     return { ok: true, relativePath: result.relativePath, sha256: result.sha256, modifiedAt: result.modifiedAt }
   }
@@ -500,7 +575,7 @@ export function createVaultFileSystem(rootPath: string): VaultFileSystem {
     unlinkSync(revalidated.absolutePath)
   }
 
-  return { listFiles, readFile, resolveMedia, savePastedImage, writeFile, createUntitledNote, createUntitledNoteInFolder, createFolder, renameFile, deleteFile }
+  return { listFiles, listDirectory, readFile, resolveMedia, savePastedImage, writeFile, createUntitledNote, createUntitledNoteInFolder, createFolder, renameFile, deleteFile }
 }
 
 
@@ -538,6 +613,44 @@ function vaultId(rootPath: string): string {
   // Renderer state needs to distinguish Vaults, but must not receive the
   // user-authorized absolute path. The digest is stable for the canonical root.
   return createHash('sha256').update(rootPath, 'utf-8').digest('hex')
+}
+
+/** 把相对路径解析为已存在文件夹的绝对路径；复用文件夹路径归一化与穿越防护。 */
+export function resolveVaultFolderAbsPath(relativePath: string): string {
+  const config = getVaultConfig()
+  if (!config) throw new Error('尚未选择 Vault')
+  const target = getSafeVaultFolderTarget(config.rootPath, relativePath)
+  if (!existsSync(target.absolutePath)) throw new Error('Vault 文件夹不存在')
+  return target.absolutePath
+}
+
+/** 把相对路径解析为已存在 Markdown 文件的绝对路径。 */
+export function resolveVaultFileAbsPath(relativePath: string): string {
+  const config = getVaultConfig()
+  if (!config) throw new Error('尚未选择 Vault')
+  const target = getSafeVaultTarget(config.rootPath, relativePath)
+  if (!existsSync(target.absolutePath)) throw new Error('Vault 文件不存在')
+  return target.absolutePath
+}
+
+/**
+ * 校验 Agent 请求展示的 Vault 目标。
+ *
+ * 只做路径归一化与存在性/类型校验，不读取内容：
+ * - file 必须是以 .md 结尾的 Markdown 文件
+ * - folder 必须是已存在的目录
+ * 相对路径由 normalizeRelative* 拒绝穿越、绝对路径与设备别名。
+ */
+export function assertVaultPresentationTarget(rootPath: string, target: { kind: 'file' | 'folder'; relativePath: string }): { kind: 'file' | 'folder'; relativePath: string } {
+  const resolved = target.kind === 'file'
+    ? getSafeVaultTarget(rootPath, target.relativePath)
+    : getSafeVaultFolderTarget(rootPath, target.relativePath)
+  if (!existsSync(resolved.absolutePath)) throw new Error('Vault 展示目标不存在')
+  const stats = lstatSync(resolved.absolutePath)
+  if (target.kind === 'file' ? !stats.isFile() : !stats.isDirectory()) {
+    throw new Error(`Vault 展示目标不是${target.kind === 'file' ? ' Markdown 文件' : '文件夹'}`)
+  }
+  return { kind: target.kind, relativePath: resolved.relativePath }
 }
 
 export function getVaultSummary(): VaultSummary | null {

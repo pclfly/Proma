@@ -12,20 +12,14 @@
 import { useCallback } from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { appModeAtom } from '@/atoms/app-mode'
-import { currentConversationIdAtom } from '@/atoms/chat-atoms'
-import {
-  agentSessionsAtom,
-  currentAgentSessionIdAtom,
-  currentAgentWorkspaceIdAtom,
-  unviewedCompletedSessionIdsAtom,
-} from '@/atoms/agent-atoms'
+
+import { agentSessionsAtom, currentAgentSessionIdAtom, currentAgentWorkspaceIdAtom, unviewedCompletedSessionIdsAtom } from '@/atoms/agent-atoms'
 import type { TabItem } from '@/atoms/tab-atoms'
 
 export type SyncActiveTabSideEffects = (newActiveTab: TabItem | null) => void
 
 export function useSyncActiveTabSideEffects(): SyncActiveTabSideEffects {
   const setAppMode = useSetAtom(appModeAtom)
-  const setCurrentConversationId = useSetAtom(currentConversationIdAtom)
   const setCurrentAgentSessionId = useSetAtom(currentAgentSessionIdAtom)
   const setCurrentAgentWorkspaceId = useSetAtom(currentAgentWorkspaceIdAtom)
   const setUnviewedCompleted = useSetAtom(unviewedCompletedSessionIdsAtom)
@@ -34,24 +28,16 @@ export function useSyncActiveTabSideEffects(): SyncActiveTabSideEffects {
   return useCallback<SyncActiveTabSideEffects>(
     (newActiveTab) => {
       if (!newActiveTab) {
-        // 所有标签都已关闭
-        setCurrentConversationId(null)
         setCurrentAgentSessionId(null)
         return
       }
 
-      if (newActiveTab.type === 'chat') {
-        setAppMode('chat')
-        setCurrentConversationId(newActiveTab.sessionId)
-        setCurrentAgentSessionId(null)
-        return
-      }
+      
 
 
       // Agent / 会话预览
       setAppMode('agent')
       setCurrentAgentSessionId(newActiveTab.sessionId)
-      setCurrentConversationId(null)
 
       // 清除该会话的"已完成未查看"标记
       setUnviewedCompleted((prev) => {
@@ -70,13 +56,6 @@ export function useSyncActiveTabSideEffects(): SyncActiveTabSideEffects {
         }).catch(console.error)
       }
     },
-    [
-      setAppMode,
-      setCurrentConversationId,
-      setCurrentAgentSessionId,
-      setCurrentAgentWorkspaceId,
-      setUnviewedCompleted,
-      agentSessions,
-    ],
+    [setAppMode, setCurrentAgentSessionId, setCurrentAgentWorkspaceId, setUnviewedCompleted, agentSessions],
   )
 }

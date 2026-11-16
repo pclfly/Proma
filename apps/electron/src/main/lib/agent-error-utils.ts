@@ -12,6 +12,7 @@ import {
 } from '@proma/shared'
 import { summarizeDetail } from './channel-test-error'
 import { TRANSIENT_NETWORK_PATTERN, isMalformedResponseError } from './error-patterns'
+import { classifyModelFailure, describeModelFailure } from './network/retry-classifier'
 
 // Agent 错误消息友好化
 // ============================================================================
@@ -224,14 +225,30 @@ export function mapAgentErrorToTypedError(
   // 瞬时网络错误（terminated / ECONNRESET / socket hang up 等）：
   // assistant.error 路径下，Pi adapter 常把这类错误标记为 errorType='unknown'，
   // 这里从 detailedMessage / originalError 兜底匹配，归类为可重试的 network_error。
+  // 官方分类器额外覆盖 Chromium 错误码、408/425 与流中断细分，并对账单类
+  // 429 显式返回不可重试，避免把额度问题误送进重试循环。
+  // 先提取 HTTP 状态：带明确 4xx/5xx 的响应不应被误判成连接层网络错误。
+  const httpStatus = extractHttpStatusFromErrorText(detailedMessage, originalError)
+  const failure = classifyModelFailure([detailedMessage, originalError].filter(Boolean).join('\n'))
+  const isNetworkFailureKind = failure.reasonKind === 'connection' || failure.reasonKind === 'stream_interrupted'
   const looksLikeNetwork =
     (!errorMap[errorCode]) &&
-    (TRANSIENT_NETWORK_PATTERN.test(detailedMessage ?? '') || TRANSIENT_NETWORK_PATTERN.test(originalError ?? ''))
+    httpStatus == null &&
+    ((isNetworkFailureKind && failure.retryable)
+      || TRANSIENT_NETWORK_PATTERN.test(detailedMessage ?? '')
+      || TRANSIENT_NETWORK_PATTERN.test(originalError ?? ''))
   if (looksLikeNetwork) {
+    // 官方 0.22.0：网络类失败给出具体原因（代理/DNS/离线/网络切换/超时），
+    // 而不是笼统的「网络异常」。无法细分时按连接中断描述。
+    const description = describeModelFailure(
+      isNetworkFailureKind && failure.retryable
+        ? failure
+        : { ...failure, reasonKind: 'connection', retryable: true },
+    )
     return {
       code: 'network_error',
-      title: '网络异常',
-      message: detailedMessage || '上游 API 连接中断',
+      title: description.title,
+      message: description.message,
       actions: [
         { key: 's', label: '设置', action: 'settings' },
         { key: 'r', label: '重试', action: 'retry' },
@@ -263,7 +280,6 @@ export function mapAgentErrorToTypedError(
     }
   }
 
-  const httpStatus = extractHttpStatusFromErrorText(detailedMessage, originalError)
   if (httpStatus === 400) {
     const hasEmptyBody = /\bstatus code \(no body\)/i.test(`${detailedMessage}\n${originalError}`)
     return {

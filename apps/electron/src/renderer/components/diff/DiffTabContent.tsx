@@ -6,19 +6,27 @@
  */
 
 import * as React from 'react'
-import { ChevronRight, Code2, Copy, Check, Eye, FolderOpen, List, Pencil, RotateCw, Save, WrapText, X } from 'lucide-react'
+import {
+  ChevronRight,
+  Code2,
+  Copy,
+  Check,
+  Eye,
+  FolderOpen,
+  List,
+  Pencil,
+  RotateCw,
+  Save,
+  WrapText,
+  X,
+} from 'lucide-react'
 import { atom, useAtom, useAtomValue, useSetAtom } from 'jotai'
 import DOMPurify from 'dompurify'
 import { File as PierreFile } from '@pierre/diffs/react'
 import { toast } from 'sonner'
 import type { FilePreviewMetadata } from '@proma/shared'
 import { cn } from '@/lib/utils'
-import {
-  agentDiffPanelTabAtom,
-  agentDiffViewModeAtom,
-  agentDiffRefreshVersionAtom,
-  agentSidePanelOpenAtomFamily,
-} from '@/atoms/agent-atoms'
+import { agentDiffPanelTabAtom, agentDiffViewModeAtom, agentDiffRefreshVersionAtom, agentSidePanelOpenAtomFamily } from '@/atoms/agent-atoms'
 import { resolvedThemeAtom } from '@/atoms/theme'
 import {
   getPreviewContentRefreshKey,
@@ -27,17 +35,12 @@ import {
   previewResolvedPathAtom,
   quotedSelectionMapAtom,
 } from '@/atoms/preview-atoms'
-import {
-  agentSideChatMapAtom,
-  conversationsAtom,
-  conversationDraftsAtom,
-  conversationQuotedSelectionMapAtom,
-  selectedModelAtom,
-} from '@/atoms/chat-atoms'
+
 import { markdownTocOpenAtom } from '@/atoms/markdown-toc'
 import { useFocusAgentSessionInput } from '@/hooks/useFocusAgentSessionInput'
 import { useShortcut } from '@/hooks/useShortcut'
 import { initShortcutRegistry } from '@/lib/shortcut-registry'
+import { computeImageFitZoom, DEFAULT_IMAGE_ZOOM } from '@/lib/image-fit-zoom'
 import { DiffView } from './DiffView'
 import { LiveMarkdownEditor, type LiveMarkdownEditorHandle, type LiveMarkdownTextSelection } from '@/components/markdown/LiveMarkdownEditor'
 import { createLiveMarkdownImageResolver } from '@/components/markdown/live-markdown-media'
@@ -46,25 +49,16 @@ import { DefaultAppOpenButton } from './DefaultAppOpenButton'
 import { UnsupportedFilePreview } from './UnsupportedFilePreview'
 import { PreviewFindBar } from './PreviewFindBar'
 import { MarkdownToc, MarkdownTocScrollTail } from './MarkdownToc'
-import {
-  isCurrentMarkdownScrollRestore,
-  shouldMaskMarkdownForScrollRestore as getShouldMaskMarkdownForScrollRestore,
-} from './markdown-scroll-restore'
+import { isCurrentMarkdownScrollRestore, shouldMaskMarkdownForScrollRestore as getShouldMaskMarkdownForScrollRestore } from './markdown-scroll-restore'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { PIERRE_FILE_CSS } from '@/components/agent/tool-result-renderers/pierre-styles'
 import { SelectionActionPopover } from '@/components/selection/SelectionActionPopover'
-import { focusChatInput } from '@/components/chat/focus-chat-input'
-import { getOrCreateSideChat } from '@/lib/side-chat'
 import { insertAgentInputQuote } from '@/lib/agent-input-quote'
 import { SELECTION_ACTION_POPOVER_SELECTOR } from '@/lib/quoted-selection'
 import type { ChangedFileEntry } from '@proma/shared'
 import { copyTextToClipboard } from '@/lib/clipboard'
-import {
-  clearPreviewContentCacheForFile,
-  clearPreviewContentCacheForSession,
-  getPreviewContentCache,
-  setPreviewContentCache,
-} from '@/lib/preview-content-cache'
+import { clearPreviewContentCacheForFile, clearPreviewContentCacheForSession, getPreviewContentCache, setPreviewContentCache } from '@/lib/preview-content-cache'
+import { getInlineMediaKind } from '@/lib/media-preview'
 import {
   clearMarkdownEditorStateForSession,
   createMarkdownEditorCacheKey,
@@ -242,6 +236,8 @@ interface DiffTabContentProps {
   basePaths?: string[]
   /** 仅可信 UI 主动选择的文件允许超出会话授权根。 */
   unrestricted?: boolean
+  /** 用户在消息或工具结果中主动点击的单个文件；只放行该文件本身。 */
+  explicitPreviewFiles?: string[]
   /** Managed Skill workspace slug for a relocatable relative path. */
   workspaceSkillSlug?: string
   /** Original absolute Skill entry path used as a legacy fallback. */
@@ -256,7 +252,7 @@ interface DiffTabContentProps {
   baseline?: ChangedFileEntry['baseline']
 }
 
-export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewOnly, readOnly, basePaths, unrestricted, workspaceSkillSlug, legacySkillFilePath, onEmptyDiff, toolbarActions, baseRef, baseline }: DiffTabContentProps): React.ReactElement {
+export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewOnly, readOnly, basePaths, unrestricted, explicitPreviewFiles, workspaceSkillSlug, legacySkillFilePath, onEmptyDiff, toolbarActions, baseRef, baseline }: DiffTabContentProps): React.ReactElement {
   const ext = getExtension(filePath)
   const isMarkdown = previewOnly && MD_EXTS.has(ext)
   const isHtml = previewOnly && HTML_EXTS.has(ext)
@@ -267,6 +263,8 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   const isOfficePreview = OFFICE_PREVIEW_EXTS.has(ext)
   const isLegacyOffice = previewOnly && LEGACY_OFFICE_EXTS.has(ext)
   const isImage = previewOnly && IMAGE_EXTS.has(ext)
+  // 音视频走 proma-file:// 的 Range 响应，<video>/<audio> 才能拖动进度。
+  const mediaKind = previewOnly ? getInlineMediaKind(filePath) : null
   const markdownEditorCacheKey = React.useMemo(
     () => createMarkdownEditorCacheKey({ filePath, dirPath, gitRoot, basePaths }),
     [basePaths, dirPath, filePath, gitRoot],
@@ -335,9 +333,13 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   const pdfIframeRef = React.useRef<HTMLIFrameElement>(null)
   const [imagePath, setImagePath] = React.useState('')
   const [imageDataUrl, setImageDataUrl] = React.useState('')
-  // 默认 25%：预览面板空间有限，先展示缩略全貌，用户可手动放大查看细节
-  const [imageZoom, setImageZoom] = React.useState(0.25)
+  const [mediaSrc, setMediaSrc] = React.useState('')
+  // 图片默认缩放到「整图可见」的自适应比例（≤100%），而不是固定 25%；
+  // 固定小比例在常见图片尺寸下会小到看不清，用户仍可手动放大细看。
+  const [imageZoom, setImageZoom] = React.useState(DEFAULT_IMAGE_ZOOM)
   const [imageNaturalSize, setImageNaturalSize] = React.useState({ w: 0, h: 0 })
+  /** 当前图片是否仍处于自适应模式；用户手动缩放或翻动图片后关闭。 */
+  const imageAutoFitRef = React.useRef(true)
   const imageContainerRef = React.useRef<HTMLDivElement>(null)
   const imageDragging = React.useRef(false)
   const imageDragStart = React.useRef({ x: 0, y: 0, scrollLeft: 0, scrollTop: 0 })
@@ -411,13 +413,6 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   // ===== 选中文本引用（Quoted Selection）=====
 
   const setQuotedSelectionMap = useSetAtom(quotedSelectionMapAtom)
-  const selectedChatModel = useAtomValue(selectedModelAtom)
-  const conversations = useAtomValue(conversationsAtom)
-  const sideChatMap = useAtomValue(agentSideChatMapAtom)
-  const setConversations = useSetAtom(conversationsAtom)
-  const setConversationDrafts = useSetAtom(conversationDraftsAtom)
-  const setChatQuotedSelectionMap = useSetAtom(conversationQuotedSelectionMapAtom)
-  const setSideChatMap = useSetAtom(agentSideChatMapAtom)
   const setSidePanelOpen = useSetAtom(agentSidePanelOpenAtomFamily(sessionId))
   const setSidePanelTabMap = useSetAtom(agentDiffPanelTabAtom)
   const focusAgentSessionInput = useFocusAgentSessionInput()
@@ -427,7 +422,6 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   const shadowRootsRef = React.useRef<Set<ShadowRoot>>(new Set())
   const pointerSelectingRef = React.useRef(false)
   const captureTimerRef = React.useRef<number | null>(null)
-  const openSelectionChatPendingRef = React.useRef(false)
   /** 当前正在展示的截断 toast id；选中回落到上限内或选区消失时主动 dismiss */
   const lastToastIdRef = React.useRef<string | null>(null)
 
@@ -588,12 +582,13 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     sessionId,
     // 只有文件面板等可信 UI 明确标记的用户主动选择可放宽范围；模型回复中的 chip 默认受会话授权约束。
     unrestricted: unrestricted === true,
+    ...(explicitPreviewFiles && explicitPreviewFiles.length > 0 ? { explicitPreviewFiles } : {}),
     ...(workspaceSkillSlug ? { workspaceSkillSlug } : {}),
     ...(legacySkillFilePath ? { legacySkillFilePath } : {}),
     // 历史工具调用的预览仅有相对 filePath；以当前 dirPath（通常是会话 CWD）补全解析上下文。
     // 绝对路径不追加该回退，避免失效路径按同名文件误命中会话目录。
     candidateBasePaths: getPreviewCandidateBasePaths(basePaths, isAbsoluteFilePath(filePath) ? undefined : dirPath),
-  }), [sessionId, basePaths, dirPath, filePath, unrestricted, workspaceSkillSlug, legacySkillFilePath])
+  }), [sessionId, basePaths, dirPath, filePath, unrestricted, explicitPreviewFiles, workspaceSkillSlug, legacySkillFilePath])
 
   const resolveProjectMarkdownImageSrc = React.useMemo(() => (
     createLiveMarkdownImageResolver(filePath, async (candidate) => (
@@ -606,7 +601,9 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     gitRoot: gitRoot ?? '',
     baseline: baseline ?? '',
     basePaths: basePaths ?? [],
-  }), [basePaths, baseline, dirPath, gitRoot])
+    // 授权上下文不同的打开方式不复用同一份预览结果。
+    explicitPreviewFiles: explicitPreviewFiles ?? [],
+  }), [basePaths, baseline, dirPath, gitRoot, explicitPreviewFiles])
 
   const getContentCacheKey = React.useCallback((mode: 'preview' | 'diff', version: number) => (
     `${sessionId}:${mode}:${filePath}@v${version}:${contentCacheScope}`
@@ -653,7 +650,8 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     setPdfZoom(100)
     setImagePath('')
     setImageDataUrl('')
-    setImageZoom(0.25)
+    setImageZoom(DEFAULT_IMAGE_ZOOM)
+    imageAutoFitRef.current = true
     setImageNaturalSize({ w: 0, h: 0 })
     setLoading(!isLegacyOffice)
     setMarkdownEditing(Boolean((isMarkdown || nextEditorState.editing) && isEditableText && !readOnly))
@@ -663,6 +661,42 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     setAutosaveStatus('idle')
   }, [filePath, sessionId, previewOnly, isLegacyOffice, isEditableText, isMarkdown, readOnly, markdownEditorCacheKey])
 
+  // 图片自适应：按容器可用空间把整图缩放到刚好可见（不超过 100%，也不会小到看不清）。
+  const fitImageToContainer = React.useCallback((): void => {
+    const el = imageContainerRef.current
+    if (!el) return
+    const next = computeImageFitZoom({
+      // 容器内边距：p-4（左右/下 16px）+ pt-12（顶部工具栏 48px）
+      availableWidth: el.clientWidth - 32,
+      availableHeight: el.clientHeight - 64,
+      naturalWidth: imageNaturalSize.w,
+      naturalHeight: imageNaturalSize.h,
+    })
+    if (next == null) return
+    // 值已相等时不写入，避免 ResizeObserver 反复触发重渲染
+    setImageZoom((current) => (Math.abs(current - next) < 0.005 ? current : next))
+  }, [imageNaturalSize])
+  const fitImageToContainerRef = React.useRef(fitImageToContainer)
+  fitImageToContainerRef.current = fitImageToContainer
+
+  // 图片加载完成（拿到原图尺寸）后执行一次自适应
+  React.useEffect(() => {
+    if (!isImage || !imageDataUrl || !imageAutoFitRef.current) return
+    fitImageToContainer()
+  }, [isImage, imageDataUrl, fitImageToContainer])
+
+  // 面板尺寸变化时继续按自适应比例贴合（用户手动缩放过就不再干预）
+  React.useEffect(() => {
+    const el = imageContainerRef.current
+    if (!el || !isImage || !imageDataUrl) return
+    const observer = new ResizeObserver(() => {
+      if (!imageAutoFitRef.current) return
+      fitImageToContainerRef.current()
+    })
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [isImage, imageDataUrl])
+
   // non-passive wheel listener for pinch-to-zoom on image
   React.useEffect(() => {
     const el = imageContainerRef.current
@@ -670,6 +704,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     const handler = (e: WheelEvent) => {
       if (e.ctrlKey || e.metaKey) {
         e.preventDefault()
+        imageAutoFitRef.current = false
         setImageZoom((z) => Math.max(0.1, Math.min(5, z * (e.deltaY < 0 ? 1.04 : 1 / 1.04))))
       }
     }
@@ -681,7 +716,11 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
   React.useEffect(() => {
     if (!isPdf) return
     const handler = (e: MessageEvent) => {
-      if (e.data?.type === 'pdf-zoom-changed') setPdfZoom(e.data.zoom)
+      // 只接受当前 PDF iframe 的回报，避免其他窗口伪造缩放百分比。
+      if (e.source !== pdfIframeRef.current?.contentWindow) return
+      if (e.data?.type === 'pdf-zoom-changed' && typeof e.data.zoom === 'number' && Number.isFinite(e.data.zoom)) {
+        setPdfZoom(e.data.zoom)
+      }
     }
     window.addEventListener('message', handler)
     return () => window.removeEventListener('message', handler)
@@ -777,12 +816,15 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
       ? getContentCacheKey('preview', previewContentVersion)
       : getContentCacheKey('diff', refreshVersion)
     const cached = getPreviewContentCache(cacheKey)
+    // 旧版本会把图片解析失败的空结果写进缓存，导致之后即使文件恢复可访问也不再重试，
+    // 并持续误报“文件过大”。这类条目不能视为命中，直接重新解析。
+    const cachedImageFailure = Boolean(cached && isImage && !cached.imageDataUrl)
     // 保存或窗口恢复触发 refreshVersion 时，仍在编辑的 Markdown 必须继续留在
     // 当前 ProseMirror 实例中；后台读取可以更新预览缓存，但不能先挂载 loading
     // 占位，从而卸载编辑器并丢失内层滚动和选区。
     const preserveMarkdownEditor = Boolean(isEditableText && activeMarkdownEditing)
 
-    if (cached) {
+    if (cached && !cachedImageFailure) {
       // 命中：直接同步渲染，不闪
       restoreScrollRef.current = !preserveMarkdownEditor
       if (preserveMarkdownEditor) {
@@ -802,11 +844,13 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
       setPdfZoom(100)
       setImagePath(cached.imagePath ?? '')
       setImageDataUrl(cached.imageDataUrl ?? '')
+      setMediaSrc(cached.mediaSrc ?? '')
       setImageZoom(0.25)
       setImageNaturalSize({ w: 0, h: 0 })
       setLoading(false)
       return // 缓存命中，直接返回，不执行 load()
     } else {
+      if (cachedImageFailure) clearPreviewContentCacheForFile(sessionId, filePath)
       if (preserveMarkdownEditor) {
         setLoading(false)
       } else if (!isLegacyOffice) {
@@ -825,6 +869,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
         setPdfZoom(100)
         setImagePath('')
         setImageDataUrl('')
+        setMediaSrc('')
         setImageZoom(0.25)
         setImageNaturalSize({ w: 0, h: 0 })
         lastNewContentRef.current = ''
@@ -873,6 +918,21 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
             return
           }
           if (previewOnly) {
+            // 音视频只需解析 URL；不要先整文件读取，否则大视频会被 5MB 上限拒绝。
+            if (mediaKind) {
+              const resolved = await window.electronAPI.resolveFilePath(filePath, fileAccess)
+              if (cancelled) return
+              const src = resolved?.url ?? ''
+              setMediaSrc(src)
+              setPreviewContentCache(cacheKey, {
+                oldContent: '',
+                newContent: '',
+                mediaSrc: src,
+                mediaKind,
+              })
+              return
+            }
+
             // 所有纯预览类型先记录主进程实际解析到的路径。相对路径的多个候选根
             // 中只有这个路径能使 watcher 刷新当前正在展示的文件。
             const resolvedPreview = await window.electronAPI.resolveAndReadFile(filePath, fileAccess)
@@ -891,13 +951,21 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
               const resolved = await window.electronAPI.resolveFilePath(filePath, fileAccess)
               if (cancelled) return
               if (resolved) {
+                setUnsupportedPreviewReason('')
+                setPreviewMetadata(undefined)
                 setImagePath(filePath)
                 setImageDataUrl(resolved.url)
                 setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', imagePath: filePath, imageDataUrl: resolved.url })
               } else {
+                // 失败结果不能写进缓存：否则文件恢复可访问后仍会命中空结果，且渲染端
+                // 再也不会重试。降级卡片让用户仍可用默认应用打开这张图。
+                const reason = resolvedPreview
+                  ? '无法注册此图片的预览地址，请稍后重试或使用默认应用打开。'
+                  : '无法预览此图片：文件不存在，或不在当前会话的授权范围内。'
                 setImagePath('')
                 setImageDataUrl('')
-                setPreviewContentCache(cacheKey, { oldContent: '', newContent: '', imagePath: '', imageDataUrl: '' })
+                setUnsupportedPreviewReason(reason)
+                setPreviewMetadata(resolvedPreview?.metadata)
               }
               return
             }
@@ -957,7 +1025,7 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     load()
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [filePath, dirPath, gitRoot, previewOnly, previewContentRefreshKey, previewContentVersion, fileAccess, isPdf, isOfficePreview, isLegacyOffice, isImage, isHtml, sessionId, ext, getContentCacheKey, baseline, setPreviewResolvedPaths])
+  }, [filePath, dirPath, gitRoot, previewOnly, previewContentRefreshKey, previewContentVersion, fileAccess, isPdf, isOfficePreview, isLegacyOffice, isImage, mediaKind, isHtml, sessionId, ext, getContentCacheKey, baseline, setPreviewResolvedPaths])
 
   // refreshVersion 触发的静默刷新：仅 diff 模式、内容有变化时才更新 state
   const prevRefreshRef = React.useRef(-1)
@@ -1020,13 +1088,15 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     } else if (isOfficePreview && !officeHtml && !officeHtmlUrl) {
       message = `无法加载 ${ext === '.pptx' ? 'PPTX' : ext === '.docx' ? 'DOCX' : 'Excel'} 预览`
     } else if (isImage && !imageDataUrl) {
-      message = '图片文件过大，无法在此预览'
+      message = unsupportedPreviewReason || '无法预览此图片'
+    } else if (mediaKind && !mediaSrc) {
+      message = '无法加载音频/视频预览'
     }
     if (message) {
       toastedPreviewFailRef.current = key
       toast.warning(message)
     }
-  }, [previewOnly, isOfficePreview, loading, filePath, ext, isLegacyOffice, isPdf, pdfSrc, officeHtml, officeHtmlUrl, isImage, imageDataUrl])
+  }, [previewOnly, isOfficePreview, loading, filePath, ext, isLegacyOffice, isPdf, pdfSrc, officeHtml, officeHtmlUrl, isImage, imageDataUrl, unsupportedPreviewReason, mediaKind, mediaSrc])
 
   // scrollPosition persistent: module-level Map scoped by session, file path, and resolution context
   // content changes (refreshVersion bump) → delete stored position;
@@ -1471,66 +1541,6 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
     focusAgentSessionInput(sessionId)
   }, [clearPreviewSelection, focusAgentSessionInput, previewSelection, sessionId, setQuotedSelectionMap])
 
-  const handleOpenSelectionChat = React.useCallback(async (): Promise<void> => {
-    if (!previewSelection || openSelectionChatPendingRef.current) return
-
-    const quote = {
-      text: previewSelection.text,
-      filePath: previewSelection.filePath,
-      sourceType: 'file' as const,
-      sourceLabel: previewSelection.filePath,
-      capturedAt: Date.now(),
-    }
-    const activeConversationId = sideChatMap.get(sessionId) ?? null
-    // 右侧已绑定有效 Chat 时始终复用，避免因激活 Tab 状态短暂不同步而重复创建会话。
-    if (activeConversationId) {
-      setChatQuotedSelectionMap((previous) => new Map(previous).set(activeConversationId, quote))
-      setSidePanelOpen(true)
-      setSidePanelTabMap((previous) => new Map(previous).set(sessionId, 'chat'))
-      window.getSelection()?.removeAllRanges()
-      clearPreviewSelection()
-      focusChatInput(activeConversationId)
-      return
-    }
-
-    openSelectionChatPendingRef.current = true
-    try {
-      const conversation = await getOrCreateSideChat(sessionId, () => window.electronAPI.createConversation(
-        '预览选区问答',
-        selectedChatModel?.modelId,
-        selectedChatModel?.channelId,
-      ))
-      setConversations((prev) => prev.some((item) => item.id === conversation.id) ? prev : [conversation, ...prev])
-      setConversationDrafts((prev) => new Map(prev).set(conversation.id, '我的问题：'))
-      setSideChatMap((prev) => new Map(prev).set(sessionId, conversation.id))
-      setSidePanelOpen(true)
-      setSidePanelTabMap((prev) => new Map(prev).set(sessionId, 'chat'))
-      setChatQuotedSelectionMap((previous) => new Map(previous).set(conversation.id, quote))
-      window.getSelection()?.removeAllRanges()
-      clearPreviewSelection()
-      focusChatInput(conversation.id)
-    } catch (error) {
-      console.error('[DiffTabContent] 打开预览选区聊天标签失败:', error)
-      toast.error('打开右侧问答失败')
-    } finally {
-      openSelectionChatPendingRef.current = false
-    }
-  }, [
-    clearPreviewSelection,
-    conversations,
-    previewSelection,
-    selectedChatModel,
-    sessionId,
-    setConversationDrafts,
-    setConversations,
-    setChatQuotedSelectionMap,
-    setQuotedSelectionMap,
-    setSideChatMap,
-    setSidePanelOpen,
-    setSidePanelTabMap,
-    sideChatMap,
-  ])
-
   // persistRef 始终持有最新 persistMarkdownDraft，供 setTimeout / unmount cleanup 调用。
   // 用 effect 而非渲染期赋值，避免 React 19 严格模式下并发渲染中途读到中间态。
   React.useEffect(() => {
@@ -1886,6 +1896,12 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
                   <span className="text-xs text-muted-foreground min-w-[40px] text-center font-mono">{pdfZoom}%</span>
                   <button
                     type="button"
+                    className="h-6 rounded px-1 text-xs text-muted-foreground hover:bg-muted/50"
+                    title="适应宽度"
+                    onClick={() => pdfIframeRef.current?.contentWindow?.postMessage({ type: 'pdf-fit-width' }, '*')}
+                  >适应宽度</button>
+                  <button
+                    type="button"
                     className="w-6 h-6 rounded border border-border/30 flex items-center justify-center text-sm text-muted-foreground hover:bg-muted/50"
                     onClick={() => pdfIframeRef.current?.contentWindow?.postMessage({ type: 'pdf-zoom', direction: 'in' }, '*')}
                   >+</button>
@@ -1898,6 +1914,29 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
                 />
               </div>
               ) : null
+            ) : mediaKind ? (
+              mediaSrc ? (
+                <div className="flex h-full items-center justify-center bg-muted/20 p-4">
+                  {mediaKind === 'video' ? (
+                    <video
+                      src={mediaSrc}
+                      controls
+                      playsInline
+                      preload="metadata"
+                      className="max-h-full max-w-full rounded-lg bg-black"
+                      data-inline-media="video"
+                    />
+                  ) : (
+                    <audio
+                      src={mediaSrc}
+                      controls
+                      preload="metadata"
+                      className="w-full max-w-xl"
+                      data-inline-media="audio"
+                    />
+                  )}
+                </div>
+              ) : null
             ) : isImage ? (
               imageDataUrl ? (
                 <div className="relative h-full">
@@ -1905,13 +1944,13 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
                   <button
                     type="button"
                     className="w-6 h-6 rounded border border-border/30 flex items-center justify-center text-sm text-muted-foreground hover:bg-muted/50"
-                    onClick={() => setImageZoom((z) => Math.max(0.1, z / 1.5))}
+                    onClick={() => { imageAutoFitRef.current = false; setImageZoom((z) => Math.max(0.1, z / 1.5)) }}
                   >−</button>
                   <span className="text-xs text-muted-foreground min-w-[40px] text-center font-mono">{Math.round(imageZoom * 100)}%</span>
                   <button
                     type="button"
                     className="w-6 h-6 rounded border border-border/30 flex items-center justify-center text-sm text-muted-foreground hover:bg-muted/50"
-                    onClick={() => setImageZoom((z) => Math.min(5, z * 1.5))}
+                    onClick={() => { imageAutoFitRef.current = false; setImageZoom((z) => Math.min(5, z * 1.5)) }}
                   >+</button>
                 </div>
                 <div
@@ -1948,7 +1987,13 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
                         const img = e.currentTarget
                         setImageNaturalSize({ w: img.naturalWidth, h: img.naturalHeight })
                       }}
-                      style={{ width: imageNaturalSize.w > 0 ? imageNaturalSize.w * imageZoom : '100%', height: imageNaturalSize.h > 0 ? imageNaturalSize.h * imageZoom : 'auto', maxWidth: imageZoom <= 1 ? '100%' : 'none' }}
+                      style={{
+                        width: imageNaturalSize.w > 0 ? imageNaturalSize.w * imageZoom : '100%',
+                        height: imageNaturalSize.h > 0 ? imageNaturalSize.h * imageZoom : 'auto',
+                        maxWidth: imageZoom <= 1 ? '100%' : 'none',
+                        // 原图尺寸未知时先隐藏，等自适应比例算好再显示，避免闪一下满宽大图
+                        opacity: imageNaturalSize.w > 0 ? 1 : 0,
+                      }}
                     />
                   </div>
                 </div>
@@ -2048,7 +2093,6 @@ export function DiffTabContent({ filePath, dirPath, sessionId, gitRoot, previewO
             x={previewSelection.x}
             y={previewSelection.y}
             onAddToAgent={handleAddSelectionToAgent}
-            onOpenChat={handleOpenSelectionChat}
           />
         )}
       </div>

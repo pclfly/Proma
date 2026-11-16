@@ -2,17 +2,17 @@ import { randomUUID } from 'node:crypto'
 import {
   AGENT_RUNTIME_METHODS,
   AGENT_RUNTIME_PROTOCOL_VERSION,
-  createAgentRuntimeRequest,
   createAgentRuntimeResponse,
   isAgentRuntimeEnvelope,
   serializeAgentRuntimeError,
   type AgentRuntimeHandshakePayload,
   type AgentRuntimeRequest,
-  type AgentRuntimeResponse,
   type AgentRuntimeState,
 } from '@proma/shared'
 import { PiAgentAdapter, type PiAgentQueryOptions } from '../main/lib/adapters/pi-agent-adapter'
-import { getParentRequestTimeoutMs } from './agent-runtime-request-timeout'
+import { ParentCapabilityRequests } from './agent-runtime-parent-requests'
+import { createKnowledgeMutationProxy } from './knowledge-mutation-proxy'
+import { runWithUtilityNetworkReporter } from '../main/lib/network/utility-network-reporting'
 
 type MessagePortLike = {
   on(event: 'message', listener: (event: { data: unknown }) => void): void
@@ -27,16 +27,12 @@ type ParentPortLike = {
 }
 
 type RuntimeRequest = AgentRuntimeRequest & { payload?: Record<string, unknown> }
-type PendingParentRequest = {
-  resolve: (value: unknown) => void
-  reject: (reason: unknown) => void
-  timer: ReturnType<typeof setTimeout>
-  cleanup: () => void
-}
 type ActiveQuery = {
   queryId: string
   sessionId: string
   sequence: number
+  networkEpoch: number
+  routeEpoch: number
   done: Promise<void>
   resolveDone: () => void
 }
@@ -45,7 +41,17 @@ const bootId = randomUUID()
 let runtimePort: MessagePortLike | undefined
 let status: AgentRuntimeState['status'] = 'starting'
 let activeQuery: ActiveQuery | undefined
-const parentRequests = new Map<string, PendingParentRequest>()
+const parentRequests = new ParentCapabilityRequests({
+  transport: () => {
+    const port = runtimePort
+    return port ? {
+      postMessage: (request) => port.postMessage(request),
+      bootId,
+      sessionId: activeQuery?.sessionId,
+      queryId: activeQuery?.queryId,
+    } : undefined
+  },
+})
 const capabilityAbortControllers = new Map<string, AbortController>()
 const piAdapter = new PiAgentAdapter()
 const parentPort = (process as typeof process & { parentPort?: ParentPortLike }).parentPort
@@ -113,7 +119,7 @@ function sendQueryEvent(method: string, payload: unknown): void {
 function handleMessage(rawMessage: unknown): void {
   if (!isAgentRuntimeEnvelope(rawMessage)) return
   if (rawMessage.kind === 'response') {
-    resolveParentRequest(rawMessage)
+    parentRequests.resolve(rawMessage)
     return
   }
   if (rawMessage.kind !== 'request') return
@@ -168,7 +174,15 @@ function handleQueryStart(request: RuntimeRequest): void {
 
   let resolveDone!: () => void
   const done = new Promise<void>((resolve) => { resolveDone = resolve })
-  const active: ActiveQuery = { queryId, sessionId, sequence: 0, done, resolveDone }
+  const active: ActiveQuery = {
+    queryId,
+    sessionId,
+    sequence: 0,
+    networkEpoch: typeof payload.networkEpoch === 'number' ? payload.networkEpoch : 0,
+    routeEpoch: typeof payload.routeEpoch === 'number' ? payload.routeEpoch : 0,
+    done,
+    resolveDone,
+  }
   activeQuery = active
   emitState()
   respond(request, { accepted: true, queryId })
@@ -200,7 +214,18 @@ function handleQueryStart(request: RuntimeRequest): void {
     ),
   }
   ;(utilityInput as Record<string, unknown>).customTools = createProxyCustomTools(active, queryInput.customTools)
-  void pumpQuery(active, utilityInput as unknown as PiAgentQueryOptions)
+  // 只有 main 显式声明才重建来源观察器；普通 query 不产生额外 RPC。
+  if (queryInput.knowledgeAttribution === true) {
+    delete (utilityInput as Record<string, unknown>).knowledgeAttribution
+    ;(utilityInput as Record<string, unknown>).knowledgeMutationObserver = createKnowledgeMutationProxy(
+      (method, request, signal) => requestParent(method, { queryId, sessionId, request }, signal),
+    )
+  }
+  void runWithUtilityNetworkReporter({
+    epoch: () => active.networkEpoch,
+    routeEpoch: () => active.routeEpoch,
+    report: (notice) => sendQueryEvent(AGENT_RUNTIME_METHODS.EVENT_NETWORK_FAILURE, notice),
+  }, () => pumpQuery(active, utilityInput as unknown as PiAgentQueryOptions))
 }
 
 function serializeCanUseToolOptions(options: Record<string, unknown>): Record<string, unknown> {
@@ -302,11 +327,7 @@ async function handleShutdown(request: RuntimeRequest): Promise<void> {
   status = 'stopping'
   if (activeQuery) piAdapter.abort(activeQuery.sessionId)
   piAdapter.dispose()
-  for (const pending of parentRequests.values()) {
-    pending.cleanup()
-    pending.reject(new Error('Agent runtime is shutting down'))
-  }
-  parentRequests.clear()
+  parentRequests.rejectAll(new Error('Agent runtime is shutting down'))
   emitState()
   respond(request, { accepted: true })
   setTimeout(() => {
@@ -316,75 +337,8 @@ async function handleShutdown(request: RuntimeRequest): Promise<void> {
   }, 0)
 }
 
-function requestParent<Result = unknown>(
-  method: string,
-  payload: unknown,
-  signal?: AbortSignal,
-): Promise<Result> {
-  const port = runtimePort
-  if (!port) return Promise.reject(new Error('Agent runtime port is not connected'))
-  const timeoutMs = getParentRequestTimeoutMs(method, payload)
-  const request = createAgentRuntimeRequest(method, payload, {
-    sessionId: activeQuery?.sessionId,
-    queryId: activeQuery?.queryId,
-  }, bootId)
-
-  return new Promise<Result>((resolve, reject) => {
-    let removeAbortListener = (): void => {}
-    const cleanup = (): void => {
-      clearTimeout(timer)
-      removeAbortListener()
-    }
-    const timer = setTimeout(() => {
-      if (!parentRequests.delete(request.requestId)) return
-      cleanup()
-      port.postMessage(createAgentRuntimeRequest(
-        AGENT_RUNTIME_METHODS.CAPABILITY_CANCEL,
-        { requestId: request.requestId },
-        { sessionId: activeQuery?.sessionId, queryId: activeQuery?.queryId },
-        bootId,
-      ))
-      reject(new Error(`Main runtime request timed out: ${method}`))
-    }, timeoutMs)
-    parentRequests.set(request.requestId, {
-      resolve: (value) => resolve(value as Result),
-      reject,
-      timer,
-      cleanup,
-    })
-    if (signal) {
-      const abort = (): void => {
-        if (!parentRequests.delete(request.requestId)) return
-        cleanup()
-        port.postMessage(createAgentRuntimeRequest(
-          AGENT_RUNTIME_METHODS.CAPABILITY_CANCEL,
-          { requestId: request.requestId },
-          { sessionId: activeQuery?.sessionId, queryId: activeQuery?.queryId },
-          bootId,
-        ))
-        reject(new Error(`Main runtime request aborted: ${method}`))
-      }
-      if (signal.aborted) {
-        abort()
-        return
-      }
-      signal.addEventListener('abort', abort, { once: true })
-      removeAbortListener = () => signal.removeEventListener('abort', abort)
-    }
-    port.postMessage(request)
-  })
-}
-
-function resolveParentRequest(response: AgentRuntimeResponse): void {
-  const pending = parentRequests.get(response.requestId)
-  if (!pending) return
-  parentRequests.delete(response.requestId)
-  pending.cleanup()
-  if (response.ok) pending.resolve(response.payload)
-  else {
-    const error = response.error ?? { code: 'runtime.parent_request_failed', message: `Main request failed: ${response.method}` }
-    pending.reject(Object.assign(new Error(error.message), error))
-  }
+function requestParent<Result = unknown>(method: string, payload: unknown, signal?: AbortSignal): Promise<Result> {
+  return parentRequests.request<Result>(method, payload, signal)
 }
 
 function handleHandshake(request: RuntimeRequest): void {

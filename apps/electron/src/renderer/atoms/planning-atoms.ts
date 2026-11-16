@@ -1,5 +1,6 @@
 import { atom } from 'jotai'
 import type { ActivePlanningReminder, CalendarEvent, PlanningGroup, PlanningTag, Todo } from '@proma/shared'
+import type { TodoListView } from '@/lib/todo-view'
 
 export type PlanningTab = 'todos' | 'calendar' | 'automations'
 
@@ -11,6 +12,11 @@ export const calendarPlanningGroupsAtom = atom<PlanningGroup[]>([])
 export const planningTagsAtom = atom<PlanningTag[]>([])
 export const activePlanningRemindersAtom = atom<ActivePlanningReminder[]>([])
 export const planningTabAtom = atom<PlanningTab>('todos')
+/**
+ * Todo 工作区当前视图。官方 0.22.0：切换视图不应丢失选中项，
+ * 视图本身也需要跨 Tab/窗口切换保留。
+ */
+export const planningTodoViewAtom = atom<TodoListView>('today')
 /** 外部提醒等入口可指定要在 Todo 工作区中打开的任务。 */
 export const planningSelectedTodoIdAtom = atom<string | null>(null)
 export const planningSelectedCalendarEventIdAtom = atom<string | null>(null)

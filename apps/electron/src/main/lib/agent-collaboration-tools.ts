@@ -5,18 +5,30 @@
  * Skill 负责判断何时协作；这里负责受控创建真实 Agent 会话、运行、等待和停止。
  */
 
+import { budgetDelegationResults, type DelegationResultBudgetOptions } from './agent-collaboration-result-budget'
+import {
+  DEFAULT_COLLABORATION_RESULT_CHARS,
+  MAX_COLLABORATION_RESULT_CHARS,
+  paginateDelegationResults,
+  projectDelegationResults,
+  selectDelegationResults,
+  validateDelegationResultReadOptions,
+  type DelegationResultLike,
+} from './agent-collaboration-result-view'
+import { CollaborationCoordinator } from './agent-collaboration-coordinator'
 import { randomUUID } from 'node:crypto'
+import { classifyDelegationCompletion, getActiveAgentRun, getAssistantSummary, getFinalAssistantUuid, onAgentRunLifecycle, type AgentRunIdentity } from './agent-collaboration-lifecycle'
+import { normalizeDelegationWaitSeconds } from '@proma/shared'
 import type {
+  AgentCollaborationAttemptSnapshot,
   AgentDelegationRole,
   AgentDelegationStatus,
-  AgentMessage,
   AgentSessionMeta,
   AgentStreamPayload,
   AgentThinkingLevel,
   AskUserRequest,
   PermissionRequest,
   PromaPermissionMode,
-  SDKMessage,
 } from '@proma/shared'
 import {
   createAgentSession,
@@ -30,14 +42,11 @@ import {
   stopRegisteredAgent,
 } from './agent-headless-runner-registry'
 import {
-  DEFAULT_DELEGATION_WAIT_SECONDS,
-  MAX_DELEGATION_WAIT_SECONDS,
   MAX_RUNNING_DELEGATIONS_PER_PARENT,
   buildRecoveredDelegationState,
   buildDelegationTaskWithSharedContext,
   buildDelegationPrompt,
   createToolCallIdempotencyCache,
-  normalizePersistedDelegationStatus,
   resolveDelegationPermissionMode,
   resolveDelegationWaitStatus,
 } from './agent-collaboration-utils'
@@ -59,6 +68,7 @@ interface CollaborationToolResult extends Record<string, unknown> {
 
 interface DelegationRecord {
   delegationId: string
+  attemptId: string
   parentSessionId: string
   childSessionId: string
   channelId: string
@@ -73,20 +83,86 @@ interface DelegationRecord {
   completedAt?: number
   error?: string
   resultSummary?: string
+  runGeneration?: number
+  resultUuid?: string
+  invocationToken?: string
   completion: Promise<void>
   resolveCompletion: () => void
 }
 
 
-const RESULT_SUMMARY_CHAR_LIMIT = 50_000
 const DELEGATION_GOAL_CHAR_LIMIT = 1_000
 /** live Map 中保留的已结束委派上限，超出时按完成时间清理最老的（持久化仍可回查） */
 const MAX_RETAINED_FINISHED_DELEGATIONS = 200
 
 const delegations = new Map<string, DelegationRecord>()
+const stateListeners = new Set<() => void>()
+let lifecycleRegistered = false
+
+function notifyStateChanged(): void {
+  for (const listener of stateListeners) listener()
+}
+
+function persistDelegation(record: DelegationRecord): void {
+  updateAgentSessionMeta(record.childSessionId, {
+    delegationStatus: record.status,
+    delegationAttemptId: record.attemptId,
+    delegationRunGeneration: record.runGeneration,
+    delegationStartedAt: record.startedAt,
+    delegationCompletedAt: record.completedAt,
+    delegationError: record.error,
+    delegationResultUuid: record.resultUuid,
+  })
+}
+
+function beginDelegationRun(record: DelegationRecord, identity: AgentRunIdentity, recovering = false): void {
+  if (!recovering && record.runGeneration !== undefined && record.runGeneration >= identity.runGeneration) return
+  record.resolveCompletion()
+  Object.assign(record, createDelegationCompletion(), {
+    status: 'running', startedAt: identity.startedAt, runGeneration: identity.runGeneration,
+    error: undefined, resultSummary: undefined, resultUuid: '', completedAt: undefined,
+    invocationToken: undefined,
+  })
+  for (const blocked of blockedEvents.values()) {
+    if (blocked.delegationId === record.delegationId) blocked.resolved = true
+  }
+  persistDelegation(record)
+  notifyStateChanged()
+}
+
+/** 同步注册，桌面和 headless 的已接受运行使用唯一状态源（不依赖 UI EventBus）。 */
+export function registerCollaborationLifecycle(): void {
+  if (lifecycleRegistered) return
+  lifecycleRegistered = true
+  onAgentRunLifecycle(({ sessionId, identity, completion }) => {
+    const meta = getAgentSessionMeta(sessionId)
+    if (!meta?.sourceDelegationId) return
+    let record = delegations.get(meta.sourceDelegationId)
+    if (record && record.childSessionId !== sessionId) return
+    if (!record) {
+      if (!meta.parentSessionId) return
+      record = recoverDelegationRecordFromSession(meta.parentSessionId, meta.sourceDelegationId, meta, meta.permissionMode, meta.channelId ?? '', meta.modelId)
+    }
+    if (!completion) {
+      beginDelegationRun(record, identity)
+      return
+    }
+    if (record.runGeneration !== identity.runGeneration) return
+    record.resultUuid = completion.finalAssistantUuid ?? ''
+    markDelegationFinished(record, classifyDelegationCompletion(completion), {
+      error: completion.error ?? completion.resultErrors?.join('\n') ?? (completion.resultSubtype?.startsWith('error') ? completion.resultSubtype : undefined),
+    })
+  })
+}
 // Pi 的 provider/retry 流可能重放同一个 tool call；委派会创建真实会话，必须幂等。
 const piDelegateAgentCalls = createToolCallIdempotencyCache<PiDelegationToolResult>()
 const piDelegateAgentsCalls = createToolCallIdempotencyCache<PiBatchDelegationResult>()
+interface ContinuationReceipt {
+  delegationId: string
+  continuationId: string
+  requestedAt: number
+}
+const piContinueCalls = createToolCallIdempotencyCache<ContinuationReceipt>()
 
 // ===== 阻塞事件追踪（Level 1: Blocked Event Bubbling） =====
 
@@ -237,7 +313,7 @@ interface DelegateAgentArgs {
   task: string
   expectedOutput?: string
   permissionMode?: PromaPermissionMode
-  modelId?: string
+  modelId?: string | null
   /** 子会话的目标思考强度；未传入时保持新会话默认值。 */
   thinkingLevel?: AgentThinkingLevel
 }
@@ -320,42 +396,13 @@ function assertCanCreateDelegation(
   return parent
 }
 
-function extractTextFromSdkMessage(message: SDKMessage): string[] {
-  const record = message as Record<string, unknown>
-  if (record.type !== 'assistant') return []
-
-  const outerMessage = record.message
-  if (!outerMessage || typeof outerMessage !== 'object') return []
-
-  const content = (outerMessage as Record<string, unknown>).content
-  if (!Array.isArray(content)) return []
-
-  const parts: string[] = []
-  for (const block of content) {
-    if (!block || typeof block !== 'object') continue
-    const blockRecord = block as Record<string, unknown>
-    if (blockRecord.type === 'text' && typeof blockRecord.text === 'string') {
-      parts.push(blockRecord.text)
-    }
-  }
-  return parts
-}
-
-function summarizeChildResult(childSessionId: string, messages?: AgentMessage[]): string {
-  const lastAssistant = [...(messages ?? [])]
-    .reverse()
-    .find((message) => message.role === 'assistant' && message.content.trim().length > 0)
-  if (lastAssistant) return truncateText(lastAssistant.content.trim(), RESULT_SUMMARY_CHAR_LIMIT)
-
-  const sdkMessages = getAgentSessionSDKMessages(childSessionId)
-  const sdkTexts: string[] = []
-  for (const message of sdkMessages) {
-    sdkTexts.push(...extractTextFromSdkMessage(message))
-  }
-  const text = sdkTexts.join('\n\n').trim()
-  if (text) return truncateText(text, RESULT_SUMMARY_CHAR_LIMIT)
-
-  return '子会话已结束，但未找到可摘要的 assistant 文本。请打开子会话查看完整记录。'
+function summarizeChildResult(record: DelegationRecord): string {
+  if (record.resultSummary !== undefined) return record.resultSummary
+  if (record.resultUuid === '') return '本轮未产生可摘要的 assistant 正文。请打开子会话查看完整记录。'
+  const messages = getAgentSessionSDKMessages(record.childSessionId)
+  // 旧版本无结果引用时只取最后一条正文；新轮显式空引用绝不能借用旧结果。
+  const uuid = record.resultUuid ?? [...messages].reverse().map(getFinalAssistantUuid).find(Boolean)
+  return getAssistantSummary(messages, uuid) ?? '本轮未产生可摘要的 assistant 正文。请打开子会话查看完整记录。'
 }
 
 function markDelegationFinished(
@@ -368,13 +415,15 @@ function markDelegationFinished(
   record.completedAt = Date.now()
   record.error = fields.error
   record.resultSummary = fields.resultSummary
-  updateAgentSessionMeta(record.childSessionId, { delegationStatus: status })
+  persistDelegation(record)
   record.resolveCompletion()
+  notifyStateChanged()
 }
 
-function getDelegationSummary(record: DelegationRecord): Record<string, unknown> {
+function getDelegationSummary(record: DelegationRecord, includeResult = true): Record<string, unknown> {
   return {
     delegationId: record.delegationId,
+    attemptId: record.attemptId,
     parentSessionId: record.parentSessionId,
     childSessionId: record.childSessionId,
     channelId: record.channelId,
@@ -385,75 +434,52 @@ function getDelegationSummary(record: DelegationRecord): Record<string, unknown>
     goal: record.goal,
     permissionMode: record.permissionMode,
     status: record.status,
+    runGeneration: record.runGeneration,
     startedAt: record.startedAt,
     completedAt: record.completedAt,
     error: record.error,
-    resultSummary: record.resultSummary,
+    resultSummary: !includeResult || record.status === 'running' ? undefined : summarizeChildResult(record),
     pendingBlockedEvents: getPendingBlockedEvents(record.delegationId),
   }
 }
 
-function listKnownDelegations(parentSessionId: string): Array<Record<string, unknown>> {
-  const live = Array.from(delegations.values())
-    .filter((item) => item.parentSessionId === parentSessionId)
-    .map(getDelegationSummary)
+function toAttemptSnapshot(summary: Record<string, unknown>): AgentCollaborationAttemptSnapshot {
+  const text = (key: string): string | undefined => {
+    const value = summary[key]
+    return typeof value === 'string' ? value : undefined
+  }
+  return {
+    parentSessionId: text('parentSessionId'),
+    childSessionId: text('childSessionId'),
+    channelId: text('channelId'),
+    modelId: text('modelId'),
+    thinkingLevel: text('thinkingLevel') as AgentCollaborationAttemptSnapshot['thinkingLevel'],
+    thinkingLevelSemantics: text('thinkingLevelSemantics'),
+    title: text('title'),
+    role: text('role') as AgentCollaborationAttemptSnapshot['role'],
+    goal: text('goal'),
+    startedAt: typeof summary.startedAt === 'number' ? summary.startedAt : undefined,
+  }
+}
 
-  const liveIds = new Set(live.map((item) => item.delegationId))
-  const persisted = listAgentSessions()
-    .filter((session) => session.parentSessionId === parentSessionId && session.sourceDelegationId && !liveIds.has(session.sourceDelegationId))
-    .map((session) => ({
-      delegationId: session.sourceDelegationId,
-      parentSessionId,
-      childSessionId: session.id,
-      channelId: session.channelId,
-      modelId: session.modelId,
-      ...getThinkingLevelSummary(session.reasoningLevel),
-      title: session.title,
-      role: session.delegationRole,
-      goal: session.delegationGoal,
-      permissionMode: session.permissionMode,
-      status: session.delegationStatus,
-      startedAt: session.createdAt,
-      completedAt: session.delegationStatus && session.delegationStatus !== 'running' ? session.updatedAt : undefined,
-    }))
-
-  return [...live, ...persisted]
+function listKnownDelegations(
+  parentSessionId: string,
+  includeResult = false,
+): Array<Record<string, unknown>> {
+  const ids = new Set(Array.from(delegations.values()).filter((item) => item.parentSessionId === parentSessionId).map((item) => item.delegationId))
+  for (const session of listAgentSessions()) {
+    if (session.parentSessionId === parentSessionId && session.sourceDelegationId) ids.add(session.sourceDelegationId)
+  }
+  return [...ids].map((id) => {
+    const record = getDelegationRecordForContinuation({ sessionId: parentSessionId, channelId: '' }, id)!
+    return getDelegationSummary(record, includeResult)
+  })
 }
 
 function getDelegationResult(parentSessionId: string, delegationId: string): Record<string, unknown> {
-  const live = delegations.get(delegationId)
-  if (live) {
-    if (live.parentSessionId !== parentSessionId) {
-      throw new Error(`委派不属于当前父会话: ${delegationId}`)
-    }
-    return getDelegationSummary(live)
-  }
-
-  const session = getPersistedDelegationSession(parentSessionId, delegationId)
-  if (!session) {
-    throw new Error(`未找到当前会话下的委派: ${delegationId}`)
-  }
-
-  const resultSummary = session.delegationStatus && session.delegationStatus !== 'running'
-    ? summarizeChildResult(session.id)
-    : '委派已不在当前运行内存中（可能因应用重启而中断），未产生最终结果；可用 continue_delegation 继续。'
-
-  return {
-    delegationId,
-    parentSessionId: session.parentSessionId ?? parentSessionId,
-    childSessionId: session.id,
-    channelId: session.channelId,
-    modelId: session.modelId,
-    ...getThinkingLevelSummary(session.reasoningLevel),
-    title: session.title,
-    role: session.delegationRole,
-    goal: session.delegationGoal,
-    permissionMode: session.permissionMode,
-    status: normalizePersistedDelegationStatus(session.delegationStatus),
-    startedAt: session.createdAt,
-    completedAt: session.updatedAt,
-    resultSummary,
-  }
+  const record = getDelegationRecordForContinuation({ sessionId: parentSessionId, channelId: '' }, delegationId)
+  if (!record) throw new Error(`未找到当前会话下的委派: ${delegationId}`)
+  return getDelegationSummary(record)
 }
 
 function setDelegationThinkingLevel(
@@ -529,15 +555,19 @@ function recoverDelegationRecordFromSession(
   const completionHandle = createDelegationCompletion()
   const record: DelegationRecord = {
     ...state,
+    attemptId: session.delegationAttemptId ?? `legacy:${delegationId}:${session.updatedAt}`,
     channelId: session.channelId ?? fallbackChannelId,
     modelId: session.modelId ?? fallbackModelId,
     thinkingLevel: session.reasoningLevel,
+    runGeneration: session.delegationRunGeneration,
+    resultUuid: session.delegationResultUuid,
+    error: session.delegationError,
     ...completionHandle,
   }
-  if (record.status !== 'running') {
-    record.resolveCompletion()
-    delegations.set(delegationId, record)
-  }
+  delegations.set(delegationId, record)
+  const active = getActiveAgentRun(session.id)
+  if (active) beginDelegationRun(record, active, true)
+  else record.resolveCompletion()
   return record
 }
 
@@ -558,70 +588,44 @@ function getDelegationRecordForContinuation(
   return recoverDelegationRecordFromSession(ctx.sessionId, delegationId, session, ctx.permissionMode, ctx.channelId, ctx.modelId)
 }
 
-interface WaitResolution {
-  /** 仍在内存中、需要实际等待的委派 */
-  liveRecords: DelegationRecord[]
-  /** 不在内存、但持久化记录已是终态的委派（如应用重启后的遗留委派） */
-  settled: Array<Record<string, unknown>>
+function resolveWaitTargets(ids: string[], parentSessionId: string): DelegationRecord[] {
+  return [...new Set(ids)].map((id) => {
+    const record = getDelegationRecordForContinuation({ sessionId: parentSessionId, channelId: '' }, id)
+    if (!record) throw new Error(`未找到当前会话下的委派: ${id}`)
+    return record
+  })
 }
 
-/**
- * 解析等待目标：内存中的进行中委派照常等待；
- * 不在内存的委派回退到持久化记录（重启后遗留），已终态则直接计入完成。
- * 两处都查不到才抛错。
- */
-function resolveWaitTargets(ids: string[], parentSessionId: string): WaitResolution {
-  const liveRecords: DelegationRecord[] = []
-  const settled: Array<Record<string, unknown>> = []
-  for (const id of ids) {
-    const record = delegations.get(id)
-    if (record) {
-      if (record.parentSessionId !== parentSessionId) {
-        throw new Error(`委派不属于当前父会话: ${id}`)
+function throwIfWaitAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException('协作等待已取消；子会话不会因此自动停止。', 'AbortError')
+}
+
+async function waitForLiveRecords(parentSessionId: string, ids: string[], timeoutSeconds: number, target: number, signal?: AbortSignal): Promise<void> {
+  throwIfWaitAborted(signal)
+  const deadline = Date.now() + normalizeDelegationWaitSeconds(timeoutSeconds) * 1000
+  while (resolveWaitTargets(ids, parentSessionId).filter((record) => record.status !== 'running').length < target) {
+    throwIfWaitAborted(signal)
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    let check: (() => void) | undefined
+    try {
+      await new Promise<void>((resolve) => {
+        check = () => { resolve() }
+        // 取消仅唤醒并释放父等待，不能自动停止已接受的子任务。
+        stateListeners.add(check)
+        signal?.addEventListener('abort', check, { once: true })
+        timeout = setTimeout(resolve, remaining)
+        if (signal?.aborted) resolve()
+      })
+    } finally {
+      if (timeout) clearTimeout(timeout)
+      if (check) {
+        stateListeners.delete(check)
+        signal?.removeEventListener('abort', check)
       }
-      liveRecords.push(record)
-      continue
     }
-    // 不在内存：回退到持久化记录；getDelegationResult 在完全找不到时抛错
-    settled.push(getDelegationResult(parentSessionId, id))
-  }
-  return { liveRecords, settled }
-}
-
-function getFinishedDelegationCount(records: DelegationRecord[]): number {
-  return records.filter((record) => record.status !== 'running').length
-}
-
-async function waitForLiveRecords(
-  records: DelegationRecord[],
-  timeoutSeconds: number,
-  liveTarget: number,
-): Promise<'completed' | 'timeout'> {
-  if (getFinishedDelegationCount(records) >= liveTarget) {
-    return 'completed'
-  }
-
-  let timeout: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([
-      new Promise<'completed'>((resolve) => {
-        const check = () => {
-          if (getFinishedDelegationCount(records) >= liveTarget) {
-            resolve('completed')
-          }
-        }
-        for (const record of records) {
-          if (record.status === 'running') {
-            record.completion.then(check)
-          }
-        }
-      }),
-      new Promise<'timeout'>((resolve) => {
-        timeout = setTimeout(() => resolve('timeout'), timeoutSeconds * 1000)
-      }),
-    ])
-  } finally {
-    if (timeout) clearTimeout(timeout)
+    throwIfWaitAborted(signal)
   }
 }
 
@@ -683,13 +687,37 @@ function stopDelegation(parentSessionId: string, delegationId: string): Record<s
   }
 }
 
+function runDelegation(record: DelegationRecord, message: string, workspaceId?: string): void {
+  const token = randomUUID()
+  record.invocationToken = token
+  const failBeforeAccepted = (error: string): void => {
+    // accepted 已清除此 token；旧 promise/callback 绝不能结束新轮。
+    if (record.invocationToken !== token) return
+    record.resultUuid = ''
+    markDelegationFinished(record, 'failed', { error })
+  }
+  runRegisteredHeadlessAgent({
+    sessionId: record.childSessionId, userMessage: message,
+    channelId: record.channelId, modelId: record.modelId, workspaceId,
+    permissionModeOverride: record.permissionMode, triggeredBy: 'delegation', startedAt: record.startedAt,
+  }, {
+    source: 'delegation', originSessionId: record.parentSessionId,
+    onError: failBeforeAccepted,
+    onComplete: () => { failBeforeAccepted('运行未被接受或未发布终态，请检查子会话。') },
+    onTitleUpdated: (title) => { record.title = title },
+  }).catch((error: unknown) => failBeforeAccepted(error instanceof Error ? error.message : '未知错误'))
+}
+
 function startDelegation(
   ctx: CollaborationToolContext,
   parent: AgentSessionMeta | undefined,
   args: DelegateAgentArgs,
+  scope?: CollaborationCoordinator,
 ): StartDelegationResult {
   const task = assertNonBlank(args.task, 'task')
+  scope?.assertCanStart()
   const delegationId = randomUUID()
+  const attemptId = randomUUID()
   const role = args.role ?? 'custom'
   const title = normalizeTitle(args.title, `协作：${task}`)
   const goal = truncateText(task, DELEGATION_GOAL_CHAR_LIMIT)
@@ -699,7 +727,7 @@ function startDelegation(
     args.permissionMode,
   )
   const thinkingLevel = assertThinkingLevel(args.thinkingLevel)
-  const effectiveModelId = args.modelId !== undefined
+  const effectiveModelId = args.modelId != null
     ? assertEnabledModelForChannel({
         channelId: ctx.channelId,
         modelId: args.modelId,
@@ -719,6 +747,7 @@ function startDelegation(
     sourceAutomationId: parent?.sourceAutomationId,
     delegationRole: role,
     delegationStatus: 'running',
+    delegationAttemptId: attemptId,
     delegationDepth: (parent?.delegationDepth ?? 0) + 1,
     delegationGoal: goal,
     permissionMode,
@@ -727,6 +756,7 @@ function startDelegation(
 
   const record: DelegationRecord = {
     delegationId,
+    attemptId,
     parentSessionId: ctx.sessionId,
     childSessionId: child.id,
     channelId: ctx.channelId,
@@ -742,6 +772,7 @@ function startDelegation(
     resolveCompletion,
   }
   delegations.set(delegationId, record)
+  scope?.track(delegationId, attemptId, toAttemptSnapshot(getDelegationSummary(record, false)))
   pruneFinishedDelegations()
 
   const prompt = buildDelegationPrompt({
@@ -752,43 +783,161 @@ function startDelegation(
     expectedOutput: args.expectedOutput,
   })
 
-  runRegisteredHeadlessAgent(
-    {
-      sessionId: child.id,
-      userMessage: prompt,
-      channelId: ctx.channelId,
-      modelId: effectiveModelId,
-      workspaceId: ctx.workspaceId,
-      permissionModeOverride: permissionMode,
-      triggeredBy: 'delegation',
-      startedAt: record.startedAt,
-    },
-    {
-      source: 'delegation',
-      originSessionId: ctx.sessionId,
-      onError: (error) => {
-        markDelegationFinished(record, 'failed', { error })
-      },
-      onComplete: (messages) => {
-        if (record.status !== 'running') return
-        const resultSummary = summarizeChildResult(child.id, messages)
-        markDelegationFinished(record, 'completed', { resultSummary })
-      },
-      onTitleUpdated: (updatedTitle) => {
-        record.title = updatedTitle
-      },
-    },
-  ).catch((error: unknown) => {
-    markDelegationFinished(record, 'failed', {
-      error: error instanceof Error ? error.message : '未知错误',
-    })
-  })
+  runDelegation(record, prompt, ctx.workspaceId)
 
   return {
     record,
     effectivePermissionMode: permissionMode,
     effectiveModelId,
     configuredThinkingLevel: childThinkingLevel,
+  }
+}
+
+export interface CollaborationBoundaryRequest {
+  receipts: string[]
+  timeoutSeconds: number
+  checkOnly?: boolean
+}
+
+export interface CollaborationBoundaryDelivery {
+  receipts: string[]
+  text: string
+}
+
+export interface CollaborationBoundaryResult {
+  pending: boolean
+  reason?: string
+  delivery?: CollaborationBoundaryDelivery
+}
+
+export type CollaborationBoundaryHandler = (
+  request: CollaborationBoundaryRequest,
+  signal: AbortSignal,
+) => Promise<CollaborationBoundaryResult>
+
+function delegationReceipt(summary: Record<string, unknown>): string | undefined {
+  const delegationId = typeof summary.delegationId === 'string' ? summary.delegationId : undefined
+  const status = typeof summary.status === 'string' ? summary.status : undefined
+  if (!delegationId || !status || status === 'running') return undefined
+  const generation = typeof summary.runGeneration === 'number' ? summary.runGeneration : 0
+  return `${delegationId}:${generation}:${status}`
+}
+
+function pendingBlockedIds(summary: Record<string, unknown>): string[] {
+  const pending = summary.pendingBlockedEvents
+  if (!Array.isArray(pending)) return []
+  return pending.flatMap((item) => {
+    if (!item || typeof item !== 'object') return []
+    const id = (item as { blockedEventId?: unknown }).blockedEventId
+    return typeof id === 'string' ? [id] : []
+  })
+}
+
+interface CollaborationReceiptRef {
+  delegationId: string
+  attemptId: string
+  status: string
+  pendingBlockedEvents?: unknown[]
+}
+
+function collectCollaborationReceiptRefs(
+  value: unknown,
+  refs: CollaborationReceiptRef[] = [],
+): CollaborationReceiptRef[] {
+  if (Array.isArray(value)) {
+    for (const item of value) collectCollaborationReceiptRefs(item, refs)
+    return refs
+  }
+  if (!value || typeof value !== 'object') return refs
+  const record = value as Record<string, unknown>
+  if (typeof record.delegationId === 'string' && typeof record.attemptId === 'string') {
+    refs.push({
+      delegationId: record.delegationId,
+      attemptId: record.attemptId,
+      status: typeof record.status === 'string' ? record.status : 'running',
+      ...(Array.isArray(record.pendingBlockedEvents)
+        ? { pendingBlockedEvents: record.pendingBlockedEvents }
+        : {}),
+    })
+  }
+  for (const [key, child] of Object.entries(record)) {
+    if (key === 'pendingBlockedEvents') continue
+    collectCollaborationReceiptRefs(child, refs)
+  }
+  return refs
+}
+
+/**
+ * 父会话 settle 前的协作收口。
+ *
+ * 官方 0.22.0 的 boundary 依赖 coordinator 的 receipts；本地协作栈使用
+ * `listKnownDelegations` 的持久状态，因此这里生成等价的 `delegationId:generation:status`
+ * 与 `delegationId:blocked:<id>` 凭据，保证同一条结果不会重复投递。
+ */
+export function createCollaborationBoundary(parentSessionId: string): CollaborationBoundaryHandler {
+  return async (request, signal) => {
+    const known = listKnownDelegations(parentSessionId)
+    const running = known.filter((summary) => summary.status === 'running')
+    const blocked = known.flatMap((summary) => pendingBlockedIds(summary))
+
+    if (request.checkOnly) {
+      return {
+        pending: running.length > 0 || blocked.length > 0,
+        reason: running.length > 0
+          ? '仍有协作子会话在运行'
+          : blocked.length > 0
+            ? '协作子会话有未处理的阻塞事件'
+            : undefined,
+      }
+    }
+
+    if (running.length > 0) {
+      const ids = running
+        .map((summary) => (typeof summary.delegationId === 'string' ? summary.delegationId : undefined))
+        .filter((id): id is string => !!id)
+      await waitForLiveRecords(parentSessionId, ids, request.timeoutSeconds, ids.length, signal)
+    }
+
+    const after = listKnownDelegations(parentSessionId)
+    const receipts = new Set(request.receipts)
+    const freshIds = new Set<string>()
+    for (const summary of after) {
+      const delegationId = typeof summary.delegationId === 'string' ? summary.delegationId : undefined
+      if (!delegationId) continue
+      const receipt = delegationReceipt(summary)
+      if (receipt && !receipts.has(receipt)) {
+        receipts.add(receipt)
+        freshIds.add(delegationId)
+      }
+      for (const blockedEventId of pendingBlockedIds(summary)) {
+        const blockedReceipt = `${delegationId}:blocked:${blockedEventId}`
+        if (!receipts.has(blockedReceipt)) {
+          receipts.add(blockedReceipt)
+          freshIds.add(delegationId)
+        }
+      }
+    }
+
+    const stillRunning = after.filter((summary) => summary.status === 'running')
+    if (freshIds.size === 0) {
+      return {
+        pending: stillRunning.length > 0,
+        reason: stillRunning.length > 0 ? '仍有协作子会话在运行' : undefined,
+      }
+    }
+
+    const results = [...freshIds].map((delegationId) => getDelegationResult(parentSessionId, delegationId))
+    return {
+      pending: stillRunning.length > 0,
+      delivery: {
+        receipts: [...receipts],
+        text: JSON.stringify({
+          type: 'collaboration_results',
+          results,
+          note: '协作子会话结果已收敛；请基于结果继续父任务，不要重复等待同一批委派。',
+        }, null, 2),
+      },
+    }
   }
 }
 
@@ -802,8 +951,14 @@ function startDelegation(
 export function buildPiCollaborationTools(
   sdk: typeof import('@earendil-works/pi-coding-agent'),
   ctx: CollaborationToolContext,
-): unknown[] {
+): { tools: unknown[]; boundary: CollaborationBoundaryHandler } {
   const { Type } = require('typebox') as typeof import('typebox')
+  const scope = new CollaborationCoordinator(
+    getAgentSessionMeta(ctx.sessionId)?.collaborationScope,
+    (state) => {
+      updateAgentSessionMeta(ctx.sessionId, { collaborationScope: structuredClone(state) })
+    },
+  )
 
   const roleType = Type.Optional(Type.Union([
     Type.Literal('explore'),
@@ -823,24 +978,38 @@ export function buildPiCollaborationTools(
     Type.Literal('max'),
   ], { description: '子会话思考强度；未传则使用新会话默认值' }))
 
+  const modelIdType = Type.Optional(Type.Union([
+    Type.String({ minLength: 1, pattern: '\\S', description: '当前渠道已启用的精确模型ID；不能传空串' }),
+    Type.Null(),
+  ], { description: '可选目标模型ID；省略或null继承父模型。指定前先查询list_available_agent_models。' }))
+
   const delegateItemType = Type.Object({
     title: Type.Optional(Type.String({ description: '子会话标题' })),
     role: roleType,
     task: Type.String({ description: '发送给子 Agent 的完整任务说明' }),
     expectedOutput: Type.Optional(Type.String({ description: '希望子 Agent 最终返回的格式或要点' })),
-    modelId: Type.Optional(Type.String({ description: '可选目标模型 ID' })),
+    modelId: modelIdType,
     thinkingLevel: thinkingLevelType,
   })
 
-  function piJsonResult(payload: unknown): { content: Array<{ type: 'text'; text: string }>; details: unknown } {
-    const serialized = serializePiToolResultPayload(payload)
+  function piJsonResult(
+    payload: object,
+    budget?: DelegationResultBudgetOptions,
+    skipBudget = false,
+  ): { content: Array<{ type: 'text'; text: string }>; details: unknown } {
+    const withReceipts = {
+      ...payload,
+      collaborationReceipts: scope.receiptsFor(collectCollaborationReceiptRefs(payload)),
+    }
+    const value = skipBudget ? withReceipts : budgetDelegationResults(withReceipts, budget)
+    const serialized = serializePiToolResultPayload(value)
     return {
       content: [{ type: 'text', text: serialized.text }],
       details: serialized.details,
     }
   }
 
-  return [
+  const tools = [
     sdk.defineTool({
       name: 'mcp__collaboration__list_available_agent_models',
       label: '列出可用模型',
@@ -859,14 +1028,14 @@ export function buildPiCollaborationTools(
         role: roleType,
         task: Type.String({ description: '发送给子 Agent 的完整任务说明，必须自包含必要上下文' }),
         expectedOutput: Type.Optional(Type.String({ description: '希望子 Agent 最终返回的格式或要点' })),
-        modelId: Type.Optional(Type.String({ description: '可选目标模型 ID' })),
+        modelId: modelIdType,
         thinkingLevel: thinkingLevelType,
       }),
       async execute(toolCallId: string, params: unknown) {
         const args = params as DelegateAgentArgs
         const result = piDelegateAgentCalls.getOrCreate(ctx.sessionId, toolCallId, () => {
           const parent = assertCanCreateDelegation(ctx)
-          const created = startDelegation(ctx, parent, args)
+          const created = startDelegation(ctx, parent, args, scope)
           return {
             delegationId: created.record.delegationId,
             effectivePermissionMode: created.effectivePermissionMode,
@@ -907,7 +1076,7 @@ export function buildPiCollaborationTools(
                   sharedContext: args.sharedContext,
                   task: item.task,
                 }),
-              })
+              }, scope)
               created.push({
                 delegationId: started.record.delegationId,
                 effectivePermissionMode: started.effectivePermissionMode,
@@ -954,77 +1123,158 @@ export function buildPiCollaborationTools(
         mode: Type.Optional(Type.Union([Type.Literal('all'), Type.Literal('any')])),
         minCompleted: Type.Optional(Type.Number({ description: 'mode=any 时至少等待完成的数量，默认 1' })),
         timeoutSeconds: Type.Optional(Type.Number({ description: '最长等待秒数，默认 3600；最大 7200' })),
+        maxResultChars: Type.Optional(Type.Number({ minimum: 0, maximum: MAX_COLLABORATION_RESULT_CHARS, description: '总结果正文字符预算，默认12000' })),
+        maxCharsPerResult: Type.Optional(Type.Number({ minimum: 0, maximum: 32000, description: '单项正文字符预算，默认4000' })),
       }),
-      async execute(_toolCallId: string, params: unknown) {
-        const args = params as { delegationIds?: string[]; mode?: 'all' | 'any'; minCompleted?: number; timeoutSeconds?: number }
+      async execute(_toolCallId: string, params: unknown, signal?: AbortSignal) {
+        throwIfWaitAborted(signal)
+        const args = params as { delegationIds?: string[]; mode?: 'all' | 'any'; minCompleted?: number; timeoutSeconds?: number; maxResultChars?: number; maxCharsPerResult?: number }
         const ids = args.delegationIds?.length
           ? args.delegationIds
           : Array.from(delegations.values())
             .filter((item) => item.parentSessionId === ctx.sessionId && item.status === 'running')
             .map((item) => item.delegationId)
-        const { liveRecords, settled } = resolveWaitTargets(ids, ctx.sessionId)
-        const totalTargets = liveRecords.length + settled.length
+        const liveRecords = resolveWaitTargets(ids, ctx.sessionId)
+        const totalTargets = liveRecords.length
         if (totalTargets === 0) {
           return piJsonResult({ delegations: [], note: '没有找到可等待的协作委派' })
         }
         const mode = args.mode ?? 'all'
-        const minCompleted = args.minCompleted ?? 1
-        const timeoutSeconds = Math.min(
-          args.timeoutSeconds ?? DEFAULT_DELEGATION_WAIT_SECONDS,
-          MAX_DELEGATION_WAIT_SECONDS,
-        )
+        const minCompleted = Number.isFinite(args.minCompleted) ? Math.floor(args.minCompleted!) : 1
+        const timeoutSeconds = normalizeDelegationWaitSeconds(args.timeoutSeconds)
         const targetCompleted = mode === 'all' ? totalTargets : Math.max(1, Math.min(minCompleted, totalTargets))
-        const liveTarget = Math.max(0, targetCompleted - settled.length)
-        const waitResult = liveRecords.length > 0
-          ? await waitForLiveRecords(liveRecords, timeoutSeconds, liveTarget)
-          : 'completed'
-        const allDelegations = [...liveRecords.map(getDelegationSummary), ...settled]
+        await waitForLiveRecords(ctx.sessionId, ids, timeoutSeconds, targetCompleted, signal)
+        const allDelegations = resolveWaitTargets(ids, ctx.sessionId).map((record) => getDelegationSummary(record))
         const completedCount = allDelegations.filter((item) => item.status !== 'running').length
         const status = resolveDelegationWaitStatus({ finishedCount: completedCount, targetCompleted })
-        return piJsonResult({
+        const maxResultChars = args.maxResultChars ?? DEFAULT_COLLABORATION_RESULT_CHARS
+        const payload = {
           status,
           mode,
           completedCount,
           runningCount: allDelegations.filter((item) => item.status === 'running').length,
-          delegations: allDelegations,
-          note: status === 'timeout' || waitResult === 'timeout'
+          resultDetail: args.maxCharsPerResult === undefined ? 'preview' : undefined,
+          maxResultChars,
+          delegations: args.maxCharsPerResult === undefined
+            ? projectDelegationResults(
+                allDelegations as DelegationResultLike[],
+                { detail: 'preview', maxResultChars },
+              )
+            : allDelegations,
+          note: status === 'timeout'
             ? '等待未收敛：仍有委派在运行或未达到目标完成数，不能视为已完成。'
             : undefined,
-        })
+        }
+        if (args.maxCharsPerResult !== undefined) {
+          return piJsonResult(payload, {
+            totalChars: maxResultChars,
+            perResultChars: args.maxCharsPerResult,
+          })
+        }
+        return piJsonResult(payload, undefined, true)
       },
     }),
     sdk.defineTool({
       name: 'mcp__collaboration__list_delegations',
       label: '列出协作子会话',
-      description: '列出当前父会话创建的 Proma 协作子会话及状态。返回中的 thinkingLevel 表示配置/请求值，不代表模型 capability normalization 后的实际运行档位。',
+      description: '列出协作子会话的紧凑状态，默认不返回结果正文。scope=current 仅查看当前协作 scope；scope=history 分页排查当前父会话的历史委派。需要某条结论时用 get_delegation_results 按 ID 精读。',
       parameters: Type.Object({
+        scope: Type.Optional(Type.Union([
+          Type.Literal('current'),
+          Type.Literal('history'),
+        ], { description: 'current 仅当前协作 scope；history 为当前父会话的持久化历史。默认 history 以兼容旧调用。' })),
         includeCompleted: Type.Optional(Type.Boolean({ description: '是否包含已完成委派，默认 true' })),
+        includeResultPreview: Type.Optional(Type.Boolean({ description: '是否附带受总预算限制的结果预览，默认 false' })),
+        maxResultChars: Type.Optional(Type.Number({ minimum: 0, maximum: MAX_COLLABORATION_RESULT_CHARS, description: '结果预览合计最大字符数，默认 12000' })),
+        limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: '每页最多返回数量，默认 20' })),
+        cursor: Type.Optional(Type.String({ description: '上一页返回的 nextCursor' })),
       }),
       async execute(_toolCallId: string, params: unknown) {
-        const args = params as { includeCompleted?: boolean }
-        const items = listKnownDelegations(ctx.sessionId)
-        const delegationsResult = args.includeCompleted === false
-          ? items.filter((item) => item.status === 'running')
-          : items
-        return piJsonResult({
-          maxRunningDelegations: MAX_RUNNING_DELEGATIONS_PER_PARENT,
-          runningCount: delegationsResult.filter((item) => item.status === 'running').length,
-          delegations: delegationsResult,
+        const args = params as {
+          scope?: 'current' | 'history'
+          includeCompleted?: boolean
+          includeResultPreview?: boolean
+          maxResultChars?: number
+          limit?: number
+          cursor?: string
+        }
+        const listScope = args.scope ?? 'history'
+        const detail = args.includeResultPreview ? 'preview' : 'metadata'
+        const maxResultChars = args.maxResultChars ?? DEFAULT_COLLABORATION_RESULT_CHARS
+        const items = listKnownDelegations(
+          ctx.sessionId,
+          detail === 'preview',
+        ) as DelegationResultLike[]
+        const selected = selectDelegationResults({
+          scope: listScope,
+          dependencies: scope.snapshot.dependencies,
+          all: items,
+          includeCompleted: args.includeCompleted ?? true,
         })
+        const page = paginateDelegationResults(selected, {
+          cursor: args.cursor,
+          limit: args.limit,
+          order: listScope === 'history' ? 'newest-first' : 'input',
+        })
+        return piJsonResult({
+          scope: listScope,
+          scopeId: listScope === 'current' ? scope.snapshot.scopeId : undefined,
+          totalCount: page.totalCount,
+          nextCursor: page.nextCursor,
+          maxRunningDelegations: MAX_RUNNING_DELEGATIONS_PER_PARENT,
+          runningCount: selected.filter((item) => item.status === 'running').length,
+          resultDetail: detail,
+          maxResultChars,
+          delegations: projectDelegationResults(page.items, { detail, maxResultChars }),
+        }, undefined, true)
       },
     }),
     sdk.defineTool({
       name: 'mcp__collaboration__get_delegation_results',
       label: '读取子会话结果',
-      description: '按委派 ID 读取一个或多个 Proma 协作子会话的结果摘要。返回中的 thinkingLevel 表示配置/请求值，不代表模型 capability normalization 后的实际运行档位。',
+      description: '按明确 delegation ID 读取结果。默认返回受总预算限制的 preview；detail=full 只允许读取一个 ID，适合精读被截断的结论。兼容旧调用：传 maxCharsPerResult 或 resultOffset 时使用按偏移分页的 resultRead。',
       parameters: Type.Object({
         delegationIds: Type.Array(Type.String(), { description: '要读取结果的委派 ID 列表' }),
+        detail: Type.Optional(Type.Union([
+          Type.Literal('preview'),
+          Type.Literal('full'),
+        ], { description: '结果读取粒度，默认 preview' })),
+        maxResultChars: Type.Optional(Type.Number({ minimum: 0, maximum: MAX_COLLABORATION_RESULT_CHARS, description: '本次结果正文合计最大字符数，默认 12000；full 最大 50000' })),
+        maxCharsPerResult: Type.Optional(Type.Number({ minimum: 0, maximum: 32000, description: '兼容旧调用的单项正文预算；传入时使用 resultRead 分页' })),
+        resultOffset: Type.Optional(Type.Number({ minimum: 0, description: '兼容旧调用的 UTF-16 字符偏移；分页时仅指定一个委派' })),
       }),
       async execute(_toolCallId: string, params: unknown) {
-        const args = params as { delegationIds: string[] }
-        return piJsonResult({
-          delegations: args.delegationIds.map((delegationId) => getDelegationResult(ctx.sessionId, delegationId)),
+        const args = params as {
+          delegationIds: string[]
+          detail?: 'preview' | 'full'
+          maxResultChars?: number
+          maxCharsPerResult?: number
+          resultOffset?: number
+        }
+        const ids = [...new Set(args.delegationIds)]
+        if (args.resultOffset && ids.length !== 1) throw new Error('分页精读时请仅指定一个 delegationId')
+        if (args.maxCharsPerResult !== undefined || args.resultOffset !== undefined) {
+          return piJsonResult({
+            delegations: ids.map((delegationId) => getDelegationResult(ctx.sessionId, delegationId)),
+          }, {
+            totalChars: args.maxResultChars ?? 24_000,
+            perResultChars: args.maxCharsPerResult ?? 12_000,
+            offset: args.resultOffset,
+          })
+        }
+        const options = validateDelegationResultReadOptions({
+          delegationCount: ids.length,
+          detail: args.detail,
+          maxResultChars: args.maxResultChars,
         })
+        return piJsonResult({
+          detail: options.detail,
+          maxResultChars: options.maxResultChars,
+          delegations: projectDelegationResults(
+            ids.map((delegationId) => getDelegationResult(ctx.sessionId, delegationId)) as DelegationResultLike[],
+            options,
+          ),
+        }, undefined, true)
       },
     }),
     sdk.defineTool({
@@ -1129,70 +1379,44 @@ export function buildPiCollaborationTools(
     sdk.defineTool({
       name: 'mcp__collaboration__continue_delegation',
       label: '追加后续指令',
-      description: '向已完成、已失败、已取消或已中断的协作子会话追加后续指令。子会话保留完整上下文继续执行。',
+      description: '向已完成、已失败、已取消或已中断的协作子会话追加指令。接受请求后立即返回，不等待子任务完成；必须用wait_for_delegations收敛结果。同一toolCallId重放不会重复续跑。',
       parameters: Type.Object({
         delegationId: Type.String({ description: '要继续操作的委派 ID' }),
         message: Type.String({ description: '追加给子 Agent 的后续指令' }),
       }),
-      async execute(_toolCallId: string, params: unknown) {
+      async execute(toolCallId: string, params: unknown, signal?: AbortSignal) {
+        throwIfWaitAborted(signal)
         const args = params as { delegationId: string; message: string }
-        const record = getDelegationRecordForContinuation(ctx, args.delegationId)
-        if (!record) throw new Error(`未找到当前会话下的委派: ${args.delegationId}`)
-        if (record.status === 'running') {
-          throw new Error(`委派正在运行中，无法追加指令: ${args.delegationId}`)
-        }
-
-        record.status = 'running'
-        record.error = undefined
-        record.resultSummary = undefined
-        record.completedAt = undefined
-        const completionHandle = createDelegationCompletion()
-        record.completion = completionHandle.completion
-        record.resolveCompletion = completionHandle.resolveCompletion
-
-        updateAgentSessionMeta(record.childSessionId, { delegationStatus: 'running' })
-
-        runRegisteredHeadlessAgent(
-          {
-            sessionId: record.childSessionId,
-            userMessage: args.message,
-            channelId: record.channelId,
-            modelId: record.modelId,
-            workspaceId: ctx.workspaceId,
-            permissionModeOverride: record.permissionMode,
-            triggeredBy: 'delegation',
-            startedAt: Date.now(),
-          },
-          {
-            source: 'delegation',
-            originSessionId: ctx.sessionId,
-            onError: (error) => {
-              markDelegationFinished(record, 'failed', { error })
-            },
-            onComplete: (messages) => {
-              if (record.status !== 'running') return
-              const resultSummary = summarizeChildResult(record.childSessionId, messages)
-              markDelegationFinished(record, 'completed', { resultSummary })
-            },
-            onTitleUpdated: () => {},
-          },
-        ).catch((error: unknown) => {
-          markDelegationFinished(record, 'failed', {
-            error: error instanceof Error ? error.message : '未知错误',
+        const receipt = piContinueCalls.getOrCreate(ctx.sessionId, toolCallId, () => {
+          const message = assertNonBlank(args.message, 'message')
+          const record = getDelegationRecordForContinuation(ctx, args.delegationId)
+          if (!record) throw new Error(`未找到当前会话下的委派: ${args.delegationId}`)
+          if (record.status === 'running') throw new Error(`委派正在运行中，无法追加指令: ${args.delegationId}`)
+          scope.assertCanStart()
+          const requestedAt = Date.now()
+          const attemptId = randomUUID()
+          Object.assign(record, createDelegationCompletion(), {
+            status: 'running', error: undefined, resultSummary: undefined,
+            resultUuid: '', completedAt: undefined, startedAt: requestedAt, attemptId,
           })
+          persistDelegation(record)
+          scope.track(
+            record.delegationId,
+            attemptId,
+            toAttemptSnapshot(getDelegationSummary(record, false)),
+          )
+          notifyStateChanged()
+          runDelegation(record, message, ctx.workspaceId)
+          return { delegationId: record.delegationId, continuationId: randomUUID(), requestedAt }
         })
-
-        const timeout = new Promise<'timeout'>((resolve) => setTimeout(
-          () => resolve('timeout'),
-          DEFAULT_DELEGATION_WAIT_SECONDS * 1000,
-        ))
-        await Promise.race([record.completion, timeout])
-
         return piJsonResult({
-          delegation: getDelegationSummary(record),
-          note: record.status === 'running' ? '子会话仍在运行中（等待超时），可稍后用 wait_for_delegations 等待结果。' : undefined,
+          accepted: true,
+          continuation: receipt,
+          delegation: getDelegationResult(ctx.sessionId, receipt.delegationId),
+          note: '续跑请求已接受；这不是完成确认。请用wait_for_delegations收敛结果，不要因尚未完成而重复追加同一指令。',
         })
       },
     }),
   ]
+  return { tools, boundary: createCollaborationBoundary(ctx.sessionId) }
 }

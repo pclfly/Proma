@@ -12,16 +12,41 @@
  */
 
 import * as React from 'react'
-import { Bot, Loader2, AlertTriangle, FileText, FileImage, Download, Split, Undo2, RotateCw, Plus, Minimize2, Wrench, Settings, Cpu, ExternalLink, Quote, Clock, FolderInput, FolderPlus, ListTodo } from 'lucide-react'
+import {
+  Bot,
+  AlertTriangle,
+  FileText,
+  FileImage,
+  Download,
+  Split,
+  Undo2,
+  RotateCw,
+  Plus,
+  Minimize2,
+  Wrench,
+  Settings,
+  Cpu,
+  ExternalLink,
+  Quote,
+  Clock,
+  FolderInput,
+  FolderPlus,
+} from 'lucide-react'
 import { useAtomValue, useSetAtom } from 'jotai'
 import { cn } from '@/lib/utils'
 import { ImageLightbox, type LightboxImage } from '@/components/ui/image-lightbox'
 import { ContentBlock } from './ContentBlock'
 import { TurnFileChangesSummary, buildTurnFileNameMap } from './TurnFileChangesSummary'
 import { TurnSkillUsageSummary } from './TurnSkillUsageSummary'
-import { ProcessBlockGroup, buildAssistantTurnRenderItems } from './ProcessBlockGroup'
+import {
+  ProcessBlockGroup,
+  buildAssistantTurnRenderItems,
+  buildNestedProcessItems,
+  type AssistantTurnOutcome,
+} from './ProcessBlockGroup'
 import { extractToolResultText, TASK_TOOL_NAMES } from './task-progress'
 import { normalizeThinkTagsInContentBlocks } from './thinking-tag-parser'
+import { getAssistantAnswerFallback } from './assistant-answer-fallback'
 // 会话转录的纯逻辑(Turn 分组 / 快照去重 / 预览)已下沉到 @proma/session-core 作为唯一真源。
 // 这里 import 供本文件内部使用，并 re-export 以保持既有 `from './SDKMessageRenderer'` 导入方零改动。
 import {
@@ -36,25 +61,22 @@ import {
 } from '@proma/session-core'
 export { groupIntoTurns, getGroupPreview, extractUserText } from '@proma/session-core'
 export type { MessageGroup, AssistantTurn } from '@proma/session-core'
-import { DurationBadge } from './AgentMessages'
 import {
   Message,
-  MessageHeader,
   MessageContent,
   MessageActions,
   MessageAction,
   MessageResponse,
   UserMessageContent,
   TurnFileMapProvider,
+  useMessageSessionId,
 } from '@/components/ai-elements/message'
-import { UserAvatar } from '@/components/chat/UserAvatar'
-import { CopyButton } from '@/components/chat/CopyButton'
+import { CopyButton } from '@/components/session-shared/CopyButton'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { formatMessageTime } from '@/components/chat/ChatMessageItem'
+import { formatMessageTime } from '@/lib/message-time'
 import { getModelLogo, resolveModelDisplayName, resolveModelProvider } from '@/lib/model-logo'
-import { userProfileAtom } from '@/atoms/user-profile'
-import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/chat-atoms'
+import { channelsAtom, modelSelectorOpenAtom } from '@/atoms/channel-atoms'
 import { agentSessionPendingFilesAtom, agentSessionsAtom, agentWorkspacesAtom } from '@/atoms/agent-atoms'
 import { activeSessionIdAtom } from '@/atoms/tab-atoms'
 import { automationsAtom, automationFormAtom, automationToDraft } from '@/atoms/automation-atoms'
@@ -132,7 +154,7 @@ function PermissionDeniedNotice({ message }: { message: SDKSystemMessage }): Rea
   const reason = typeof message.decision_reason === 'string' ? message.decision_reason : undefined
 
   return (
-    <div className="my-3 pl-[46px] pr-1">
+    <div className="my-3 pr-1">
       <div className="flex items-start gap-2.5 rounded-md border border-amber-500/20 bg-amber-500/5 px-3 py-2.5 text-xs text-foreground/80">
         <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
         <div className="min-w-0 space-y-1">
@@ -186,7 +208,7 @@ function CompactStatusNotice({ message }: { message: SDKSystemMessage }): React.
   if (compactStatus === 'failed') {
     const error = typeof message.compact_error === 'string' ? message.compact_error : undefined
     return (
-      <div className="my-3 pl-[46px] pr-1">
+      <div className="my-3 pr-1">
         <div className="flex items-start gap-2.5 rounded-md border border-destructive/25 bg-destructive/5 px-3 py-2.5 text-xs text-foreground/80">
           <AlertTriangle className="mt-0.5 size-3.5 shrink-0 text-destructive" />
           <div className="min-w-0 space-y-1">
@@ -458,8 +480,12 @@ export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onR
     }
   }
 
+  const answerFallback = React.useMemo(() => getAssistantAnswerFallback({
+    assistantMessages: turn.assistantMessages, turnMessages: turn.turnMessages, isStreaming, stoppedByUser,
+  }), [turn.assistantMessages, turn.turnMessages, isStreaming, stoppedByUser])
+
   // 检测是否有主要内容（text 块），用于决定 tool/thinking 是否 dimmed
-  const hasTextContent = topLevelBlocks.some(
+  const hasTextContent = Boolean(answerFallback) || topLevelBlocks.some(
     (b) => b.type === 'text' && 'text' in b && !!(b as { text: string }).text
   )
 
@@ -473,6 +499,22 @@ export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onR
   const turnFileMap = React.useMemo(
     () => buildTurnFileNameMap(turn.turnMessages),
     [turn.turnMessages]
+  )
+
+  // 官方 0.22.0：过程摘要要标注终态。中断/失败轮次由过程组强制展开。
+  const turnOutcome: AssistantTurnOutcome = isStreaming
+    ? 'running'
+    : hasError
+      ? 'failed'
+      : stoppedByUser
+        ? 'stopped'
+        : 'completed'
+  const processStepCount = React.useMemo(
+    () => topLevelBlocks.reduce((count, block) => {
+      if (block.type !== 'tool_use') return count
+      return TASK_TOOL_NAMES.has((block as SDKToolUseBlock).name) ? count : count + 1
+    }, 0),
+    [topLevelBlocks],
   )
 
   // 如果只有错误消息
@@ -492,12 +534,13 @@ export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onR
   // 如果没有任何内容
   if (enrichedBlocks.length === 0 && !hasError) return null
 
-  const renderTopLevelBlock = (block: SDKContentBlock, i: number): React.ReactNode => {
-    // 任务进度由底部浮层统一呈现，输出记录不再重复显示任务卡。
-    if (block.type === 'tool_use' && TASK_TOOL_NAMES.has((block as SDKToolUseBlock).name)) {
-      return null
-    }
-
+  const renderTopLevelBlock = (
+    block: SDKContentBlock,
+    i: number,
+    isCurrent = false,
+    nestedThinking?: Array<{ block: SDKContentBlock; isCurrent?: boolean }>,
+  ): React.ReactNode => {
+    // 官方 0.22.0：任务工具族已下线，历史 TaskCreate/TaskUpdate 以普通工具行呈现。
     const isAgentTool = block.type === 'tool_use'
       && ((block as { name: string }).name === 'Agent' || (block as { name: string }).name === 'Task')
     const childBlocks = isAgentTool
@@ -515,21 +558,23 @@ export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onR
         dimmed={hasTextContent && block.type !== 'text'}
         childBlocks={childBlocks}
         isStreaming={isStreaming}
+        isCurrent={isCurrent}
+        nestedThinking={nestedThinking}
       />
     )
   }
 
-  const renderProcessGroupBlock = (block: SDKContentBlock, i: number): React.ReactNode => {
-    return renderTopLevelBlock(block, i)
+  const renderProcessGroupBlock = (
+    block: SDKContentBlock,
+    i: number,
+    isCurrent = false,
+    nestedThinking?: Array<{ block: SDKContentBlock; isCurrent?: boolean }>,
+  ): React.ReactNode => {
+    return renderTopLevelBlock(block, i, isCurrent, nestedThinking)
   }
 
   return (
     <Message from="assistant">
-      <MessageHeader
-        model={turn.model ? resolveModelDisplayName(turn.model, channels) : undefined}
-        time={turn.createdAt ? formatMessageTime(turn.createdAt) : undefined}
-        logo={<AssistantLogo model={turn.model} />}
-      />
       <MessageContent>
         <TurnFileMapProvider map={turnFileMap}>
         <div className={cn('space-y-2')}>
@@ -546,15 +591,41 @@ export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onR
                 key={groupKey}
                 blocks={groupBlocks}
                 isStreaming={isStreaming}
-                renderChildren={() => item.items.map((groupItem) => (
-                  <React.Fragment key={groupItem.index}>
-                    {renderProcessGroupBlock(groupItem.block, groupItem.index)}
-                  </React.Fragment>
-                ))}
-                isMessageTail={itemIndex === renderItems.length - 1}
+                outcome={turnOutcome}
+                startedAt={turn.createdAt}
+                durationMs={durationMs ?? undefined}
+                steps={processStepCount}
+                usage={usage}
+                renderChildren={() => {
+                  const entries = buildNestedProcessItems(item.items, {
+                    // 流式中的最后一段思考保持独立，保证「正在分析」始终可见。
+                    keepTailStandalone: !!isStreaming,
+                  })
+                  const lastIndex = item.items[item.items.length - 1]?.index
+                  return entries.map((entry) => (
+                    <React.Fragment key={entry.index}>
+                      {renderProcessGroupBlock(
+                        entry.block,
+                        entry.index,
+                        isStreaming && entry.index === lastIndex,
+                        entry.nestedThinking.map((nested) => ({
+                          block: nested.block,
+                          isCurrent: isStreaming && nested.index === lastIndex,
+                        })),
+                      )}
+                    </React.Fragment>
+                  ))
+                }}
+                isMessageTail={!answerFallback && itemIndex === renderItems.length - 1}
               />
             )
           })}
+          {answerFallback && (
+            <div data-assistant-answer-fallback="thinking-only" className="space-y-2">
+              <p className="text-xs text-muted-foreground">模型仅返回思考内容，以下为兼容展示，并非额外生成的最终答案。</p>
+              <ContentBlock block={{ type: 'text', text: answerFallback }} allMessages={allMessages} basePath={basePath} />
+            </div>
+          )}
         </div>
         {/* 如果有错误但也有内容块，在末尾以 tail 形式挂错误横幅附错误提示 + 重试按钮，保留正文本身的 markdown 排版 */}
         {hasError && errorContent && topLevelBlocks.length > 0 && (
@@ -581,7 +652,7 @@ export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onR
       )}
       {/* 操作栏：流式输出完成后显示操作按钮 */}
       {!isStreaming && (() => {
-        const textContent = topLevelBlocks
+        const textContent = answerFallback ?? topLevelBlocks
           .filter((b) => b.type === 'text' && 'text' in b)
           .map((b) => (b as { text: string }).text)
           .join('\n\n')
@@ -593,17 +664,10 @@ export function AssistantTurnRenderer({ turn, allMessages, basePath, onFork, onR
           ? mainlineAssistants[mainlineAssistants.length - 1]?.uuid
           : undefined
         const hasActions = !!(textContent || (onFork && lastUuid) || (onRewind && lastUuid))
-        const hasDuration = durationMs != null
-        if (!hasDuration && !hasActions && !showStoppedBadge) return null
+        if (!hasActions && !showStoppedBadge) return null
         return (
-          <MessageActions className="pl-[46px] mt-0.5 min-h-[28px] justify-start">
-            {hasDuration && <DurationBadge durationMs={durationMs!} usage={usage} />}
+          <MessageActions className="mt-0.5 min-h-[28px] justify-start">
             {textContent && <CopyButton content={textContent} />}
-            {textContent && onCreateTodo && (
-              <MessageAction tooltip="标记为 Todo" onClick={() => onCreateTodo(textContent)}>
-                <ListTodo className="size-3.5" />
-              </MessageAction>
-            )}
             {onFork && lastUuid && (
               <MessageAction tooltip="从此处探索（保留主线，结论可带回）" onClick={() => onFork(lastUuid)}>
                 <Split className="size-3.5" />
@@ -680,13 +744,6 @@ export function SDKMessageRenderer({
 
     return (
       <Message from="assistant">
-        {showHeader && (
-          <MessageHeader
-            model={model ? resolveModelDisplayName(model, channels) : undefined}
-            time={meta.createdAt ? formatMessageTime(meta.createdAt) : undefined}
-            logo={<AssistantLogo model={model} />}
-          />
-        )}
         <MessageContent>
           <div className={cn('space-y-2')}>
             {blocks.map((block, i) => (
@@ -789,6 +846,11 @@ function AttachedImageThumb({ file, index, onOpen, onLoaded }: {
   onLoaded: (path: string, src: string) => void
 }): React.ReactElement {
   const [imageSrc, setImageSrc] = React.useState<string | null>(null)
+  const sessionId = useMessageSessionId()
+  const context = React.useMemo(
+    () => sessionId ? { kind: 'agent' as const, sessionId } : undefined,
+    [sessionId],
+  )
 
   React.useEffect(() => {
     const ext = file.filename.split('.').pop()?.toLowerCase() ?? 'png'
@@ -799,18 +861,18 @@ function AttachedImageThumb({ file, index, onOpen, onLoaded }: {
     const mediaType = mimeMap[ext] ?? 'image/png'
 
     window.electronAPI
-      .readAttachment(file.path)
+      .readAttachment(file.path, context)
       .then((base64) => {
         const src = `data:${mediaType};base64,${base64}`
         setImageSrc(src)
         onLoaded(file.path, src)
       })
       .catch((err) => console.error('[AttachedImageThumb] 读取附件失败:', err))
-  }, [file.path, file.filename, onLoaded])
+  }, [file.path, file.filename, context, onLoaded])
 
   const handleSave = React.useCallback((): void => {
-    window.electronAPI.saveImageAs(file.path, file.filename)
-  }, [file.path, file.filename])
+    window.electronAPI.saveImageAs(file.path, file.filename, context)
+  }, [file.path, file.filename, context])
 
   if (!imageSrc) {
     return <div className="w-[200px] h-[140px] rounded-lg bg-muted/30 animate-pulse shrink-0" />
@@ -928,7 +990,6 @@ function UserInputMessage({ message, onAgentHistoryQuoteClick }: {
   message: SDKUserMessage
   onAgentHistoryQuoteClick?: (quote: QuotedSelection) => void
 }): React.ReactElement {
-  const userProfile = useAtomValue(userProfileAtom)
   const rawText = extractUserText(message) ?? ''
   const isScheduledRun = rawText.includes(SCHEDULED_RUN_MARKER)
   const { files: attachedFiles, quotes, text } = parseAttachedFiles(
@@ -940,6 +1001,11 @@ function UserInputMessage({ message, onAgentHistoryQuoteClick }: {
   const setSessionPendingFiles = useSetAtom(agentSessionPendingFilesAtom)
   const nonImageFiles = attachedFiles.filter((f) => !isImageFile(f.filename))
   const meta = extractMeta(message as unknown as SDKMessage)
+  const messageSessionId = useMessageSessionId()
+  const attachmentContext = React.useMemo(
+    () => messageSessionId ? { kind: 'agent' as const, sessionId: messageSessionId } : undefined,
+    [messageSessionId],
+  )
 
   const handleImageEditComplete = React.useCallback((editedDataUrl: string): void => {
     const base64 = editedDataUrl.split(',')[1]
@@ -987,30 +1053,14 @@ function UserInputMessage({ message, onAgentHistoryQuoteClick }: {
     () => imageFiles.map((file) => ({
       src: loadedSrcs[file.path] ?? '',
       alt: file.filename,
-      onSave: () => window.electronAPI.saveImageAs(file.path, file.filename),
+      onSave: () => window.electronAPI.saveImageAs(file.path, file.filename, attachmentContext),
       onEditComplete: handleImageEditComplete,
     })),
-    [imageFiles, loadedSrcs, handleImageEditComplete]
+    [imageFiles, loadedSrcs, handleImageEditComplete, attachmentContext]
   )
 
   return (
     <Message from="user">
-      <div className="flex items-start gap-2.5 mb-2.5">
-        <UserAvatar avatar={userProfile.avatar} size={35} />
-        <div className="flex flex-col justify-between h-[35px]">
-          <span className="text-sm font-semibold text-foreground/60 leading-none">{userProfile.userName}</span>
-          {(meta.createdAt || isScheduledRun) && (
-            <span className="flex items-center gap-2 leading-none">
-              {meta.createdAt && (
-                <span className="message-time text-[10px] text-foreground/[0.38]">{formatMessageTime(meta.createdAt)}</span>
-              )}
-              {isScheduledRun && (
-                <ScheduledRunBadge />
-              )}
-            </span>
-          )}
-        </div>
-      </div>
       <MessageContent>
         {/* 引用文件 Chip */}
         {quotes.filter((quote) => quote.sourceType !== 'agent-history').length > 0 && (
@@ -1061,7 +1111,7 @@ function UserInputMessage({ message, onAgentHistoryQuoteClick }: {
         />
       )}
       {text && (
-        <MessageActions className="pl-[46px] mt-0.5">
+        <MessageActions className="ml-auto mt-0.5">
           <CopyButton content={replaceAgentHistoryQuoteMentionsWithLabels(text)} />
         </MessageActions>
       )}
@@ -1346,15 +1396,6 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact, onReli
 
   return (
     <Message from="assistant">
-      <MessageHeader
-        model={undefined}
-        time={meta.createdAt ? formatMessageTime(meta.createdAt) : undefined}
-        logo={
-          <div className="size-[35px] rounded-[25%] bg-destructive/10 flex items-center justify-center">
-            <AlertTriangle size={18} className="text-destructive" />
-          </div>
-        }
-      />
       <MessageContent>
         <AssistantErrorTail
           message={message}
@@ -1366,7 +1407,7 @@ function ErrorMessage({ message, onRetry, onRetryInNewSession, onCompact, onReli
           standalone
         />
       </MessageContent>
-      <MessageActions className="pl-[46px] mt-0.5">
+      <MessageActions className="mt-0.5">
         <CopyButton content={copyText} />
       </MessageActions>
     </Message>

@@ -39,6 +39,39 @@ describe('convertPiMessage', () => {
     expect(JSON.stringify(message).length).toBeGreaterThan(content.length)
   })
 
+  test('propagates OpenAI Responses text phase to SDK text blocks', () => {
+    const phaseSignature = (phase: string): string => JSON.stringify({ v: 1, id: 'message-1', phase })
+    const message = convertPiMessage({
+      role: 'assistant',
+      api: 'openai-responses',
+      content: [
+        { type: 'text', text: '过程说明', textSignature: phaseSignature('commentary') },
+        { type: 'text', text: '最终回复', textSignature: phaseSignature('final_answer') },
+      ],
+    } as unknown as AssistantMessage, 'session-1') as {
+      message: { content: Array<{ type: string; text?: string; phase?: string }> }
+    }
+
+    expect(message.message.content[0]).toMatchObject({ phase: 'commentary' })
+    expect(message.message.content[1]).toMatchObject({ phase: 'final_answer' })
+  })
+
+  test('does not read text phase signatures from non-Responses providers', () => {
+    const message = convertPiMessage({
+      role: 'assistant',
+      api: 'anthropic-messages',
+      content: [{
+        type: 'text',
+        text: '最终回复',
+        textSignature: JSON.stringify({ v: 1, id: 'message-1', phase: 'final_answer' }),
+      }],
+    } as unknown as AssistantMessage, 'session-1') as {
+      message: { content: Array<{ phase?: string }> }
+    }
+
+    expect(message.message.content[0]?.phase).toBeUndefined()
+  })
+
   test('only exposes terminal Pi errors', () => {
     const providerError = 'Connection error. Failed to fetch'
     const nonTerminal = convertPiMessage({

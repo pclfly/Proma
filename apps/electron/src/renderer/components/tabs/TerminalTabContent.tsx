@@ -1,10 +1,12 @@
 import * as React from 'react'
+import { useAtomValue } from 'jotai'
 import { FitAddon } from '@xterm/addon-fit'
 import { Terminal } from '@xterm/xterm'
 import type { TerminalOutputEvent } from '@proma/shared'
 import '@xterm/xterm/css/xterm.css'
 import { detectIsWindows } from '@/lib/platform'
 import { getWindowsPtyOptions } from '@/lib/terminal-windows-pty'
+import { fontSizesAtom } from '@/atoms/font-sizes'
 
 // 保持系统等宽字体的字形度量；仅在 Powerline 私有区字符缺字时回退到 Nerd Font。
 const TERMINAL_FONT_FALLBACKS = [
@@ -38,8 +40,24 @@ export function TerminalTabContent({ terminalId, sessionId, cwd, terminateOnUnmo
   const terminalRef = React.useRef<Terminal>()
   const fitAddonRef = React.useRef<FitAddon>()
   const lastPtyDimensionsRef = React.useRef<{ cols: number; rows: number }>()
+  const fontSizes = useAtomValue(fontSizesAtom)
+  // 创建 xterm 时读取最新字号，但不把字号放进创建 effect 的依赖，避免改字号重建 PTY。
+  const terminalFontSizeRef = React.useRef(fontSizes.terminal)
+  terminalFontSizeRef.current = fontSizes.terminal
   // StrictMode 会模拟一次卸载再挂载；用单调 generation 区分真实关闭与这次重挂载。
   const lifecycleGenerationRef = React.useRef(0)
+
+  // 字号变化只更新 xterm 度量并重新 fit，不重建终端/PTY。
+  React.useEffect(() => {
+    const terminal = terminalRef.current
+    if (!terminal) return
+    terminal.options.fontSize = fontSizes.terminal
+    try {
+      fitAddonRef.current?.fit()
+    } catch {
+      // 终端尚未完成布局时忽略，下一次 ResizeObserver 会重试。
+    }
+  }, [fontSizes.terminal])
 
   React.useEffect(() => {
     const host = hostRef.current
@@ -52,7 +70,7 @@ export function TerminalTabContent({ terminalId, sessionId, cwd, terminateOnUnmo
       // 兼容路径，避免 resize 或输入回车时与 ConPTY 重复重排而导致光标上跳。
       reflowCursorLine: false,
       fontFamily: TERMINAL_FONT_FALLBACKS,
-      fontSize: 13,
+      fontSize: terminalFontSizeRef.current,
       lineHeight: 1.25,
       scrollback: 5_000,
       windowsPty: detectIsWindows() ? getWindowsPtyOptions() : undefined,

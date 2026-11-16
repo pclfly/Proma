@@ -14,8 +14,6 @@ import type {
 } from '@proma/shared'
 import { DingTalkBridge } from './dingtalk-bridge'
 import { getDingTalkMultiBotConfig, getDingTalkBotById } from './dingtalk-config'
-import { getDingTalkBotBindingsPath } from './config-paths'
-import { isBindingForDeletedWorkspace, loadBridgeChatBindings, saveBridgeChatBindings } from './bridge-binding-store'
 import { redactSensitiveLogValue } from './bridge-log-redaction'
 
 class DingTalkBridgeManager {
@@ -127,28 +125,15 @@ class DingTalkBridgeManager {
   }
 
   /**
-   * 清理删除项目的聊天绑定，包括尚未启动的 Bot 的持久化绑定文件。
-   * 活跃 Bot 由其 handler 负责同步内存与持久化；未启动 Bot 直接更新 JSON 文件。
+   * 关闭删除项目的活动路由。未启动Bot的旧记录保留，启动时会成为拒绝路由墓碑，
+   * 避免清空记录后把原chat静默创建到另一个默认项目。
    */
   removeBindingsForDeletedWorkspace(workspaceId: string, sessionIds: Iterable<string>): number {
     const deletedSessionIds = new Set(sessionIds)
-    const config = getDingTalkMultiBotConfig()
     let removedCount = 0
 
     for (const bridge of this.bridges.values()) {
       removedCount += bridge.removeBindingsForDeletedWorkspace(workspaceId, deletedSessionIds)
-    }
-
-    for (const bot of config.bots) {
-      if (this.bridges.has(bot.id)) continue
-
-      const filePath = getDingTalkBotBindingsPath(bot.id)
-      const bindings = loadBridgeChatBindings(filePath, `钉钉 Bridge/${bot.name}`)
-      const retained = bindings.filter((binding) => !isBindingForDeletedWorkspace(binding, workspaceId, deletedSessionIds))
-      if (retained.length === bindings.length) continue
-
-      saveBridgeChatBindings(filePath, retained, `钉钉 Bridge/${bot.name}`)
-      removedCount += bindings.length - retained.length
     }
 
     return removedCount

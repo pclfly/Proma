@@ -5,20 +5,71 @@
  * 每次执行都新建独立子会话（不污染来源会话，规避 orchestrator 同会话并发守卫）。
  */
 
+/**
+ * 单次运行状态
+ * - running：已开始执行、尚未结算（v5 起在运行开始时即原子落盘）
+ * - interrupted：上次进程退出/崩溃时遗留的 running 记录，启动恢复时改标
+ */
+export type AutomationRunStatus = 'running' | 'success' | 'error' | 'skipped' | 'interrupted'
+
+/** 运行的触发来源：调度器自动触发 / 用户手动「立即运行」 */
+export type AutomationRunTrigger = 'schedule' | 'manual'
+
 /** 单次自动运行的记录 */
 export interface AutomationRun {
+  /**
+   * 本轮运行的唯一标识（v5 起新增）。
+   * 结束结算按 runId 合并回同一条记录，迟到回调不会覆盖新一轮。
+   */
+  runId: string
   /** 本次触发的时间戳 */
   runAt: number
-  /** 本轮新建的子会话 ID（可点进去查看执行详情） */
+  /** 本轮子会话 ID（可点进去查看执行详情；会话创建前为空字符串） */
   sessionId: string
-  /** 运行结果 */
-  status: 'success' | 'error' | 'skipped'
+  /** 运行状态 */
+  status: AutomationRunStatus
+  /** 结束时间戳（status === 'running' 时为空） */
+  finishedAt?: number
   /** 耗时（毫秒） */
   durationMs?: number
   /** 失败原因（status === 'error' 时） */
   error?: string
   /** 跳过原因（status === 'skipped' 时，如来源会话忙） */
   skipReason?: string
+  /** 触发来源（旧记录可能缺失） */
+  trigger?: AutomationRunTrigger
+}
+
+/** 上次进程退出时遗留 running 记录的统一错误文案 */
+export const AUTOMATION_RUN_INTERRUPTED_ERROR = '运行被中断（应用退出或崩溃）'
+
+/** 启动一次运行的阶段结果 */
+export type AutomationRunStartPhase =
+  | 'running'
+  | 'busy'
+  | 'paused'
+  | 'not-runnable'
+  | 'not-found'
+  | 'failed'
+
+/**
+ * 「立即运行」的启动摘要。
+ * 只要会话已创建就立即返回 started=true，不等待任务执行结束；
+ * 并发、配置不完整、启动失败等情况返回 started=false 并给出原因。
+ */
+export interface AutomationRunStartResult {
+  started: boolean
+  /** 任务 ID */
+  id: string
+  phase: AutomationRunStartPhase
+  /** 本轮运行 ID（已落盘 running 时返回） */
+  runId?: string
+  /** 已创建/复用的子会话 ID */
+  sessionId?: string
+  /** started=false 时的可读原因 */
+  reason?: string
+  /** 附加说明（例如已暂停任务的手动单次运行） */
+  note?: string
 }
 
 /** 调度模式 */
@@ -206,6 +257,13 @@ export interface UpdateAutomationInput {
 }
 
 /** Automation 相关 IPC 通道常量 */
+/** 删除任务并清理历史会话的结果；失败不抛出，按计数回报。 */
+export interface AutomationDeletionResult {
+  deleted: boolean
+  deletedHistoricalSessionCount: number
+  failedHistoricalSessionCount: number
+}
+
 export const AUTOMATION_IPC_CHANNELS = {
   /** 获取全部定时任务 */
   LIST: 'automation:list',
@@ -213,8 +271,10 @@ export const AUTOMATION_IPC_CHANNELS = {
   CREATE: 'automation:create',
   /** 更新定时任务 */
   UPDATE: 'automation:update',
-  /** 删除定时任务 */
+  /** 删除定时任务（仅删任务本身，保留历史会话） */
   DELETE: 'automation:delete',
+  /** 删除定时任务并清理其历史会话 */
+  DELETE_WITH_SESSIONS: 'automation:delete-with-sessions',
   /** 切换启用/暂停 */
   TOGGLE: 'automation:toggle',
   /** 立即运行一次（不影响调度计时） */

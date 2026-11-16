@@ -8,6 +8,9 @@ export interface PreviewContentCacheEntry {
   pdfSrc?: string
   imageDataUrl?: string
   imagePath?: string
+  /** 可内联播放的音视频 URL（proma-file:// Range 由主进程提供）。 */
+  mediaSrc?: string
+  mediaKind?: 'video' | 'audio'
   officeHtml?: string
   officeHtmlUrl?: string
   officeText?: string

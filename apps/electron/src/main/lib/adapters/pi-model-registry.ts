@@ -6,17 +6,24 @@
  */
 
 import {
+  ALL_THINKING_LEVELS,
+  type ReasoningProfileConfigData,
   CODEX_GPT_54_55_CONTEXT_WINDOW,
   CODEX_GPT_54_MINI_CONTEXT_WINDOW,
   CODEX_GPT_56_CONTEXT_WINDOW,
   CODEX_GPT_6_CONTEXT_WINDOW,
+  GPT_6_ASTRA_CONTEXT_WINDOW,
+  inferCorrectedGPTContextWindow,
   extractZhipuCodingTeamApiToken,
   inferContextWindow,
+  inferKnownContextWindow,
   inferCodexAlignedGPT5ContextWindow,
   getGeminiModelCapability,
+  getKimiContextWindow,
   isGpt6AstraFamily,
   isGpt6LunaFamily,
   isGpt6SolFamily,
+  isKimiK31Model,
   isMimoV26Model,
   resolveReasoningCapability,
   resolveReasoningProfile,
@@ -37,6 +44,7 @@ import type { Api, KnownProvider, Model } from '@earendil-works/pi-ai/compat'
 import type { PiAgentQueryOptions } from './pi-agent-adapter'
 import { rememberXaiOAuthCredentials, refreshXaiOAuthCredentialsSerial } from '../xai-oauth-credentials'
 import { supportsPiDeveloperRole } from './pi-provider-compat'
+import { isManagedCodexModelAllowed } from '../codex-model-policy'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 type PiAiCompat = typeof import('@earendil-works/pi-ai/compat')
@@ -60,10 +68,29 @@ const ZERO_MODEL_COST: PiModelCost = { input: 0, output: 0, cacheRead: 0, cacheW
 export const DEFAULT_CONTEXT_WINDOW = 200_000
 const DEFAULT_MAX_TOKENS = 64_000
 const VOLCENGINE_GLM_MAX_TOKENS = 128_000
+// 官方 0.22.60：火山未登记型号回退 500K 上下文，而不是通用 200K 默认值。
+const VOLCENGINE_FALLBACK_CONTEXT_WINDOW = 500_000
 /** GLM-5.3 系列均支持 128K 最大输出。 */
 const GLM_53_FAMILY_MAX_TOKENS = 131_072
 /** MiMo-V2.6 系列（pro / flash / pro-ultraspeed）官方最大输出均为 128K。 */
 const MIMO_V26_FAMILY_MAX_TOKENS = 128_000
+/**
+ * Kimi K3.1 在 kimi-coding 渠道的 OpenAI 兼容能力。
+ *
+ * 官方 0.21.92 将 Kimi Coding Plan 切到 openai-completions；Pi catalog 尚未
+ * 收录 K3.1 时用这份兜底，避免 thinking/reasoning 字段被按 Anthropic 协议发送。
+ */
+const KIMI_K31_COMPAT: NonNullable<PiCatalogModel['compat']> = {
+  supportsStrictMode: false,
+  supportsStore: false,
+  supportsDeveloperRole: false,
+  supportsReasoningEffort: true,
+  maxTokensField: 'max_tokens',
+  thinkingFormat: 'openai',
+  requiresReasoningContentOnAssistantMessages: true,
+  supportsMidConvoSystemMessages: true,
+  supportsMidConvoToolAdditions: true,
+}
 const CODEX_BASE_URL = 'https://chatgpt.com/backend-api'
 const CODEX_MAX_TOKENS = 128_000
 /** 已从 ChatGPT Codex 订阅下线、不得再展示或运行的模型。 */
@@ -87,13 +114,14 @@ export function getCodexAlignedGPT5Capabilities(modelId: string | undefined): Pi
   return { contextWindow }
 }
 
-function toReasoningTransport(api: Api): ReasoningTransport {
+export function toReasoningTransport(api: Api): ReasoningTransport {
   switch (api) {
     case 'anthropic-messages':
       return 'anthropic-messages'
     case 'openai-completions':
       return 'openai-completions'
     case 'openai-responses':
+    case 'openai-codex-responses':
       return 'openai-responses'
     default:
       return 'other'
@@ -101,19 +129,27 @@ function toReasoningTransport(api: Api): ReasoningTransport {
 }
 
 /** 将共享 reasoning profile 编译为 Pi SDK 的 model compatibility patch。 */
-function compilePiReasoningCapabilities(
+export function compilePiReasoningCapabilities(
   api: Api,
   modelId: string | undefined,
-): Pick<PiModelDefaults, 'compat' | 'thinkingLevelMap'> | undefined {
+  profiles?: readonly ReasoningProfileConfigData[],
+): Pick<PiModelDefaults, 'reasoning' | 'compat' | 'thinkingLevelMap'> | undefined {
   const transport = toReasoningTransport(api)
-  const profile = resolveReasoningProfile({ modelId, transport })
+  const profile = resolveReasoningProfile({ modelId, transport, profiles })
   const encoding = profile?.encodings[transport]
-  if (!encoding) return undefined
+  if (!profile || !encoding) return undefined
+  if (profile.reasoning === false) return { reasoning: false, compat: { supportsMidConvoEffort: false } }
 
-  const thinkingLevelMap = encoding.effortMap as PiCatalogModel['thinkingLevelMap']
+  // Pi 会再次 clamp；用相同 levels 排除档位，扩展档位必须有显式映射。
+  const thinkingLevelMap: NonNullable<PiCatalogModel['thinkingLevelMap']> = { ...encoding.effortMap }
+  for (const level of ALL_THINKING_LEVELS) {
+    if (!profile.levels.includes(level)) thinkingLevelMap[level] = null
+    else if ((level === 'xhigh' || level === 'max') && thinkingLevelMap[level] === undefined) thinkingLevelMap[level] = level
+  }
   switch (encoding.kind) {
     case 'adaptive-effort':
       return {
+        reasoning: true,
         compat: { forceAdaptiveThinking: true },
         thinkingLevelMap,
       }
@@ -121,14 +157,16 @@ function compilePiReasoningCapabilities(
     // Pi's generic stream emits a legacy budget; the runtime request extension
     // replaces it with `thinking: enabled` + `output_config.effort`.
     case 'deepseek-output-effort':
-      return { thinkingLevelMap }
+      return { reasoning: true, thinkingLevelMap }
     case 'openai-reasoning-effort':
       return {
+        reasoning: true,
         compat: { supportsReasoningEffort: true },
         thinkingLevelMap,
       }
     case 'zai-thinking-effort':
       return {
+        reasoning: true,
         compat: {
           supportsDeveloperRole: false,
           supportsReasoningEffort: true,
@@ -138,6 +176,16 @@ function compilePiReasoningCapabilities(
         thinkingLevelMap,
       }
   }
+}
+
+/** 普通 API / OAuth 共用最终模型补丁，返回副本，不修改 Pi 共享 catalog。 */
+export function applyPiReasoningProfile(
+  model: PiCatalogModel,
+  profiles?: readonly ReasoningProfileConfigData[],
+): PiCatalogModel {
+  const patch = compilePiReasoningCapabilities(model.api, model.id, profiles)
+  if (!patch) return model
+  return { ...model, ...patch, compat: { ...model.compat, ...patch.compat } }
 }
 
 /**
@@ -354,19 +402,50 @@ function applyPiModelCapabilityOverrides(model: PiCatalogModel | undefined): PiC
   const normalizedId = model.id.trim().toLowerCase()
   // Google 协议模型的 thinking 档位由 API 合约决定，而非目录供应商名。
   const geminiCapability = model.api === 'google-generative-ai' ? getGeminiModelCapability(normalizedId) : undefined
-  const requiresMinimalThinkingExclusion = geminiCapability && !geminiCapability.thinkingLevels.includes('minimal')
   const input: PiCatalogModel['input'] = supportsPiNativeImageInput(model.id) && !model.input.includes('image')
     ? [...model.input, 'image']
     : model.input
-  const thinkingLevelMap = requiresMinimalThinkingExclusion
-    ? { ...model.thinkingLevelMap, minimal: null }
-    : model.thinkingLevelMap
+  // Gemini 4 各型号的合法档位不同：能力表之外的一律显式禁用，避免 UI 提供
+  // 会让上游 400 的档位（如 Carbon 的 xhigh、Hydrogen 的 minimal）。
+  const geminiLevelOverrides = geminiCapability
+    ? (() => {
+        const overrides: NonNullable<PiCatalogModel['thinkingLevelMap']> = { ...model.thinkingLevelMap }
+        for (const level of ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) {
+          // off 由 Google adapter 归一到模型最低档，属于通用的「尽量少想」入口，
+          // 不因能力表未列出而禁用；其余档位必须严格受能力表约束。
+          if (level === 'off') continue
+          if ((geminiCapability.thinkingLevels as readonly string[]).includes(level)) {
+            if (level === 'xhigh' && overrides[level] === undefined) overrides[level] = 'xhigh'
+          } else {
+            overrides[level] = null
+          }
+        }
+        return overrides
+      })()
+    : undefined
+  const thinkingLevelMap = geminiLevelOverrides ?? model.thinkingLevelMap
 
-  if (input === model.input && thinkingLevelMap === model.thinkingLevelMap) return model
-  return { ...model, input, ...(thinkingLevelMap ? { thinkingLevelMap } : {}) }
+  const correctedContextWindow = inferCorrectedGPTContextWindow(model.id)
+  const contextWindow = correctedContextWindow ?? model.contextWindow
+  if (input === model.input && thinkingLevelMap === model.thinkingLevelMap && contextWindow === model.contextWindow) return model
+  return { ...model, input, contextWindow, ...(thinkingLevelMap ? { thinkingLevelMap } : {}) }
 }
 
 const CODEX_MODEL_PATCHES: PiCatalogModelPatch[] = [
+  {
+    // 官方 0.21.67-01：Codex 订阅的 GPT-6.1 Terra，500K 上下文 + 图片输入，订阅计费不计入成本。
+    id: 'gpt-6.1-terra',
+    name: 'GPT-6.1 Terra',
+    api: 'openai-codex-responses',
+    provider: 'openai-codex',
+    baseUrl: CODEX_BASE_URL,
+    reasoning: true,
+    thinkingLevelMap: compilePiReasoningCapabilities('openai-responses', 'gpt-6.1-terra')?.thinkingLevelMap,
+    input: ['text', 'image'],
+    cost: ZERO_MODEL_COST,
+    contextWindow: 500_000,
+    maxTokens: CODEX_MAX_TOKENS,
+  },
   {
     id: 'gpt-6-astra',
     name: 'GPT-6 Astra',
@@ -377,7 +456,7 @@ const CODEX_MODEL_PATCHES: PiCatalogModelPatch[] = [
     thinkingLevelMap: compilePiReasoningCapabilities('openai-responses', 'gpt-6-astra')?.thinkingLevelMap,
     input: ['text', 'image'],
     cost: ZERO_MODEL_COST,
-    contextWindow: CODEX_GPT_6_CONTEXT_WINDOW,
+    contextWindow: GPT_6_ASTRA_CONTEXT_WINDOW,
     maxTokens: CODEX_MAX_TOKENS,
   },
   {
@@ -466,9 +545,10 @@ function loadPiAiCompat(): Promise<PiAiCompat> {
   return piAiCompatPromise
 }
 
-function normalizePiApi(provider: ProviderType): Api {
+export function normalizePiApi(provider: ProviderType): Api {
   switch (provider) {
     case 'openai':
+    case 'kimi-coding':
     case 'xai':
     case 'zhipu':
     case 'doubao-api':
@@ -623,7 +703,7 @@ async function findPiCatalogModel(provider: ProviderType, modelId: string): Prom
 
 /**
  * 解析模型图片输入能力。未知模型保持 unknown，由调用方决定是否保守拒绝。
- * 视觉助手等会产生数据外发的功能必须仅接受 confirmed supported。
+ * 会产生数据外发的功能必须仅接受 confirmed supported。
  */
 export async function resolvePiImageInputCapability(
   provider: ProviderType,
@@ -639,27 +719,23 @@ export async function resolvePiImageInputCapability(
   return catalogModel.input.includes('image') ? 'supported' : 'unsupported'
 }
 
-/** Vision Relay 的实际请求路由。 */
-export interface PiVisionRelayRoute {
-  adapterProvider: ProviderType
-  baseUrl?: string
-}
-
-export async function resolvePiVisionRelayRoute(
-  provider: ProviderType,
-  modelId: string | undefined,
-): Promise<PiVisionRelayRoute | undefined> {
-  const resolvedModelId = stripLegacyAgentSdkContextSuffix(modelId)
-  if (provider === 'opencode-go-openai' || !resolvedModelId) return undefined
-  // DeepSeek Flash 的实验视觉模型尚未进入 Pi catalog；其渠道协议无需 catalog 分流。
-  if (supportsPiNativeImageInput(resolvedModelId)) {
-    return { adapterProvider: provider }
+/** 设置页只展示已知能力；未知模型不使用运行时的 200K 兜底。 */
+export async function resolvePiBuiltInContextWindow(provider: ProviderType, modelId: string): Promise<number | undefined> {
+  const id = stripLegacyAgentSdkContextSuffix(modelId)
+  if (!id) return undefined
+  const corrected = inferCorrectedGPTContextWindow(id)
+  if (corrected !== undefined) return corrected
+  const catalog = await findPiCatalogModel(provider, id)
+  const known = inferKnownContextWindow(id)
+  const aligned = inferCodexAlignedGPT5ContextWindow(id)
+  if (provider === 'openai-codex' || provider === 'github-copilot' || provider === 'xai') {
+    return catalog?.contextWindow ?? known
   }
-
-  const catalogModel = await findPiCatalogModel(provider, resolvedModelId)
-  if (!catalogModel?.input.includes('image')) return undefined
-
-  return { adapterProvider: provider }
+  if (aligned !== undefined) return aligned
+  const windows = [catalog?.contextWindow, known].filter((value): value is number =>
+    value !== undefined && Number.isFinite(value) && value > 0,
+  )
+  return windows.length > 0 ? Math.max(...windows) : undefined
 }
 
 /**
@@ -671,6 +747,7 @@ export async function resolvePiVisionRelayRoute(
 export async function resolvePiReasoningCapability(
   provider: ProviderType,
   modelId: string | undefined,
+  profiles?: readonly ReasoningProfileConfigData[],
 ): Promise<ReasoningCapability | undefined> {
   const resolvedModelId = stripLegacyAgentSdkContextSuffix(modelId)
   const catalogModel = resolvedModelId
@@ -680,7 +757,8 @@ export async function resolvePiReasoningCapability(
     modelId: resolvedModelId,
     transport: provider === 'openai-codex' || provider === 'xai'
       ? 'openai-responses'
-      : toReasoningTransport(resolvePiApi(provider)),
+      : toReasoningTransport(provider === 'github-copilot' && catalogModel ? catalogModel.api : resolvePiApi(provider)),
+    profiles,
   })
   return resolveReasoningCapability({
     profile,
@@ -695,7 +773,16 @@ async function resolvePiModelDefaults(input: PiAgentQueryOptions): Promise<PiMod
   const catalogModel = input.model ? await findPiCatalogModel(input.provider, input.model) : undefined
   const codexAlignedCapabilities = getCodexAlignedGPT5Capabilities(input.model)
   const api = resolvePiApi(input.provider)
-  const providerSpecificCapabilities = compilePiReasoningCapabilities(api, input.model)
+  const providerSpecificCapabilities = compilePiReasoningCapabilities(api, input.model, input.reasoningProfiles)
+  const isKimiK31 = isKimiK31Model(input.model)
+  // Kimi 仅沿用同渠道、同协议的 catalog compat；catalog 未收录 K3.1 时用官方兜底。
+  const kimiCompat = input.provider === 'kimi-coding'
+    ? (catalogModel?.provider === 'kimi-coding' && catalogModel.api === api
+        ? catalogModel.compat
+        : isKimiK31
+          ? KIMI_K31_COMPAT
+          : undefined)
+    : undefined
   const glmModelId = input.model?.toLowerCase()
   const isVolcengineGlm5x = input.provider === 'doubao-api'
     && (glmModelId === 'glm-5.2' || glmModelId === 'glm-5.3')
@@ -709,23 +796,33 @@ async function resolvePiModelDefaults(input: PiAgentQueryOptions): Promise<PiMod
   const shouldForceAdaptiveThinking = shouldForcePiAdaptiveThinking(api, catalogModel, input.model)
   return {
     api,
-    reasoning: catalogModel?.reasoning ?? true,
+    reasoning: providerSpecificCapabilities?.reasoning ?? catalogModel?.reasoning ?? true,
     thinkingLevelMap: providerSpecificCapabilities?.thinkingLevelMap
       ?? catalogModel?.thinkingLevelMap,
     compat: shouldForceAdaptiveThinking
       ? { ...providerSpecificCapabilities?.compat, forceAdaptiveThinking: true }
-      : providerSpecificCapabilities?.compat,
+      : kimiCompat
+        ? { ...kimiCompat, ...providerSpecificCapabilities?.compat }
+        : providerSpecificCapabilities?.compat,
     input: catalogModel ? [...catalogModel.input] : ['text', 'image'],
     cost: catalogModel ? { ...catalogModel.cost } : { ...ZERO_MODEL_COST },
     // 用户为单模型配置的上下文窗口优先；Codex 对齐策略次之；
     // 其他模型仍保留 catalog 与 shared inference 中更大的已验证能力。
+    // Kimi K3.1 使用其目录窗口，避免把 k3-256k 按通用 K3 家族放大。
     contextWindow: input.channelModelContextWindow
       ?? codexAlignedCapabilities?.contextWindow
-      ?? Math.max(catalogContextWindow, inferredContextWindow),
+      ?? (isKimiK31
+        ? (catalogModel?.contextWindow ?? getKimiContextWindow(input.model) ?? DEFAULT_CONTEXT_WINDOW)
+        : kimiCompat
+          ? catalogContextWindow
+          : input.provider === 'doubao-api' && !catalogModel
+            ? VOLCENGINE_FALLBACK_CONTEXT_WINDOW
+            : Math.max(catalogContextWindow, inferredContextWindow)),
     // Pi 的智谱目录将 GLM-5.2 标为 131072，但火山方舟兼容端点上限为 128000；GLM-5.3 同理。
     maxTokens: isVolcengineGlm5x
       ? VOLCENGINE_GLM_MAX_TOKENS
-      : (catalogModel?.maxTokens
+      : (((isKimiK31 && !catalogModel) ? 131_072 : undefined)
+        ?? catalogModel?.maxTokens
         ?? (isCatalogMissingGlm53Family
           ? GLM_53_FAMILY_MAX_TOKENS
           : isCatalogMissingMimoV26Family
@@ -737,6 +834,12 @@ async function resolvePiModelDefaults(input: PiAgentQueryOptions): Promise<PiMod
 export function normalizePiBaseUrl(baseUrl: string | undefined, provider: ProviderType, api = normalizePiApi(provider)): string | undefined {
   if (!baseUrl) return undefined
   const normalizedBaseUrl = baseUrl.trim().replace(/\/+$/, '')
+  // Kimi Coding Plan 走 OpenAI completions；用户可能粘贴完整 messages/chat/completions
+  // 路径，统一收敛到带 /v1 的协议根，避免 Pi 再拼一次路径。
+  if (provider === 'kimi-coding' && api === 'openai-completions') {
+    const rootUrl = normalizedBaseUrl.replace(/\/(?:messages|chat\/completions)$/i, '')
+    return /\/v1$/i.test(rootUrl) ? rootUrl : `${rootUrl}/v1`
+  }
   if (api === 'anthropic-messages') {
     return normalizeAnthropicBaseUrlForSdk(resolveAnthropicMessagesUrl(normalizedBaseUrl, provider))
   }
@@ -856,8 +959,10 @@ function isCompleteCatalogModel(model: PiCatalogModelPatch): model is PiCatalogM
 
 function isSupportedCodexModel(model: Pick<PiCatalogModel, 'id'>): boolean {
   const modelId = model.id.trim().toLowerCase()
-  return !UNSUPPORTED_CODEX_MODEL_IDS.has(modelId)
-    && !UNSUPPORTED_CODEX_MODEL_PREFIXES.some((prefix) => modelId === prefix || modelId.startsWith(`${prefix}-`))
+  if (UNSUPPORTED_CODEX_MODEL_IDS.has(modelId)) return false
+  if (UNSUPPORTED_CODEX_MODEL_PREFIXES.some((prefix) => modelId === prefix || modelId.startsWith(`${prefix}-`))) return false
+  // 官方白名单为精确 ID；本地额外保留 Astra SKU 变体与 Terra -1 入口。
+  return isManagedCodexModelAllowed(modelId)
 }
 
 export async function getCodexCatalogModels(): Promise<PiCatalogModel[]> {
@@ -888,6 +993,9 @@ export async function buildCodexModel(sdk: PiSdk, input: CodexModelInput) {
   })
 
   const resolvedModelId = stripLegacyAgentSdkContextSuffix(input.model)
+  if (resolvedModelId && !isManagedCodexModelAllowed(resolvedModelId)) {
+    throw new Error(`未找到指定的 ChatGPT (Codex) 模型: ${resolvedModelId}`)
+  }
   const runtimeModels = modelRuntime.getModels('openai-codex').filter(isSupportedCodexModel)
   const codexModels = await getCodexCatalogModels()
   const model = resolvedModelId
@@ -1008,13 +1116,16 @@ export async function buildModel(sdk: PiSdk, input: PiAgentQueryOptions) {
     throw new Error('OpenCode Go 渠道已停用，请选择其他渠道')
   }
   if (input.provider === 'openai-codex') {
-    return buildCodexModel(sdk, input)
+    const result = await buildCodexModel(sdk, input)
+    return { ...result, model: applyPiReasoningProfile({ ...applyPiModelCapabilityOverrides(result.model)!, ...(input.channelModelContextWindow ? { contextWindow: input.channelModelContextWindow } : {}) }, input.reasoningProfiles) }
   }
   if (input.provider === 'xai') {
-    return buildXaiModel(sdk, input)
+    const result = await buildXaiModel(sdk, input)
+    return { ...result, model: applyPiReasoningProfile({ ...applyPiModelCapabilityOverrides(result.model)!, ...(input.channelModelContextWindow ? { contextWindow: input.channelModelContextWindow } : {}) }, input.reasoningProfiles) }
   }
   if (input.provider === 'github-copilot') {
-    return buildGithubCopilotModel(sdk, input)
+    const result = await buildGithubCopilotModel(sdk, input)
+    return { ...result, model: applyPiReasoningProfile({ ...applyPiModelCapabilityOverrides(result.model)!, ...(input.channelModelContextWindow ? { contextWindow: input.channelModelContextWindow } : {}) }, input.reasoningProfiles) }
   }
   const providerName = `proma-${input.provider}-${input.sessionId}`
   const resolvedApiKey = resolvePiApiKey(input.provider, input.apiKey)

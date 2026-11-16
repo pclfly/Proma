@@ -1,17 +1,19 @@
-import { app, BrowserWindow, WebContentsView, session as electronSession, type DownloadItem, type Session, type WebContents } from 'electron'
+import { app, BrowserWindow, WebContentsView, nativeImage, session as electronSession, type DownloadItem, type Session, type WebContents } from 'electron'
 import path from 'node:path'
 import { realpath, stat } from 'node:fs/promises'
-import type { BrowserExecutionSource, BrowserOperationStatus, BrowserSessionClosed, BrowserTabFocusChange, BrowserTraceAction, BrowserTraceItem, BrowserViewLayout, BrowserViewState, BrowserTabState } from '@proma/shared'
+import type { BrowserExecutionSource, BrowserOperationStatus, BrowserPreviewFrame, BrowserSessionClosed, BrowserTabFocusChange, BrowserTraceAction, BrowserTraceItem, BrowserViewLayout, BrowserViewState, BrowserTabState } from '@proma/shared'
 import { AGENT_IPC_CHANNELS } from '@proma/shared'
 import { assertSafeBrowserDestination, assertSafeBrowserDestinationWithFallback, assertSafeBrowserDownloadUrl, assertSafeBrowserUrl, isSupportedBrowserPopupUrl, isTransientBrowserPopupUrl, USER_NEW_TAB_URL } from './browser-policy'
+import { ensureBrowserSystemNetwork } from './network/browser-network'
 import { createAuthorizedPreviewUrl, isAuthorizedPreviewProtocol } from './browser-preview-service'
+import { findReusablePreviewTab, selectExcessTabsToReclaim } from './browser-tab-lifecycle'
 import { handlePromaFileRequest } from './local-file-protocol'
 import { BrowserCdpTimeoutError, BrowserOperationAbortedError, BROWSER_OBSERVE_TIMEOUT_MS, resolveBrowserObserveAxDepth, throwIfBrowserOperationAborted, withBrowserCdpTimeout } from './browser-cdp'
+import { BrowserPreviewCapture } from './browser-preview-capture'
 import { parseBrowserPressAction } from './browser-key-policy'
 import { browserObservationNameLimit, prioritizeBrowserObservationCandidates, resolveBrowserObserveMaxElements } from './browser-observation-policy'
 import { buildPersistentBrowserPartition, resolveBrowserProfileKey } from './browser-profile-policy'
 import { canBrowserSessionTakeForeground, isNewBrowserTabLayoutRevision } from './browser-presentation-policy'
-import { hasAcknowledgedBrowserRiskDisclaimer } from './browser-risk-disclaimer'
 import { buildPromaBrowserUserAgent } from './browser-identity'
 import {
   assertBrowserExtract,
@@ -27,7 +29,6 @@ import {
   type BrowserScrollInput,
   type BrowserSelectOptionInput,
 } from './browser-script-policy'
-import { getSettings } from './settings-service'
 import { isValidImageBytes } from './image-content-validation'
 
 const MAX_TRACE_ITEMS = 30
@@ -61,6 +62,8 @@ type BrowserTabRecord = {
   /** 防止 UI 与 Agent 在同一 Tab 上交错下发命令。 */
   commandTail: Promise<void>
   isLocalPreview: boolean
+  /** 本地预览对应的绝对路径；用于同一文件复用既有预览标签。 */
+  localPreviewPath: string | null
   /** 仅表示来源：由 Agent 创建的标签始终保留标识，不随当前工作标签切换而丢失。 */
   openedByAgent: boolean
   /** 此标签是页面 window.open / target=_blank 创建的真实 child window。 */
@@ -78,6 +81,8 @@ type BrowserTabRecord = {
   lastBounds?: BrowserViewLayout['bounds']
   /** 仅记录当前实际挂载的 owner；隐藏时 detach，但保留 WebContents 及页面状态。 */
   attachedOwner: BrowserWindow | null
+  /** 用户未直接查看该标签时，renderer 轮询的缩略图。 */
+  preview: BrowserPreviewCapture
 }
 type BrowserTabOptions = {
   isLocalPreview?: boolean
@@ -356,15 +361,6 @@ export class BrowserController {
     return tab
   }
 
-  /**
-   * 在首次确认前，仍先创建并发布浏览器状态，以便渲染进程展示风险告知；
-   * 但不允许实际读取、导航或操作第三方网页。
-   */
-  private assertRiskDisclaimerAcknowledged(): void {
-    if (hasAcknowledgedBrowserRiskDisclaimer(getSettings())) return
-    throw new Error('首次使用受管浏览器前，请在浏览器面板阅读并确认平台账号风险告知后重试。')
-  }
-
   private updateNavigationState(browserSession: BrowserSessionRecord, tab: BrowserTabRecord): void {
     // Navigation callbacks can arrive after the tab was closed or its session removed.
     if (this.sessions.get(browserSession.sessionId) !== browserSession) return
@@ -488,7 +484,8 @@ export class BrowserController {
         callback({ cancel: false })
         return
       }
-      void assertSafeBrowserDestination(details.url)
+      void ensureBrowserSystemNetwork(browserSession)
+        .then(() => assertSafeBrowserDestination(details.url))
         .then(() => callback({ cancel: false }))
         .catch(() => callback({ cancel: true }))
     })
@@ -613,6 +610,7 @@ export class BrowserController {
       generation: 0,
       commandTail: Promise.resolve(),
       isLocalPreview,
+      localPreviewPath: null,
       openedByAgent: claimAsAgent,
       openedByPopup: popupOptions?.openedByPopup ?? false,
       openerTabId: popupOptions?.openerTabId ?? null,
@@ -621,6 +619,36 @@ export class BrowserController {
       lastActivityAt: Date.now(),
       favicon: null,
       attachedOwner: null,
+      preview: new BrowserPreviewCapture({
+        debugger: view.webContents.debugger,
+        getTarget: () => (
+          this.isManagedTabCurrent(browserSession, tab)
+          && !view.webContents.isDestroyed()
+          && Boolean(tab.state.url)
+            ? { tabId, url: tab.state.url, generation: tab.generation }
+            : null
+        ),
+        encode: (base64) => {
+          const image = nativeImage.createFromBuffer(Buffer.from(base64, 'base64'))
+          if (image.isEmpty()) return null
+          const { width, height } = image.getSize()
+          if (width <= 0 || height <= 0) return null
+          const scale = Math.min(1, 640 / width, 400 / height)
+          const thumbnail = image.resize({
+            width: Math.max(1, Math.round(width * scale)),
+            height: Math.max(1, Math.round(height * scale)),
+          })
+          return `data:image/jpeg;base64,${thumbnail.toJPEG(65).toString('base64')}`
+        },
+        isVisible: () => !view.webContents.isDestroyed() && view.getVisible(),
+        capturePage: async () => {
+          const image = await this.captureTabPage(tab)
+          return {
+            isEmpty: () => image.isEmpty(),
+            toJPEG: (quality: number) => image.toJPEG(quality),
+          }
+        },
+      }),
     }
     view.setVisible(false)
     view.webContents.setWindowOpenHandler(({ url }) => {
@@ -802,9 +830,8 @@ export class BrowserController {
     const browserSession = this.getOrCreateSession(sessionId, [], false)
     this.markUserBrowserContext(browserSession)
     const activeTab = this.getDisplayTab(browserSession)
-    // 首次风险告知前不能加载第三方页面；告知已确认后才将用户空白页导航到 Google。
-    if (hasAcknowledgedBrowserRiskDisclaimer(getSettings())
-      && browserSession.agentTabId !== activeTab.tabId
+    // 首次打开即把用户空白页导航到默认页，不再经过风险确认弹窗。
+    if (browserSession.agentTabId !== activeTab.tabId
       && !activeTab.openedByAgent
       && (activeTab.state.url === '' || activeTab.state.url === 'about:blank')) {
       const state = await this.navigateDisplay(sessionId, USER_NEW_TAB_URL, activeTab.tabId)
@@ -833,9 +860,49 @@ export class BrowserController {
     return browserSession ? structuredClone(this.buildState(browserSession)) : null
   }
 
+  /**
+   * 隐藏的 WebContentsView 不在窗口树里，Chromium 不会产生可截图的 surface。
+   * 截图期间临时以 1×1 尺寸挂载，拿到帧后立即移除并恢复原状态。
+   */
+  private async captureTabPage(tab: BrowserTabRecord): Promise<Electron.NativeImage> {
+    const owner = this.owner
+    if (!owner || owner.isDestroyed() || tab.view.webContents.isDestroyed()) {
+      return nativeImage.createEmpty()
+    }
+    const wasAttached = tab.attachedOwner === owner
+    const previousBounds = tab.view.getBounds()
+    const previousVisible = tab.view.getVisible()
+    try {
+      if (!wasAttached) {
+        // 插到最底层并用正常视口尺寸，既让 compositor 产出完整 surface，
+        // 又被不透明的 renderer 遮住，不会在用户界面闪现。
+        owner.contentView.addChildView(tab.view, 0)
+        tab.view.setBounds({ x: 0, y: 0, width: 1280, height: 800 })
+      }
+      tab.view.setVisible(true)
+      // 给 compositor 一帧时间生成新的 surface。
+      await new Promise<void>((resolve) => setTimeout(resolve, 80))
+      return await tab.view.webContents.capturePage()
+    } finally {
+      if (!owner.isDestroyed()) {
+        if (wasAttached) {
+          tab.view.setVisible(previousVisible)
+        } else {
+          tab.view.setVisible(false)
+          owner.contentView.removeChildView(tab.view)
+        }
+        tab.view.setBounds(previousBounds)
+      }
+    }
+  }
+
+  /** 按请求标签捕获缩略图；用户当前选中的标签不限制 Agent 工作标签。 */
+  getPreviewFrame(sessionId: string, tabId: string): Promise<BrowserPreviewFrame | null> {
+    return this.sessions.get(sessionId)?.tabs.get(tabId)?.preview.get() ?? Promise.resolve(null)
+  }
+
   listTabs(sessionId: string): BrowserViewState {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     return structuredClone(this.buildState(browserSession))
   }
 
@@ -1078,13 +1145,22 @@ export class BrowserController {
    * 一律保留；若没有安全候选，宁可暂时超过限制也不擅自关闭用户内容。
    */
   private reclaimExcessAgentTabs(browserSession: BrowserSessionRecord): number {
-    const candidates = [...browserSession.tabs.values()]
-      .filter((tab) => tab.openedByAgent && tab.tabId !== browserSession.activeTabId && tab.tabId !== browserSession.agentTabId)
-      .sort((left, right) => left.lastActivityAt - right.lastActivityAt)
+    const reclaimIds = selectExcessTabsToReclaim(
+      [...browserSession.tabs.values()].map((tab) => ({
+        tabId: tab.tabId,
+        retained: !tab.openedByAgent,
+        lastActivityAt: tab.lastActivityAt,
+      })),
+      {
+        maxTabs: MAX_BROWSER_TABS,
+        activeTabId: browserSession.activeTabId,
+        agentTabId: browserSession.agentTabId,
+      },
+    )
     let reclaimed = 0
-    while (browserSession.tabs.size > MAX_BROWSER_TABS && candidates.length > 0) {
-      const tab = candidates.shift()
-      if (!tab || !browserSession.tabs.has(tab.tabId)) continue
+    for (const tabId of reclaimIds) {
+      const tab = browserSession.tabs.get(tabId)
+      if (!tab) continue
       this.disposeTab(browserSession, tab)
       reclaimed += 1
     }
@@ -1095,7 +1171,6 @@ export class BrowserController {
   async createNewTab(sessionId: string, url?: string): Promise<BrowserViewState> {
     // 新会话由本方法直接创建 Agent 标签，不能经 getOrCreateSession 预建空白标签，
     // 否则携带 URL 时会留下一个无用的初始标签。
-    this.assertRiskDisclaimerAcknowledged()
     const browserSession = this.sessions.get(sessionId) ?? this.createSession(sessionId)
     const tab = this.createTab(browserSession, false, true)
     browserSession.agentTabId = tab.tabId
@@ -1113,7 +1188,6 @@ export class BrowserController {
     // 首次由历史链接携带 URL 创建时，此标签本身就是初始展示标签；不要先经
     // getOrCreateSession 预建一个空白标签，否则会留下无用的空 Tab。
     const browserSession = this.sessions.get(sessionId) ?? this.createSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     this.markUserBrowserContext(browserSession)
     const tab = this.createTab(browserSession)
     this.activateDisplayTab(browserSession, tab)
@@ -1130,7 +1204,6 @@ export class BrowserController {
   /** 用户 UI 的 tab 选择只控制显示，不影响 Agent 之后的默认操作目标。 */
   selectTab(sessionId: string, tabId: string): BrowserViewState {
     const browserSession = this.getSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     this.markUserBrowserContext(browserSession)
     const tab = this.getDisplayTab(browserSession, tabId)
     this.activateDisplayTab(browserSession, tab)
@@ -1140,7 +1213,6 @@ export class BrowserController {
   /** Agent 显式切换工作 tab，并同步激活用户可见的前台标签。 */
   selectAgentTab(sessionId: string, tabId: string): BrowserViewState {
     const browserSession = this.getSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     browserSession.agentTabId = tab.tabId
     this.activateDisplayTab(browserSession, tab)
@@ -1168,10 +1240,21 @@ export class BrowserController {
     const browserSession = this.getOrCreateSession(sessionId, allowedRoots)
     const releaseAgentOperation = this.acquireAgentOperation(browserSession)
     try {
-      this.assertRiskDisclaimerAcknowledged()
       // 先校验路径，避免无效路径遗留一个空白的 Agent 预览标签。
       const preview = createAuthorizedPreviewUrl(inputPath, browserSession.allowedRoots, baseDir)
-      const tab = tabId ? this.getAgentTab(browserSession, tabId) : this.createTab(browserSession, true, true)
+      const reusableTabId = tabId ?? findReusablePreviewTab(
+        [...browserSession.tabs.values()].map((candidate) => ({
+          tabId: candidate.tabId,
+          retained: !candidate.openedByAgent,
+          lastActivityAt: candidate.lastActivityAt,
+          localPreviewPath: candidate.localPreviewPath,
+        })),
+        preview.filePath,
+        browserSession.agentTabId,
+      )
+      const tab = reusableTabId
+        ? this.getAgentTab(browserSession, reusableTabId)
+        : this.createTab(browserSession, true, true)
       browserSession.agentTabId = tab.tabId
       this.activateDisplayTab(browserSession, tab)
       const reclaimed = this.reclaimExcessAgentTabs(browserSession)
@@ -1180,6 +1263,7 @@ export class BrowserController {
         tab.isLocalPreview = true
         try {
           await this.loadUrl(tab, preview.url, operationSignal)
+          tab.localPreviewPath = preview.filePath
           this.trace(browserSession, tab, 'navigate', `预览本地文件 ${preview.filePath.split(/[\\/]/).pop() ?? preview.filePath}`, 'verified')
           this.updateNavigationState(browserSession, tab)
           return structuredClone(this.buildState(browserSession))
@@ -1248,12 +1332,12 @@ export class BrowserController {
     const browserSession = this.getOrCreateSession(sessionId, [])
     const releaseAgentOperation = this.acquireAgentOperation(browserSession)
     try {
-      this.assertRiskDisclaimerAcknowledged()
       const tab = this.getAgentTab(browserSession, tabId)
       const destination = await assertSafeBrowserDestinationWithFallback(url)
       const host = new URL(destination.url).host
       return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
         tab.isLocalPreview = false
+        tab.localPreviewPath = null
         this.trace(browserSession, tab, 'navigate', `正在打开 ${host}`, 'dispatched')
         try {
           const result = await this.loadUrlWithFallback(tab, destination.url, destination.fallbackUrl, operationSignal)
@@ -1275,7 +1359,6 @@ export class BrowserController {
   /** 用户地址栏导航当前显示 tab，不会改变 Agent 的工作 tab。 */
   async navigateDisplay(sessionId: string, url: string, tabId?: string): Promise<BrowserViewState> {
     const browserSession = this.getOrCreateSession(sessionId, [])
-    this.assertRiskDisclaimerAcknowledged()
     this.markUserBrowserContext(browserSession)
     const tab = this.getDisplayTab(browserSession, tabId)
     const destination = await assertSafeBrowserDestinationWithFallback(url)
@@ -1298,7 +1381,6 @@ export class BrowserController {
 
   async goBack(sessionId: string, tabId?: string): Promise<BrowserViewState> {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     if (tab.view.webContents.canGoBack()) tab.view.webContents.goBack()
     this.updateNavigationState(browserSession, tab)
@@ -1312,7 +1394,6 @@ export class BrowserController {
 
   async goForward(sessionId: string, tabId?: string): Promise<BrowserViewState> {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     if (tab.view.webContents.canGoForward()) tab.view.webContents.goForward()
     this.updateNavigationState(browserSession, tab)
@@ -1326,7 +1407,6 @@ export class BrowserController {
 
   async reload(sessionId: string, tabId?: string): Promise<BrowserViewState> {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     tab.view.webContents.reload()
     this.updateNavigationState(browserSession, tab)
@@ -1340,7 +1420,6 @@ export class BrowserController {
 
   async observe(sessionId: string, tabId?: string, requestedMaxElements?: number, signal?: AbortSignal): Promise<BrowserObservation> {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, (operationSignal) => this.observeInternal(browserSession, tab, requestedMaxElements, operationSignal))
   }
@@ -1398,7 +1477,6 @@ export class BrowserController {
     if (!role && !name) throw new Error('语义定位至少需要 role 或 name。')
     if (!Number.isInteger(maxResults) || maxResults < 1 || maxResults > 50) throw new Error('maxResults 必须是 1 到 50 的整数。')
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       // Filter the AX tree before applying the observation ranking/cap so Find can discover a matching
@@ -1477,7 +1555,6 @@ export class BrowserController {
 
   async click(sessionId: string, ref: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       await this.clickRef(browserSession, tab, ref, operationSignal)
@@ -1487,7 +1564,6 @@ export class BrowserController {
 
   async hover(sessionId: string, ref: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       const generation = tab.generation
@@ -1506,7 +1582,6 @@ export class BrowserController {
     if (!sourceRef || !targetRef) throw new Error('拖拽需要源元素和目标元素。')
     if (sourceRef === targetRef) throw new Error('拖拽源元素和目标元素不能相同。')
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       const generation = tab.generation
@@ -1549,7 +1624,6 @@ export class BrowserController {
   async fill(sessionId: string, ref: string, text: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
     if (text.length > 10_000) throw new Error('单次输入不能超过 10000 个字符。')
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       const generation = tab.generation
@@ -1576,7 +1650,6 @@ export class BrowserController {
   async press(sessionId: string, key: string, tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
     const action = parseBrowserPressAction(key)
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       if (action.kind === 'key') {
@@ -1644,7 +1717,6 @@ export class BrowserController {
   async waitFor(sessionId: string, condition: BrowserWaitCondition, timeoutMs = 10_000, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; title: string; matched: boolean }> {
     this.assertWaitCondition(condition, timeoutMs)
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, (operationSignal) => this.waitForInternal(browserSession, tab, condition, timeoutMs, operationSignal))
   }
@@ -1653,7 +1725,6 @@ export class BrowserController {
   async act(sessionId: string, ref: string, waitFor: BrowserWaitCondition | undefined, timeoutMs = 10_000, tabId?: string, signal?: AbortSignal): Promise<{ state: BrowserViewState; wait: { tabId: string; url: string; title: string; matched: boolean } | null }> {
     if (waitFor) this.assertWaitCondition(waitFor, timeoutMs)
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       await this.clickRef(browserSession, tab, ref, operationSignal)
@@ -1669,7 +1740,6 @@ export class BrowserController {
    */
   async domAction(sessionId: string, input: BrowserDomActionInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       const result = await this.executePageExpression(tab, buildBrowserDomActionExpression(input), operationSignal)
@@ -1681,7 +1751,6 @@ export class BrowserController {
   async scroll(sessionId: string, input: BrowserScrollInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
     assertBrowserScroll(input)
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       const result = await this.executePageExpression(tab, buildBrowserScrollExpression(input), operationSignal)
@@ -1693,7 +1762,6 @@ export class BrowserController {
   async extract(sessionId: string, input: BrowserExtractInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
     assertBrowserExtract(input)
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       const result = await this.executePageExpression(tab, buildBrowserExtractExpression(input), operationSignal)
@@ -1705,7 +1773,6 @@ export class BrowserController {
   async selectOption(sessionId: string, input: BrowserSelectOptionInput, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
     assertBrowserSelectOption(input)
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       const result = await this.executePageExpression(tab, buildBrowserSelectOptionExpression(input), operationSignal)
@@ -1736,7 +1803,6 @@ export class BrowserController {
 
   async upload(sessionId: string, ref: string, filePaths: string[], tabId?: string, signal?: AbortSignal): Promise<BrowserViewState> {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       const generation = tab.generation
@@ -1765,7 +1831,6 @@ export class BrowserController {
   async evaluate(sessionId: string, script: string, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; result: unknown }> {
     assertBrowserScript(script)
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       const result = await this.executePageExpression(tab, script, operationSignal)
@@ -1776,7 +1841,6 @@ export class BrowserController {
 
   async screenshot(sessionId: string, tabId?: string, signal?: AbortSignal): Promise<{ tabId: string; url: string; mimeType: string; base64: string }> {
     const browserSession = this.getOrCreateSession(sessionId)
-    this.assertRiskDisclaimerAcknowledged()
     const tab = this.getAgentTab(browserSession, tabId)
     return this.runTabOperation(browserSession, tab, signal ?? browserSession.agentAbortController.signal, async (operationSignal) => {
       throwIfBrowserOperationAborted(operationSignal)

@@ -16,6 +16,7 @@ import { WebSearchResultRenderer } from './web-search-result'
 import { WebFetchResultRenderer } from './web-fetch-result'
 import { TaskGetResultRenderer } from './task-get-result'
 import { TaskListResultRenderer } from './task-list-result'
+import { PresentResultRenderer } from './present-result'
 import { DefaultResultRenderer } from './default-result'
 
 export interface ToolResultRendererProps {

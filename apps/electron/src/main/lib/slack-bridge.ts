@@ -25,6 +25,7 @@ import { redactSensitiveLogText, redactSensitiveLogValue } from './bridge-log-re
 import { readJsonFileSafe, writeJsonFileAtomic } from './safe-file'
 import { buildAskUserBlocks, buildPermissionBlocks, buildPlanApprovalBlocks, renderSlackMessage, type SlackBlock } from './slack/block-kit'
 import { SlackDeliveryStore, type SlackDeliveryRecord } from './slack/delivery-store'
+import { ConnectionStartup } from './network/connection-startup'
 
 const STREAM_UPDATE_INTERVAL_MS = 900
 const INTERACTION_TTL_MS = 15 * 60_000
@@ -92,6 +93,8 @@ export class SlackBridge {
   private teamId: string | null = null
   private botUserId: string | null = null
   private readonly bindings = new Map<string, SlackThreadBinding>()
+  /** 保留失效线程的路由墓碑；重启后也不能把旧线程静默建到新默认项目。 */
+  private readonly rejectedBindings = new Map<string, SlackThreadBinding>()
   private readonly runTails = new Map<string, Promise<void>>()
   private readonly activeRuns = new Map<string, ActiveRun>()
   /** Desktop-originated sessions that should post one title-and-status notification to homeChannelId. */
@@ -99,6 +102,7 @@ export class SlackBridge {
   private readonly interactions = new Map<string, PendingInteraction>()
   private readonly recentEventIds = new Set<string>()
   private stopping = false
+  private readonly connectionStartup = new ConnectionStartup()
   private eventBusUnsubscribe: (() => void) | null = null
   private deliveryStore: SlackDeliveryStore
 
@@ -121,13 +125,14 @@ export class SlackBridge {
     }
     if (this.app) await this.stop()
     this.stopping = false
+    const attempt = this.connectionStartup.begin()
     this.updateStatus({ status: 'connecting' })
 
     try {
-      const [{ App: BoltApp }, { getDecryptedSlackBotToken, getDecryptedSlackAppToken }] = await Promise.all([
+      const [{ App: BoltApp }, { getDecryptedSlackBotToken, getDecryptedSlackAppToken }] = await attempt.wait(Promise.all([
         import('@slack/bolt'),
         import('./slack-config'),
-      ])
+      ]))
       const token = getDecryptedSlackBotToken(this.botConfig.id)
       const appToken = getDecryptedSlackAppToken(this.botConfig.id)
       if (!token || !appToken) throw new Error('Slack token 为空，请重新保存配置')
@@ -141,12 +146,13 @@ export class SlackBridge {
       this.app = app
       this.client = app.client as WebClient
       this.registerHandlers(app)
-      await app.start()
+      await attempt.wait(app.start())
 
-      const auth = await this.client.auth.test()
+      const auth = await attempt.wait(this.client.auth.test())
       this.teamId = typeof auth.team_id === 'string' ? auth.team_id : null
       this.botUserId = typeof auth.user_id === 'string' ? auth.user_id : null
       if (!this.teamId || !this.botUserId) throw new Error('Slack auth.test 未返回 workspace 或 Bot 用户身份')
+      if (!attempt.isCurrent()) return
 
       this.loadBindings()
       this.eventBusUnsubscribe = agentEventBus.on((sessionId, payload) => this.handleAgentPayload(sessionId, payload))
@@ -165,6 +171,7 @@ export class SlackBridge {
   async stop(): Promise<void> {
     if (this.stopping) return
     this.stopping = true
+    this.connectionStartup.cancel()
 
     const activeRuns = [...this.activeRuns.values()]
     for (const run of activeRuns) {
@@ -197,6 +204,7 @@ export class SlackBridge {
     this.runTails.clear()
     this.recentEventIds.clear()
     this.bindings.clear()
+    this.rejectedBindings.clear()
     const app = this.app
     this.app = null
     this.client = null
@@ -295,6 +303,8 @@ export class SlackBridge {
   }
 
   private async runAgentForMessage(binding: SlackThreadBinding, incoming: IncomingSlackMessage): Promise<void> {
+    const targetSessionId = binding.sessionId
+    const targetWorkspaceId = binding.workspaceId
     const run: ActiveRun = {
       eventId: incoming.eventId,
       binding,
@@ -308,6 +318,17 @@ export class SlackBridge {
     try {
       run.responseTs = await this.postThinking(run)
       if (run.responseTs) this.deliveryStore.update(incoming.eventId, { responseTs: run.responseTs })
+      if (this.activeRuns.get(binding.sessionId) !== run || run.finalized) {
+        // 被后到线程顶替：写入明确文案并主动投递本线程，避免重启恢复误归因为“重启中断”。
+        const notice = '⚠️ 该线程已被同一会话的另一个执行顶替，请重新发送这条消息。'
+        this.deliveryStore.update(incoming.eventId, { status: 'final-ready', finalText: notice, responseTs: run.responseTs })
+        await this.deliverToSlack(incoming.eventId, binding.channelId, binding.rootThreadTs, notice, run.responseTs)
+        return
+      }
+      if (this.bindings.get(binding.key) !== binding || binding.sessionId !== targetSessionId
+        || binding.workspaceId !== targetWorkspaceId || !this.isBindingWorkspaceValid(binding)) {
+        throw new Error('本条消息的会话或项目已变化，请确认项目后重新发送')
+      }
 
       await runAgentHeadless({
         sessionId: binding.sessionId,
@@ -320,12 +341,12 @@ export class SlackBridge {
         permissionModeOverride: 'plan',
       }, {
         source: 'slack',
-        onError: (error) => { void this.finalizeRun(binding.sessionId, `⚠️ Proma 运行失败：${error}`) },
-        onComplete: () => { void this.finalizeRun(binding.sessionId) },
+        onError: (error) => { void this.finalizeRun(binding.sessionId, `⚠️ Proma 运行失败：${error}`, run) },
+        onComplete: () => { void this.finalizeRun(binding.sessionId, undefined, run) },
         onTitleUpdated: () => {},
       })
     } catch (error) {
-      await this.finalizeRun(binding.sessionId, `⚠️ Proma 运行失败：${redactSensitiveLogText(error instanceof Error ? error.message : String(error))}`)
+      await this.finalizeRun(binding.sessionId, `⚠️ Proma 运行失败：${redactSensitiveLogText(error instanceof Error ? error.message : String(error))}`, run)
     }
   }
 
@@ -403,10 +424,10 @@ export class SlackBridge {
     }
   }
 
-  private async finalizeRun(sessionId: string, forcedText?: string): Promise<void> {
+  private async finalizeRun(sessionId: string, forcedText?: string, expectedRun?: ActiveRun): Promise<void> {
     if (this.stopping) return
     const run = this.activeRuns.get(sessionId)
-    if (!run || run.finalized) return
+    if (!run || run.finalized || (expectedRun && run !== expectedRun)) return
     run.finalized = true
     if (run.updateTimer) clearTimeout(run.updateTimer)
 
@@ -421,7 +442,7 @@ export class SlackBridge {
     try {
       await this.deliverFinal(run.eventId, run.binding, text, run.responseTs, clientMessageId)
     } finally {
-      this.activeRuns.delete(sessionId)
+      if (this.activeRuns.get(sessionId) === run) this.activeRuns.delete(sessionId)
     }
   }
 
@@ -632,8 +653,10 @@ export class SlackBridge {
 
   private getOrCreateBinding(incoming: IncomingSlackMessage, rootThreadTs: string): SlackThreadBinding {
     const key = this.sessionKey(incoming.teamId, incoming.channelId, rootThreadTs, incoming.userId)
+    if (this.rejectedBindings.has(key)) throw new Error('原线程项目已失效，请确认默认项目后在 Slack 新建线程')
     const existing = this.bindings.get(key)
-    if (existing && getAgentSessionMeta(existing.sessionId)) {
+    if (existing) {
+      if (!this.isBindingWorkspaceValid(existing)) throw new Error('当前会话所属项目已失效或绑定不一致，请在 Proma 中重新选择项目/会话')
       existing.lastUsedAt = Date.now()
       this.saveBindings()
       return existing
@@ -672,17 +695,37 @@ export class SlackBridge {
     return binding
   }
 
+  private isBindingWorkspaceValid(binding: SlackThreadBinding): boolean {
+    const session = getAgentSessionMeta(binding.sessionId)
+    return Boolean(binding.workspaceId && session?.workspaceId === binding.workspaceId && getAgentWorkspace(binding.workspaceId))
+  }
+
   private loadBindings(): void {
     const file = readJsonFileSafe<SlackBindingsFile>(getSlackBotBindingsPath(this.botConfig.id))
     if (file?.version !== 1 || !Array.isArray(file.bindings)) return
 
     let removedLegacyDmState = Object.prototype.hasOwnProperty.call(file, 'directSessionsByUser')
+    const sessionOwners = new Map<string, string>()
     for (const binding of file.bindings) {
       // Earlier V1 builds stored a direct-message binding with a synthetic `im` root timestamp.
-      if (!isBinding(binding) || binding.rootThreadTs === 'im' || !getAgentSessionMeta(binding.sessionId)) {
+      if (!isBinding(binding) || binding.rootThreadTs === 'im') {
         removedLegacyDmState = true
         continue
       }
+      if (!this.isBindingWorkspaceValid(binding)) {
+        this.rejectedBindings.set(binding.key, binding)
+        continue
+      }
+      const previousKey = sessionOwners.get(binding.sessionId)
+      if (previousKey && previousKey !== binding.key) {
+        // 无法证明哪条线程拥有该session，拒绝全部歧义路由，不任意选一个覆盖另一个。
+        const previous = this.bindings.get(previousKey) ?? this.rejectedBindings.get(previousKey)
+        if (previous) this.rejectedBindings.set(previousKey, previous)
+        this.bindings.delete(previousKey)
+        this.rejectedBindings.set(binding.key, binding)
+        continue
+      }
+      sessionOwners.set(binding.sessionId, binding.key)
       this.bindings.set(binding.key, binding)
     }
     if (removedLegacyDmState) this.saveBindings()
@@ -692,7 +735,7 @@ export class SlackBridge {
   private saveBindings(): void {
     writeJsonFileAtomic(getSlackBotBindingsPath(this.botConfig.id), {
       version: 1,
-      bindings: [...this.bindings.values()],
+      bindings: [...this.rejectedBindings.values(), ...this.bindings.values()],
     } satisfies SlackBindingsFile)
   }
 

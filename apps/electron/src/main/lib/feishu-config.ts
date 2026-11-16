@@ -10,6 +10,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { writeJsonFileAtomic } from './safe-file'
 import { safeStorage } from 'electron'
 import { getFeishuConfigPath } from './config-paths'
 import { redactSensitiveLogValue } from './bridge-log-redaction'
@@ -99,7 +100,7 @@ function readRawConfig(): FeishuMultiBotConfig {
 
 function writeMultiConfig(config: FeishuMultiBotConfig): void {
   const configPath = getFeishuConfigPath()
-  writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf-8')
+  writeJsonFileAtomic(configPath, config)
 }
 
 // ===== 多 Bot API =====
@@ -113,6 +114,16 @@ export function getFeishuMultiBotConfig(): FeishuMultiBotConfig {
 export function getFeishuBotById(botId: string): FeishuBotConfig | undefined {
   const config = readRawConfig()
   return config.bots.find((b) => b.id === botId)
+}
+
+/** 只修改默认项目，允许补偿时还原未设置状态；其他配置与密文原样保留。 */
+export function updateFeishuDefaultWorkspace(botId: string, workspaceId: string | undefined): void {
+  const config = readRawConfig()
+  const bot = config.bots.find((item) => item.id === botId)
+  if (!bot) throw new Error('飞书 Bot 已不存在')
+  if (workspaceId === undefined) delete bot.defaultWorkspaceId
+  else bot.defaultWorkspaceId = workspaceId
+  writeMultiConfig(config)
 }
 
 /** 保存单个 Bot 配置（新建或更新），返回保存后的 Bot 配置 */

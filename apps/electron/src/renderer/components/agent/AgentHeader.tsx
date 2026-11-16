@@ -7,7 +7,7 @@
 import * as React from 'react'
 import { useAtom, useAtomValue, useSetAtom } from 'jotai'
 import { Check, ChevronDown, PanelRight, Pencil, Split, X } from 'lucide-react'
-import { agentSessionsAtom, agentSideTemporaryAgentMapAtom, agentDiffPanelTabAtom, currentSessionSidePanelOpenAtom, getExplorationSidePanelTab } from '@/atoms/agent-atoms'
+import { agentSessionsAtom, agentSideTemporaryAgentMapAtom, agentWorkspacesAtom, agentDiffPanelTabAtom, currentSessionSidePanelOpenAtom, getExplorationSidePanelTab } from '@/atoms/agent-atoms'
 import { tabsAtom, updateTabTitle } from '@/atoms/tab-atoms'
 import { replaceAgentSessionInFreshnessOrder } from '@/lib/agent-session-list'
 import { cn } from '@/lib/utils'
@@ -26,6 +26,7 @@ interface AgentHeaderProps {
 
 export function AgentHeader({ sessionId }: AgentHeaderProps): React.ReactElement | null {
   const sessions = useAtomValue(agentSessionsAtom)
+  const workspaces = useAtomValue(agentWorkspacesAtom)
   const session = sessions.find((s) => s.id === sessionId) ?? null
   const setAgentSessions = useSetAtom(agentSessionsAtom)
   const setTabs = useSetAtom(tabsAtom)
@@ -59,6 +60,8 @@ export function AgentHeader({ sessionId }: AgentHeaderProps): React.ReactElement
   }, [sessionId, setRightPanelOpen, setSidePanelTabMap, setSideTemporaryAgentMap])
 
   if (!session) return null
+
+  const projectName = workspaces.find((workspace) => workspace.id === session.workspaceId)?.name
 
   /** 进入编辑模式 */
   const startEdit = (): void => {
@@ -148,6 +151,14 @@ export function AgentHeader({ sessionId }: AgentHeaderProps): React.ReactElement
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>
+      )}
+      {projectName && (
+        <span
+          className="ml-1 inline-flex max-w-[180px] shrink-0 items-center truncate rounded-md bg-foreground/[0.055] px-2 py-1 text-[11px] font-medium text-muted-foreground/80"
+          title={`当前项目：${projectName}`}
+        >
+          {projectName}
+        </span>
       )}
       {explorationBranches.length > 0 && (
         <DropdownMenu>

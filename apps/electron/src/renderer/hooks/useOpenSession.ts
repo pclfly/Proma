@@ -19,18 +19,9 @@ import { previewFileMapAtom } from '@/atoms/preview-atoms'
 import { appModeAtom } from '@/atoms/app-mode'
 import { activeViewAtom } from '@/atoms/active-view'
 import { automationFormAtom } from '@/atoms/automation-atoms'
-import { currentConversationIdAtom } from '@/atoms/chat-atoms'
-import {
-  currentAgentSessionIdAtom,
-  agentSessionsAtom,
-  currentAgentWorkspaceIdAtom,
-  unviewedCompletedSessionIdsAtom,
-} from '@/atoms/agent-atoms'
-import {
-  channelFormDirtyAtom,
-  settingsOpenAtom,
-  settingsPendingSessionNavigationAtom,
-} from '@/atoms/settings-tab'
+
+import { currentAgentSessionIdAtom, agentSessionsAtom, currentAgentWorkspaceIdAtom, unviewedCompletedSessionIdsAtom } from '@/atoms/agent-atoms'
+import { channelFormDirtyAtom, settingsOpenAtom, settingsPendingSessionNavigationAtom } from '@/atoms/settings-tab'
 
 interface OpenSessionOptions {
   bypassSettingsGuard?: boolean
@@ -47,7 +38,6 @@ export function useOpenSession(): OpenSessionFn {
   const setAppMode = useSetAtom(appModeAtom)
   const setActiveView = useSetAtom(activeViewAtom)
   const setAutomationForm = useSetAtom(automationFormAtom)
-  const setCurrentConversationId = useSetAtom(currentConversationIdAtom)
   const currentAgentSessionId = useAtomValue(currentAgentSessionIdAtom)
   const setCurrentAgentSessionId = useSetAtom(currentAgentSessionIdAtom)
   const agentSessions = useAtomValue(agentSessionsAtom)
@@ -57,6 +47,9 @@ export function useOpenSession(): OpenSessionFn {
   const channelFormDirty = useAtomValue(channelFormDirtyAtom)
   const setSettingsOpen = useSetAtom(settingsOpenAtom)
   const setPendingSessionNavigation = useSetAtom(settingsPendingSessionNavigationAtom)
+  // 导航代际：只有最新一次打开的异步回填可以落地。
+  const navigationGenerationRef = React.useRef(0)
+  const openedWorkspaceIdRef = React.useRef<string | null>(null)
 
   return React.useCallback(
     (type: TabType, sessionId: string, title: string, options?: OpenSessionOptions): void => {
@@ -65,6 +58,10 @@ export function useOpenSession(): OpenSessionFn {
         return
       }
       setSettingsOpen(false)
+      // 每次导航（含命中 active 会话的同步路径）都推进代际，
+      // 这样“先发起归档回填、再打开另一会话”也会让旧回填失效。
+      const navigationGeneration = ++navigationGenerationRef.current
+      openedWorkspaceIdRef.current = store.get(currentAgentWorkspaceIdAtom)
 
       // 切回 agent 会话时，若该会话上次开着预览 Tab 则一并重建并回到上次视图
       const restore = type === 'agent'
@@ -80,10 +77,7 @@ export function useOpenSession(): OpenSessionFn {
       setAutomationForm({ open: false, draft: null })
       setActiveView('conversations')
 
-      if (type === 'chat') {
-        setAppMode('chat')
-        setCurrentConversationId(sessionId)
-      } else if (type === 'agent' || type === 'preview') {
+      {
         setAppMode('agent')
         setCurrentAgentSessionId(sessionId)
 
@@ -95,22 +89,40 @@ export function useOpenSession(): OpenSessionFn {
           return next
         })
 
-        // 同步 workspaceId，确保与 TabBar 切换行为一致
+        // 同步 workspaceId，确保与 TabBar 切换行为一致。
+        // 目标可能不在当前 active 列表（如搜索命中归档会话），此时先按 ID 补齐
+        // metadata 再切工作区，不能沿用旧项目的默认值假装已恢复目标。
         const session = agentSessions.find((s) => s.id === sessionId)
         if (session?.workspaceId) {
           setCurrentAgentWorkspaceId(session.workspaceId)
           window.electronAPI.updateSettings({
             agentWorkspaceId: session.workspaceId,
           }).catch(console.error)
+          return
         }
-      } else {
-        // 非会话 Tab（如预览）不创建或选择任何草稿视图。
-        setCurrentConversationId(null)
-        setCurrentAgentSessionId(null)
+        // 回填必须受导航代际保护：等待期间用户可能已切到另一会话/项目，
+        // 迟到的 metadata 不得把 workspace 覆盖回旧目标，更不能写进持久化设置。
+        void window.electronAPI.listAgentSessions()
+          .then((all) => {
+            if (navigationGenerationRef.current !== navigationGeneration) return
+            const target = all.find((s) => s.id === sessionId)
+            if (!target) return
+            // 只 upsert 目标，不把全部归档会话塞回 active 列表。
+            store.set(agentSessionsAtom, (prev) => (prev.some((s) => s.id === target.id) ? prev : [target, ...prev]))
+            if (!target.workspaceId) return
+            // 打开期间用户已切走会话或切了项目，则只补 metadata 不动当前工作区。
+            if (store.get(currentAgentSessionIdAtom) !== sessionId) return
+            const currentWorkspaceId = store.get(currentAgentWorkspaceIdAtom)
+            const workspaceChangedSinceOpen = openedWorkspaceIdRef.current !== currentWorkspaceId
+            if (workspaceChangedSinceOpen) return
+            setCurrentAgentWorkspaceId(target.workspaceId)
+            window.electronAPI.updateSettings({ agentWorkspaceId: target.workspaceId }).catch(console.error)
+          })
+          .catch(console.error)
       }
 
       options?.onOpened?.()
     },
-    [tabs, setTabs, setActiveTabId, setAutomationForm, setActiveView, setAppMode, setCurrentConversationId, setCurrentAgentSessionId, agentSessions, setCurrentAgentWorkspaceId, setUnviewedCompleted, settingsOpen, channelFormDirty, setSettingsOpen, setPendingSessionNavigation, currentAgentSessionId],
+    [tabs, setTabs, setActiveTabId, setAutomationForm, setActiveView, setAppMode, setCurrentAgentSessionId, agentSessions, setCurrentAgentWorkspaceId, setUnviewedCompleted, settingsOpen, channelFormDirty, setSettingsOpen, setPendingSessionNavigation, currentAgentSessionId, store],
   )
 }

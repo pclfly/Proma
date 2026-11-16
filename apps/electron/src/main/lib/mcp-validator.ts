@@ -12,12 +12,12 @@ import { existsSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { createManagedProxyFetch } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js'
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
 import { normalizeMcpTransportType } from '@proma/shared'
 import type { McpServerEntry } from '@proma/shared'
+import { parseMcpRemoteUrl, createRemoteMcpTransport, connectMcpClient, normalizeMcpTransportError } from './network/mcp-transport'
 import { getMcpApiKeyEnvironment, getMcpOAuthHeaders } from './mcp-oauth-service'
 
 /**
@@ -62,14 +62,14 @@ export async function validateMcpServer(
 
   if (type === 'http' || type === 'sse') {
     try {
-      new URL(entry.url!)
+      parseMcpRemoteUrl(entry.url!, type)
     } catch {
       return { name, valid: false, reason: `无效的 URL 格式: ${entry.url}` }
     }
   }
 
   const client = new Client({ name: 'Proma MCP validator', version: '1.0.0' }, { capabilities: {} })
-  let transport: StdioClientTransport | SSEClientTransport | StreamableHTTPClientTransport | undefined
+  let transport: Transport | undefined
   const timeoutMs = Math.max(1, entry.timeout ?? 30) * 1000
 
   let proxyFetch: ReturnType<typeof createManagedProxyFetch> | undefined
@@ -90,16 +90,16 @@ export async function validateMcpServer(
     } else {
       const oauthHeaders = workspaceSlug ? await getMcpOAuthHeaders(workspaceSlug, name, entry.url!) : undefined
       const headers = { ...(entry.headers ?? {}), ...(oauthHeaders ?? {}) }
-      const requestInit = Object.keys(headers).length > 0 ? { headers } : undefined
-      if (type === 'http') transport = new StreamableHTTPClientTransport(new URL(entry.url!), { requestInit, fetch: proxyFetch?.fetch })
-      else transport = new SSEClientTransport(new URL(entry.url!), { requestInit, fetch: proxyFetch?.fetch })
+      transport = createRemoteMcpTransport(type, entry.url!, headers, proxyFetch?.fetch)
     }
 
-    await client.connect(transport, { timeout: timeoutMs })
+    await connectMcpClient(client, transport, timeoutMs)
     const result = await client.listTools(undefined, { timeout: timeoutMs })
     return { name, valid: true, message: `MCP 握手成功，发现 ${result.tools.length} 个工具` }
   } catch (error) {
-    return { name, valid: false, reason: error instanceof Error ? error.message : 'MCP 握手或工具发现失败' }
+    // 网络类失败归一化为中文可读文案；协议/HTTP 错误保留原始信息便于排查。
+    const normalized = normalizeMcpTransportError(error, 'mcp')
+    return { name, valid: false, reason: normalized instanceof Error ? normalized.message : 'MCP 握手或工具发现失败' }
   } finally {
     try { await transport?.close() } catch { /* 验证结束时忽略关闭错误 */ }
     await proxyFetch?.close()

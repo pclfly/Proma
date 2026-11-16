@@ -2,6 +2,7 @@ import { describe, expect, mock, test } from 'bun:test'
 import type { Dispatcher } from 'undici'
 import { buildPiRemoteConnectionSettings } from './pi-agent-adapter'
 import {
+  createPiRequestProxyDispatcher,
   getPiRequestProxyDispatcher,
   runWithManagedPiRequestProxy,
   runWithPiRequestProxy,
@@ -90,5 +91,27 @@ describe('Pi request proxy', () => {
       transport: 'sse',
     })
     expect(process.env.HTTPS_PROXY).toBe(before)
+  })
+
+  test('Given no proxy and no idle timeout When creating a dispatcher Then keeps the runtime default network stack', () => {
+    expect(createPiRequestProxyDispatcher({})).toBeUndefined()
+  })
+
+  test('Given no proxy but a configured idle timeout When creating a dispatcher Then still installs the timeout', async () => {
+    const dispatcher = createPiRequestProxyDispatcher({ httpIdleTimeoutMs: 600_000 })
+    expect(dispatcher).toBeDefined()
+    // 直连场景不能退回 undefined，否则 Node 内置 fetch 的 300 秒默认值会变成隐藏天花板。
+    await runWithManagedPiRequestProxy(dispatcher, async () => {
+      expect(getPiRequestProxyDispatcher()).toBe(dispatcher)
+    })
+  })
+
+  test('Given a zero idle timeout When creating a dispatcher without a proxy Then treats it as explicitly unlimited', () => {
+    expect(createPiRequestProxyDispatcher({ httpIdleTimeoutMs: 0 })).toBeDefined()
+  })
+
+  test('Given an invalid idle timeout When creating a dispatcher without a proxy Then ignores it', () => {
+    expect(createPiRequestProxyDispatcher({ httpIdleTimeoutMs: Number.NaN })).toBeUndefined()
+    expect(createPiRequestProxyDispatcher({ httpIdleTimeoutMs: -1 })).toBeUndefined()
   })
 })

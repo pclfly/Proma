@@ -317,6 +317,12 @@ export interface CreatePlanningReminderRequest extends CreatePlanningReminderInp
 }
 
 
+/** 列出某目标下全部提醒（含已确认/已完成的历史）。 */
+export interface ListPlanningRemindersInput {
+  targetType: PlanningReminderTargetType
+  targetId: string
+}
+
 export interface SnoozePlanningReminderInput {
   id: string
   minutes: number
@@ -346,6 +352,11 @@ export const PLANNING_IPC_CHANNELS = {
   UPDATE_GROUP: 'planning:update-group',
   DELETE_GROUP: 'planning:delete-group',
   LIST_TAGS: 'planning:list-tags',
+  /** 列出某个 Todo / 日程下的全部提醒（含历史），用于提醒管理面板 */
+  LIST_REMINDERS: 'planning:list-reminders',
+  CREATE_REMINDER: 'planning:create-reminder',
+  UPDATE_REMINDER: 'planning:update-reminder',
+  DELETE_REMINDER: 'planning:delete-reminder',
   LIST_ACTIVE_REMINDERS: 'planning:list-active-reminders',
   ACKNOWLEDGE_REMINDER: 'planning:acknowledge-reminder',
   SNOOZE_REMINDER: 'planning:snooze-reminder',

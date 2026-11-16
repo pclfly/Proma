@@ -29,9 +29,9 @@ function isSafeFlatEntry(key: string, value: string): boolean {
  * accidentally interpreted as Markdown blocks.
  */
 export function getLeadingFrontmatterRange(lines: readonly string[]): LiveMarkdownFrontmatterRange | null {
-  if (lines[0]?.replace(/^\uFEFF/, '') !== '---') return null
-  const closingLine = lines.findIndex((line, index) => index > 0 && line.trim() === '---')
-  return closingLine > 1 ? { endLine: closingLine + 1 } : null
+  if (!/^(?:\uFEFF)?---[ \t]*$/.test(lines[0] ?? '')) return null
+  const closingLine = lines.findIndex((line, index) => index > 0 && /^---[ \t]*$/.test(line))
+  return closingLine >= 1 ? { endLine: closingLine + 1 } : null
 }
 
 /**

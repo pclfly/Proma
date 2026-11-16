@@ -15,6 +15,13 @@ export {
   serializeAgentRuntimeError,
 } from './agent-runtime'
 
+export {
+  DEFAULT_DELEGATION_WAIT_SECONDS,
+  MAX_DELEGATION_WAIT_SECONDS,
+  DELEGATION_WAIT_RPC_GRACE_MS,
+  normalizeDelegationWaitSeconds,
+} from './collaboration-wait'
+
 export { diffCapabilities } from './capabilities-diff'
 export type { CapabilityChange } from './capabilities-diff'
 export {
@@ -24,16 +31,31 @@ export {
   CODEX_GPT_54_MINI_CONTEXT_WINDOW,
   CODEX_GPT_56_CONTEXT_WINDOW,
   CODEX_GPT_6_CONTEXT_WINDOW,
+  GPT_6_ASTRA_CONTEXT_WINDOW,
+  GPT_61_SOL_CONTEXT_WINDOW,
+  inferCorrectedGPTContextWindow,
   inferCodexAlignedGPT5ContextWindow,
   supports1MContext,
   inferContextWindow,
+  inferKnownContextWindow,
   isMimoV26Model,
 } from './context-window'
 export {
   isGpt6AstraFamily,
   isGpt6SolFamily,
   isGpt6LunaFamily,
+  isGpt61SolFamily,
+  isGpt61TerraFamily,
 } from './model-family'
+export {
+  KIMI_K3_1_CONTEXT_WINDOW,
+  KIMI_K3_256K_CONTEXT_WINDOW,
+  normalizeKimiModelId,
+  isKimiK31Model,
+  getKimiContextWindow,
+  getKimiModelPresets,
+  type KimiModelPreset,
+} from './kimi-model-capabilities'
 export { calculateContextUsageRatio } from './context-usage'
 export {
   getGeminiModelCapability,
@@ -94,3 +116,11 @@ export {
   collectSuccessfulSkillReadActivations,
   collectSkillActivations,
 } from './skill-usage'
+export {
+  UNVIEWABLE_BINARY_HEAD_BYTES,
+  UNVIEWABLE_BINARY_SUGGESTED_ACTION,
+  describeUnviewableBinary,
+  isUnviewableBinary,
+  type UnviewableBinaryInfo,
+  type UnviewableBinaryKind,
+} from './unviewable-binary'

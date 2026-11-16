@@ -1,5 +1,6 @@
-import { afterAll, beforeAll, describe, expect, mock, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from 'bun:test'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { writeJsonFileAtomic } from './safe-file'
 import * as os from 'node:os'
 import { join } from 'node:path'
 
@@ -24,6 +25,7 @@ mock.module('@earendil-works/pi-coding-agent', () => ({
       },
       getSessionFile: () => sessionFile,
       getSessionId: () => 'pi-test-session',
+      getBranch: () => [{ id: 'entry-keep' }],
       getEntry: (entryId: string) => entryId === 'entry-keep' ? { id: entryId } : undefined,
     }),
     forkFrom: (_branchFile: string) => {
@@ -32,6 +34,7 @@ mock.module('@earendil-works/pi-coding-agent', () => ({
       return {
         getSessionFile: () => forkFile,
         getSessionId: () => 'pi-fork-session',
+        getBranch: () => [{ id: 'entry-keep' }],
         getEntry: (entryId: string) => entryId === 'entry-keep' ? { id: entryId } : undefined,
       }
     },
@@ -77,9 +80,10 @@ function writeAgentSessionJsonl(sessionId: string, rows: string[]): void {
 function writeAgentSessionsIndex(sessions: Array<{
   id: string
   title: string
-  workspaceId: string
+  workspaceId?: string
   createdAt: number
   updatedAt: number
+  lastActivityAt?: number
   agentRuntime?: string
   sdkSessionId?: string
   piSessionFile?: string
@@ -325,6 +329,70 @@ describe('Agent 会话 runtime 元数据', () => {
     expect(updated.updatedAt).toBe(archived.updatedAt)
     expect(manager.getAgentSessionMeta(session.id)).toMatchObject({ starred: true, archived: true })
   })
+
+  test('Given 标题更新 When 列表排序 Then 仍按最近活动时间而不是 updatedAt', () => {
+    writeAgentSessionsIndex([
+      { id: 'older-activity', title: '旧活动', createdAt: 1, updatedAt: 1_000, lastActivityAt: 1_000 },
+      { id: 'newer-activity', title: '新活动', createdAt: 2, updatedAt: 2_000, lastActivityAt: 2_000 },
+    ])
+
+    const updated = manager.updateAgentSessionMeta('older-activity', { title: '改过的标题' })
+
+    // 元数据更新推进 updatedAt，但活动时间保持不变。
+    expect(updated.lastActivityAt).toBe(1_000)
+    expect(updated.updatedAt).toBeGreaterThan(2_000)
+    expect(manager.listAgentSessions().map((session) => session.id)).toEqual([
+      'newer-activity',
+      'older-activity',
+    ])
+  })
+
+  test('Given 存量会话缺少 lastActivityAt When 读取索引 Then 用 updatedAt 补齐一次', () => {
+    writeAgentSessionsIndex([
+      { id: 'legacy-session', title: '旧会话', createdAt: 100, updatedAt: 500 },
+    ])
+
+    expect(manager.getAgentSessionMeta('legacy-session')?.lastActivityAt).toBe(500)
+  })
+})
+
+describe('Agent 星标与自动归档', () => {
+  test('Given 旧星标、置顶、草稿和普通会话 When 自动归档 Then 仅归档超过阈值的普通会话', () => {
+    const now = Date.UTC(2026, 10, 2, 10)
+    const threshold = now - 30 * 86_400_000
+    const clock = spyOn(Date, 'now').mockReturnValue(now)
+    const sessions = [
+      { id: 'old-starred', starred: true, updatedAt: threshold - 1 },
+      { id: 'old-pinned', pinned: true, updatedAt: threshold - 1 },
+      { id: 'old-draft', isDraft: true, updatedAt: threshold - 1 },
+      { id: 'already-archived', archived: true, updatedAt: threshold - 1 },
+      { id: 'old-ordinary', updatedAt: threshold - 1 },
+      { id: 'at-threshold', updatedAt: threshold },
+      { id: 'recent', updatedAt: now },
+    ].map((session) => ({ title: session.id, workspaceId: 'workspace-a', createdAt: 1, ...session }))
+    writeAgentSessionsIndex(sessions)
+    try {
+      expect(manager.autoArchiveAgentSessions(30)).toBe(1)
+      const readPersisted = (): { sessions: Array<{ id: string; updatedAt: number; archived?: boolean; starred?: boolean }> } =>
+        JSON.parse(readFileSync(join(tempHome, '.proma', 'agent-sessions.json'), 'utf8'))
+      const persisted = readPersisted()
+      for (const session of sessions) {
+        expect(persisted.sessions.find(item => item.id === session.id)).toMatchObject({ updatedAt: session.updatedAt })
+        expect(Boolean(persisted.sessions.find(item => item.id === session.id)?.archived))
+          .toBe(['already-archived', 'old-ordinary'].includes(session.id))
+        const saved = manager.getAgentSessionMeta(session.id)
+        expect(Boolean(saved?.archived)).toBe(['already-archived', 'old-ordinary'].includes(session.id))
+        expect(saved?.updatedAt).toBe(session.updatedAt)
+      }
+      expect(manager.getAgentSessionMeta('old-starred')?.starred).toBe(true)
+      expect(manager.autoArchiveAgentSessions(30)).toBe(0)
+      // 自动归档豁免不应禁止用户显式归档收藏。
+      expect(manager.updateAgentSessionMeta('old-starred', { archived: true }).archived).toBe(true)
+      expect(readPersisted().sessions.find(item => item.id === 'old-starred')).toMatchObject({ starred: true, archived: true })
+    } finally {
+      clock.mockRestore()
+    }
+  })
 })
 
 describe('Agent 会话正文搜索', () => {
@@ -564,7 +632,10 @@ describe('Pi entry binding recovery', () => {
       JSON.stringify({ type: 'assistant', uuid: 'assistant-stale', message: { content: [{ type: 'text', text: '丢弃' }] } }),
     ])
 
+    const scope = { version: 1, projectRoot: tempHome, directories: ['nested'] }
+    writeJsonFileAtomic(`${piSessionFile}.proma-project-scopes.json`, { version: 1, records: [{ anchorId: 'entry-keep', snapshot: scope }, { anchorId: 'entry-stale', snapshot: { ...scope, directories: ['later'] } }] })
     const forked = await manager.forkAgentSession({ sessionId: 'pi-fork-source', upToMessageUuid: 'assistant-keep' })
+    expect(JSON.parse(readFileSync(`${forked.piSessionFile}.proma-project-scopes.json`, 'utf8'))).toEqual({ version: 1, records: [{ anchorId: 'entry-keep', snapshot: scope }] })
 
     expect(forked.piEntryBindings).toEqual({ 'assistant-keep': 'entry-keep' })
     expect(manager.getAgentSessionMeta(forked.id)?.piEntryBindings).toEqual({ 'assistant-keep': 'entry-keep' })
@@ -591,7 +662,11 @@ describe('Pi entry binding recovery', () => {
       JSON.stringify({ type: 'assistant', uuid: 'assistant-stale', message: { content: [{ type: 'text', text: '丢弃' }] } }),
     ])
 
+    const scope = { version: 1, projectRoot: tempHome, directories: ['nested'] }
+    writeJsonFileAtomic(`${piSessionFile}.proma-project-scopes.json`, { version: 1, records: [{ anchorId: 'entry-keep', snapshot: scope }] })
     const retainedCount = await manager.rewindPiAgentSession('pi-rewind-source', 'assistant-keep')
+    const newFile = manager.getAgentSessionMeta('pi-rewind-source')!.piSessionFile
+    expect(JSON.parse(readFileSync(`${newFile}.proma-project-scopes.json`, 'utf8'))).toEqual({ version: 1, records: [{ anchorId: 'entry-keep', snapshot: scope }] })
 
     expect(retainedCount).toBe(2)
     expect(manager.getAgentSessionMeta('pi-rewind-source')?.piEntryBindings).toEqual({ 'assistant-keep': 'entry-keep' })

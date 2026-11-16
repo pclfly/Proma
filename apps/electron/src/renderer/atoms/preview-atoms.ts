@@ -5,6 +5,7 @@
  */
 
 import { atom } from 'jotai'
+import type { PrimitiveAtom } from 'jotai'
 import { atomWithStorage } from 'jotai/utils'
 import type { ChangedFileEntry } from '@proma/shared'
 import { currentAgentSessionIdAtom } from './agent-atoms'
@@ -24,6 +25,8 @@ export interface PreviewFile {
   readOnly?: boolean
   /** 候选基础目录（用于相对路径解析） */
   basePaths?: string[]
+  /** 用户在消息或工具结果中主动点击的单个文件；主进程只放行该文件本身。 */
+  explicitPreviewFiles?: string[]
   /** 仅由用户在文件面板等可信 UI 中主动选择的外部文件可放宽预览范围。 */
   unrestricted?: boolean
   /** Workspace slug for a relocatable managed Skill path. */
@@ -60,8 +63,32 @@ export const previewResolvedPathAtom = atom<Map<string, string>>(new Map())
 /** 每会话预览面板开关 */
 export const previewPanelOpenMapAtom = atom<Map<string, boolean>>(new Map())
 
-/** 每会话已打开的预览文件；非激活项只保留轻量元数据。 */
-export const previewFilesMapAtom = atom<Map<string, PreviewFile[]>>(new Map())
+/** 每次首开至末关的运行期手动覆盖；不持久化，末关后即释放。 */
+export const previewSidebarEpisodesAtom = atom<Map<string, PrimitiveAtom<boolean | null>>>(new Map())
+const previewFilesStateAtom = atom<Map<string, PreviewFile[]>>(new Map())
+
+/** 保持原map/setter契约；多文件变动不重置同一生命周期的用户选择。 */
+export const previewFilesMapAtom = atom(
+  (get) => get(previewFilesStateAtom),
+  (get, set, update: Map<string, PreviewFile[]> | ((previous: Map<string, PreviewFile[]>) => Map<string, PreviewFile[]>)) => {
+    const previous = get(previewFilesStateAtom)
+    const next = typeof update === 'function' ? update(previous) : update
+    if (next === previous) return
+    const episodes = new Map(get(previewSidebarEpisodesAtom))
+    let changed = false
+    for (const [sessionId, files] of next) {
+      if (files.length > 0 && !episodes.has(sessionId)) {
+        episodes.set(sessionId, atom<boolean | null>(null))
+        changed = true
+      }
+    }
+    for (const sessionId of episodes.keys()) {
+      if (!next.get(sessionId)?.length) { episodes.delete(sessionId); changed = true }
+    }
+    set(previewFilesStateAtom, next)
+    if (changed) set(previewSidebarEpisodesAtom, episodes)
+  },
+)
 
 /** 每会话当前预览的文件（兼容旧调用方的激活文件投影）。 */
 export const previewFileMapAtom = atom<Map<string, PreviewFile | null>>(new Map())

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { SDKMessage } from '@proma/shared'
 import { getContextCompactionProgress, hasRenderableAssistantTurnContent, isCompactionControlHistoryGroup, shouldRenderLiveAssistantTurn } from './AgentMessages'
-import { shouldClearRetainedCompactionForResumedStream, shouldRestoreCompactionProgress } from './TaskProgressOverlay'
+import { shouldClearRetainedCompactionForResumedStream, shouldRestoreCompactionProgress } from './ChatBottomControls'
 
 function systemMessage(fields: Record<string, unknown>): SDKMessage {
   return { type: 'system', ...fields } as unknown as SDKMessage

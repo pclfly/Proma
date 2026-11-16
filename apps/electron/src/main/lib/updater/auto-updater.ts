@@ -6,7 +6,7 @@
  */
 
 import { autoUpdater } from 'electron-updater'
-import { BrowserWindow, app } from 'electron'
+import { BrowserWindow, app, powerMonitor } from 'electron'
 import { join } from 'node:path'
 import type { UpdateStatus } from './updater-types'
 import { UPDATER_IPC_CHANNELS } from './updater-types'
@@ -14,6 +14,8 @@ import { createIdleInstallScheduler } from './idle-install-scheduler'
 import { AUTO_UPDATE_ENABLED } from './updater-config'
 import { isNewerVersion } from './version'
 import { createUpdateCacheCleanup, getDefaultUpdaterBaseCacheDirectory, shouldDeferUpdateCacheCleanup } from './update-cache-cleanup'
+import { createUpdateCheckScheduler, type UpdateCheckScheduler } from './update-check-scheduler'
+import { ensureBrowserSystemNetwork } from '../network/browser-network'
 
 /** 当前更新状态 */
 let currentStatus: UpdateStatus = { status: 'idle' }
@@ -21,8 +23,10 @@ let currentStatus: UpdateStatus = { status: 'idle' }
 /** 主窗口引用 */
 let win: BrowserWindow | null = null
 
-/** 定时检查定时器 */
-let checkInterval: ReturnType<typeof setInterval> | null = null
+/** 定时检查调度器 */
+let updateCheckScheduler: UpdateCheckScheduler | null = null
+/** 系统唤醒恢复检查只注册一次。 */
+let recoveryHookInstalled = false
 
 /** 新版窗口稳定后执行的更新缓存清理定时器。 */
 let appliedUpdateCacheCleanupTimer: ReturnType<typeof setTimeout> | null = null
@@ -86,9 +90,11 @@ function handleDownloadFailure(err: unknown): void {
   })
 }
 
-/** 开始下载已确认需要替换的最新更新。 */
+/** 开始下载已确认需要替换的最新更新；先等待系统网络策略就绪。 */
 function downloadAvailableUpdate(): void {
-  void autoUpdater.downloadUpdate().catch(handleDownloadFailure)
+  void ensureBrowserSystemNetwork(autoUpdater.netSession)
+    .then(() => autoUpdater.downloadUpdate())
+    .catch(handleDownloadFailure)
 }
 
 /**
@@ -209,10 +215,8 @@ function quitAndInstall(): void {
 
 /** 清理更新器资源（定时器等） */
 export function cleanupUpdater(): void {
-  if (checkInterval) {
-    clearInterval(checkInterval)
-    checkInterval = null
-  }
+  updateCheckScheduler?.dispose()
+  updateCheckScheduler = null
   if (appliedUpdateCacheCleanupTimer) {
     clearTimeout(appliedUpdateCacheCleanupTimer)
     appliedUpdateCacheCleanupTimer = null
@@ -386,25 +390,24 @@ export function initAutoUpdater(mainWindow: BrowserWindow): void {
     })
   })
 
-  // 启动后延迟 10 秒首次检查
-  setTimeout(() => {
-    console.log('[更新] 首次自动检查更新')
-    void checkForUpdates()
-  }, 10_000)
+  // 官方 0.22.0：启动后 10–60 秒随机首次检查，之后约每小时一次并带抖动。
+  updateCheckScheduler?.dispose()
+  updateCheckScheduler = createUpdateCheckScheduler({
+    check: () => checkForUpdates(),
+  })
+  updateCheckScheduler.start()
 
-  // 每 4 小时自动检查一次；已下载版本也会检查，发现更高版本即自动替换下载。
-  checkInterval = setInterval(() => {
-    console.log('[更新] 定时自动检查更新')
-    void checkForUpdates()
-  }, 4 * 60 * 60 * 1000)
+  mainWindow.on('focus', () => updateCheckScheduler?.notifyActive())
+  if (!recoveryHookInstalled) {
+    recoveryHookInstalled = true
+    powerMonitor.on('resume', () => updateCheckScheduler?.notifyOnline())
+  }
 
-  // 窗口关闭时清理定时器
+  // 窗口关闭时清理调度器
   mainWindow.on('closed', () => {
     cancelAppliedUpdateCacheCleanup()
-    if (checkInterval) {
-      clearInterval(checkInterval)
-      checkInterval = null
-    }
+    updateCheckScheduler?.dispose()
+    updateCheckScheduler = null
     if (appliedUpdateCacheCleanupTimer) {
       clearTimeout(appliedUpdateCacheCleanupTimer)
       appliedUpdateCacheCleanupTimer = null

@@ -1,4 +1,10 @@
-import { Tray, Menu, app, nativeImage, BrowserWindow } from 'electron'
+import {
+  Tray,
+  Menu,
+  app,
+  nativeImage,
+  BrowserWindow,
+} from 'electron'
 import { join } from 'path'
 import { existsSync } from 'fs'
 import { listAgentSessions } from './lib/agent-session-manager'
@@ -11,20 +17,7 @@ let tray: Tray | null = null
 export interface TrayActions {
   showMainWindow: () => void
   openAgentSession: (sessionId: string, title: string) => void
-  createChatSession: () => void
   createAgentSession: () => void
-  onTrayMouseEnter?: (bounds: Electron.Rectangle) => void
-  onTrayMouseMove?: (bounds: Electron.Rectangle) => void
-  onTrayMouseLeave?: () => void
-}
-
-let flashTimer: ReturnType<typeof setInterval> | null = null
-
-function clearTrayFlashTimer(): void {
-  if (flashTimer) {
-    clearInterval(flashTimer)
-    flashTimer = null
-  }
 }
 
 /**
@@ -56,7 +49,6 @@ function getDefaultTrayActions(): TrayActions {
   return {
     showMainWindow,
     openAgentSession: () => showMainWindow(),
-    createChatSession: () => showMainWindow(),
     createAgentSession: () => showMainWindow(),
   }
 }
@@ -103,10 +95,6 @@ function buildTrayMenu(actions: TrayActions): Menu {
         }]
       : []),
     { type: 'separator' },
-    {
-      label: '新建对话',
-      click: () => actions.createChatSession(),
-    },
     {
       label: '新建 Agent 会话',
       click: () => actions.createAgentSession(),
@@ -176,20 +164,6 @@ export function createTray(actionsInput?: Partial<TrayActions>): Tray | null {
       updateTrayMenu(actions)
     })
 
-    if (process.platform === 'win32') {
-      tray.on('mouse-enter', () => {
-        if (!tray) return
-        actions.onTrayMouseEnter?.(tray.getBounds())
-      })
-      tray.on('mouse-move', () => {
-        if (!tray) return
-        actions.onTrayMouseMove?.(tray.getBounds())
-      })
-      tray.on('mouse-leave', () => {
-        actions.onTrayMouseLeave?.()
-      })
-    }
-
     console.log('System tray created')
     return tray
   } catch (error) {
@@ -202,7 +176,6 @@ export function createTray(actionsInput?: Partial<TrayActions>): Tray | null {
  * 销毁系统托盘
  */
 export function destroyTray(): void {
-  clearTrayFlashTimer()
   if (tray) {
     tray.destroy()
     tray = null
@@ -216,21 +189,3 @@ export function getTray(): Tray | null {
   return tray
 }
 
-/**
- * 切换托盘图标闪烁（仅 Windows）
- */
-export function setTrayFlash(on: boolean): void {
-  if (process.platform !== 'win32') return
-  clearTrayFlashTimer()
-  const baseIcon = nativeImage.createFromPath(getTrayIconPath())
-  if (!on) {
-    tray?.setImage(baseIcon)
-    return
-  }
-  if (!tray) return
-  let showIdle = true
-  flashTimer = setInterval(() => {
-    showIdle = !showIdle
-    tray?.setImage(showIdle ? baseIcon : nativeImage.createEmpty())
-  }, 500)
-}

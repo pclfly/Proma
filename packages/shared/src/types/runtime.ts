@@ -160,6 +160,19 @@ export interface WorktreeInfo {
   name: string
 }
 
+/** 删除 linked Worktree 的请求；sessionId 用于主进程校验路径授权。 */
+export interface RemoveGitWorktreeInput {
+  repoPath: string
+  worktreePath: string
+  sessionId: string
+  /** UI 已完成确认；非 true 时主进程不执行删除。 */
+  confirmed?: boolean
+}
+
+export interface RemoveGitWorktreeResult {
+  removed: boolean
+}
+
 /** 获取文件 Diff 的输入 */
 export interface GetFileDiffInput {
   dirPath: string
@@ -229,6 +242,12 @@ export interface FileAccessOptions {
   legacySkillFilePath?: string
   /** 路径解析候选目录；主进程会先过滤到已授权目录内再使用 */
   candidateBasePaths?: string[]
+  /**
+   * 用户在可信 UI 中主动点击的单个文件路径。
+   * 主进程只放行 realpath 精确匹配的该文件本身，不扩散到同目录其他文件；
+   * 用于预览项目外的临时截图等场景。
+   */
+  explicitPreviewFiles?: string[]
   /**
    * 文件面板以 Agent 实际可操作的文件系统为准，不再按会话附件二次收窄。
    * 启用后，调用方可以操作任意已存在的本地路径。
@@ -415,6 +434,8 @@ export const IPC_CHANNELS = {
   GET_DIFF_CONTENTS: 'git:get-diff-contents',
   /** 列出 Git Worktree */
   LIST_WORKTREES: 'git:list-worktrees',
+  /** 删除 linked Git Worktree */
+  REMOVE_WORKTREE: 'git:remove-worktree',
   /** 获取 Worktree 相对于基准分支的全量变更 */
   GET_WORKTREE_CHANGES: 'git:get-worktree-changes',
   /** 在系统默认浏览器中打开外部链接 */

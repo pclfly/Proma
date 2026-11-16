@@ -7,15 +7,9 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { getSettingsPath } from './config-paths'
-import { DEFAULT_THEME_MODE, PERSONAL_DIRECTIVE_DEFAULT_CONTENT, normalizeProductivityToolsSettings } from '../../types'
-import type { AgentIslandSettings, AppSettings } from '../../types'
+import { DEFAULT_THEME_MODE, PERSONAL_DIRECTIVE_DEFAULT_CONTENT, normalizeProductivityToolsSettings, clampFontSize } from '../../types'
+import type { AppSettings } from '../../types'
 import { getTerminalProfilesForPlatform, isTerminalProfile } from '@proma/shared'
-
-function sanitizeAgentIslandSettings(input: unknown): AgentIslandSettings | undefined {
-  if (!input || typeof input !== 'object') return undefined
-  const raw = input as { enabled?: unknown }
-  return typeof raw.enabled === 'boolean' ? { enabled: raw.enabled } : undefined
-}
 
 export function sanitizeWindowsTerminalProfile(input: unknown): AppSettings['lastWindowsTerminalProfile'] {
   return isTerminalProfile(input) && getTerminalProfilesForPlatform('win32').includes(input)
@@ -40,7 +34,6 @@ export function getSettings(): AppSettings {
       longTextPasteAsAttachmentEnabled: false,
       richTextRenderingEnabled: false,
       feishuSessionMirror: { mode: 'off' },
-      visionRelay: { enabled: false },
       windowsShellPreference: 'auto',
       agentThinking: { type: 'adaptive' },
       gitAttributionEnabled: true,
@@ -59,6 +52,8 @@ export function getSettings(): AppSettings {
       interfaceVariant?: unknown
       /** PR #1895 早期构建写入的无平台 profile 字段；仅在 Windows 上迁移。 */
       lastTerminalProfile?: unknown
+      /** 0.22.80 灵动岛退役；读取时丢弃旧字段，避免下次写回复活。 */
+      agentIsland?: unknown
     }
     // Pi-only：读取时丢弃旧 runtime selector、界面风格与 Claude 白名单，避免下次写回复活。
     const {
@@ -68,6 +63,7 @@ export function getSettings(): AppSettings {
       builtinMcpDisabledIds: _legacyBuiltinMcpDisabledIds,
       interfaceVariant: _legacyInterfaceVariant,
       lastTerminalProfile: legacyLastTerminalProfile,
+      agentIsland: _legacyAgentIsland,
       ...settings
     } = data
     return {
@@ -79,7 +75,6 @@ export function getSettings(): AppSettings {
       longTextPasteAsAttachmentEnabled: data.longTextPasteAsAttachmentEnabled ?? false,
       richTextRenderingEnabled: data.richTextRenderingEnabled ?? false,
       feishuSessionMirror: data.feishuSessionMirror ?? { mode: 'off' },
-      visionRelay: data.visionRelay ?? { enabled: false },
       windowsShellPreference: settings.windowsShellPreference ?? 'auto',
       lastWindowsTerminalProfile: process.platform === 'win32'
         ? sanitizeWindowsTerminalProfile(settings.lastWindowsTerminalProfile ?? legacyLastTerminalProfile)
@@ -91,8 +86,6 @@ export function getSettings(): AppSettings {
       personalDirective: settings.personalDirective ?? { enabled: false, content: PERSONAL_DIRECTIVE_DEFAULT_CONTENT },
       // 缺省全部开启：老配置文件不会因升级意外隐藏生产力工具。
       productivityTools: normalizeProductivityToolsSettings(data.productivityTools),
-      // 仅保留 macOS 原生 Island 开关；清理旧非原生 surface 的持久化残留字段。
-      agentIsland: sanitizeAgentIslandSettings(data.agentIsland),
     }
   } catch (error) {
     console.error('[设置] 读取失败:', error)
@@ -104,7 +97,6 @@ export function getSettings(): AppSettings {
       longTextPasteAsAttachmentEnabled: false,
       richTextRenderingEnabled: false,
       feishuSessionMirror: { mode: 'off' },
-      visionRelay: { enabled: false },
       windowsShellPreference: 'auto',
       agentThinking: { type: 'adaptive' },
       gitAttributionEnabled: true,
@@ -124,10 +116,10 @@ export function updateSettings(updates: Partial<AppSettings>): AppSettings {
   const updated: AppSettings = {
     ...current,
     ...updates,
-    // 仅保留 macOS 原生 Island 开关，避免旧非原生 surface 字段被继续回写。
-    agentIsland: updates.agentIsland === undefined
-      ? sanitizeAgentIslandSettings(current.agentIsland)
-      : sanitizeAgentIslandSettings({ ...current.agentIsland, ...updates.agentIsland }),
+    // 字号轴写入前统一 clamp，避免手写 settings.json 或旧快照越界。
+    ...(updates.contentFontSize !== undefined ? { contentFontSize: clampFontSize('content', updates.contentFontSize) } : {}),
+    ...(updates.codeFontSize !== undefined ? { codeFontSize: clampFontSize('code', updates.codeFontSize) } : {}),
+    ...(updates.terminalFontSize !== undefined ? { terminalFontSize: clampFontSize('terminal', updates.terminalFontSize) } : {}),
     productivityTools: updates.productivityTools === undefined
       ? normalizeProductivityToolsSettings(current.productivityTools)
       : normalizeProductivityToolsSettings({ ...current.productivityTools, ...updates.productivityTools }),

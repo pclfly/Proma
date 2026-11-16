@@ -7,6 +7,7 @@
 import { randomUUID } from 'node:crypto'
 import { PLANNING_CONFLICT_ERROR } from '@proma/shared'
 import type {
+  ListPlanningRemindersInput,
   ActivePlanningReminder,
   CalendarEvent,
   CalendarEventListQuery,
@@ -1344,6 +1345,19 @@ export function snoozePlanningReminder(id: string, minutes: number): PlanningRem
 function getReminder(id: string): PlanningReminder | undefined { const row = getDatabase().prepare('SELECT * FROM planning_reminders WHERE id=:id').get({ id }) as ReminderRow | undefined; return row ? reminderFromRow(row) : undefined }
 /** 读取提醒以在上层能力开关中核验其归属类型。 */
 export function getPlanningReminder(id: string): PlanningReminder | undefined { return getReminder(id) }
+
+/**
+ * 列出某个 Todo / 日程下的全部提醒，含已确认与已完成的历史。
+ * 与 listActivePlanningReminders 的区别：那个只给"到期待提醒"用，这里给管理面板用。
+ */
+export function listPlanningReminders(input: ListPlanningRemindersInput): PlanningReminder[] {
+  const rows = getDatabase().prepare(`
+    SELECT * FROM planning_reminders
+    WHERE target_type=:targetType AND target_id=:targetId
+    ORDER BY trigger_at DESC
+  `).all({ targetType: input.targetType, targetId: input.targetId }) as ReminderRow[]
+  return rows.map(reminderFromRow)
+}
 export function listActivePlanningReminders(): ActivePlanningReminder[] {
   const rows = getDatabase().prepare(`SELECT * FROM planning_reminders WHERE status='pending' AND COALESCE(snoozed_until,trigger_at) <= :now ORDER BY COALESCE(snoozed_until,trigger_at)`).all({ now: Date.now() }) as ReminderRow[]
   return rows.flatMap((row): ActivePlanningReminder[] => { const target = row.target_type === 'todo' ? getTodo(row.target_id) : getCalendarEvent(row.target_id); if (!target) return []; return [{ ...reminderFromRow(row), targetTitle: target.title, group: target.group, tags: target.tags }] })

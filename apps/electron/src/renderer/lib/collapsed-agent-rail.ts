@@ -1,6 +1,7 @@
 import type { AgentSessionMeta } from '@proma/shared'
 import type { SessionIndicatorStatus } from '@/atoms/agent-atoms'
 import {
+  getAgentSessionActivityTime,
   getAgentSessionTreeIndicatorStatus,
   getDelegatedChildSessionStatus,
 } from '@/lib/agent-session-list'
@@ -90,7 +91,9 @@ export function sortDelegatedChildSessions(
   const priority = (session: AgentSessionMeta): number => Number(
     agentIndicatorMap && ['blocked', 'running', 'completed'].includes(getDelegatedChildSessionStatus(session, agentIndicatorMap)),
   )
-  return [...sessions].sort((a, b) => priority(b) - priority(a) || b.updatedAt - a.updatedAt)
+  return [...sessions].sort((a, b) => (
+    priority(b) - priority(a) || getAgentSessionActivityTime(b) - getAgentSessionActivityTime(a)
+  ))
 }
 
 export function buildAgentSessionTrees(
@@ -193,7 +196,7 @@ export function getCollapsedAgentRailTrees(input: {
     .sort((a, b) => {
       const priorityDelta = priority(a.tree.session, a.status) - priority(b.tree.session, b.status)
       if (priorityDelta !== 0) return priorityDelta
-      return b.tree.session.updatedAt - a.tree.session.updatedAt
+      return getAgentSessionActivityTime(b.tree.session) - getAgentSessionActivityTime(a.tree.session)
     })
     .slice(0, input.limit ?? 5)
     .map(({ tree }) => tree)

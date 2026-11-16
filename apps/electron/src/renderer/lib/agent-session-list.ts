@@ -18,11 +18,23 @@ export function getDelegationStatusIconClass(status: SessionIndicatorStatus): st
   return DELEGATION_STATUS_ICON_CLASS[status]
 }
 
-/** 按最近更新时间排序 Agent 会话，保持与主进程 listAgentSessions 一致。 */
+/**
+ * 会话新鲜度只看真实对话活动时间；缺失时回退到 `updatedAt`。
+ *
+ * 官方 0.22.0：标题、模型、思考档位等元数据更新只推进 `updatedAt`，
+ * 侧栏排序仍按 `lastActivityAt`，避免会话行突然跳到列表顶部。
+ */
+export function getAgentSessionActivityTime(
+  session: Pick<AgentSessionMeta, 'lastActivityAt' | 'updatedAt'>,
+): number {
+  return session.lastActivityAt ?? session.updatedAt
+}
+
+/** 按最近活动时间排序 Agent 会话，保持与主进程 listAgentSessions 一致。 */
 export function sortAgentSessionsByUpdatedAtDesc(
   sessions: readonly AgentSessionMeta[],
 ): AgentSessionMeta[] {
-  return [...sessions].sort((a, b) => b.updatedAt - a.updatedAt)
+  return [...sessions].sort((a, b) => getAgentSessionActivityTime(b) - getAgentSessionActivityTime(a))
 }
 
 /** Agent 归档会话的顶层项目分组。 */
@@ -49,10 +61,16 @@ export function groupArchivedAgentSessionsByProject({
   sessions,
   workspaces,
   excludedSessionIds = new Set<string>(),
+  requireArchived = true,
 }: {
   sessions: readonly AgentSessionMeta[]
   workspaces: readonly AgentWorkspace[]
   excludedSessionIds?: ReadonlySet<string>
+  /**
+   * 是否要求会话处于已归档状态。
+   * 归档视图传 true；收藏视图传 false——收藏与归档正交，已归档的星标会话也要出现。
+   */
+  requireArchived?: boolean
 }): ArchivedAgentSessionProjectGroup[] {
   const sessionsByWorkspaceId = new Map<string, AgentSessionMeta[]>(
     workspaces.map((workspace) => [workspace.id, []]),
@@ -61,7 +79,7 @@ export function groupArchivedAgentSessionsByProject({
   const unassignedSessions: AgentSessionMeta[] = []
 
   for (const session of sessions) {
-    if (!session.archived || session.isDraft || excludedSessionIds.has(session.id)) continue
+    if ((requireArchived && !session.archived) || session.isDraft || excludedSessionIds.has(session.id)) continue
     if (session.sourceAutomationId) {
       automationSessions.push(session)
       continue
@@ -133,7 +151,15 @@ export function upsertAgentSession(
 ): AgentSessionMeta[] {
   const existing = sessions.find((session) => session.id === incoming.id)
   const merged: AgentSessionMeta = existing
-    ? { ...existing, ...incoming }
+    ? {
+        ...existing,
+        ...incoming,
+        // 事件可能只带部分字段；活动时间只能前进，不能被缺失值或陈旧快照回退。
+        lastActivityAt: Math.max(
+          getAgentSessionActivityTime(existing),
+          incoming.lastActivityAt ?? 0,
+        ),
+      }
     : incoming
   const others = sessions.filter((session) => session.id !== incoming.id)
   return sortAgentSessionsByUpdatedAtDesc([merged, ...others])
@@ -164,24 +190,29 @@ export function mergeFetchedAgentSessions(
 ): AgentSessionMeta[] {
   const previousById = new Map(prev.map((session) => [session.id, session]))
   const fetchedIds = new Set(fetched.map((session) => session.id))
-  // 本次快照所反映的“数据新鲜度水位”：快照里最大的 updatedAt。
+  // 本次快照所反映的“数据新鲜度水位”：快照里最大的活动时间。
   // 比它更新的本地条目，说明在该快照生成之后才出现/更新，不能被它判定为删除。
   const snapshotWatermark = fetched.reduce(
-    (max, session) => Math.max(max, session.updatedAt),
+    (max, session) => Math.max(max, getAgentSessionActivityTime(session)),
     0,
   )
 
   // 保留本地存在、fetched 缺失、且不早于水位的条目（疑似并发新建尚未被本快照看到）。
   const survivingLocalOnly = prev.filter(
     (session) =>
-      !fetchedIds.has(session.id) && session.updatedAt >= snapshotWatermark,
+      !fetchedIds.has(session.id) && getAgentSessionActivityTime(session) >= snapshotWatermark,
   )
 
   // 同 ID 的旧快照不能覆盖已通过事件即时写入的本地状态。等值也保留本地，
   // 因为 TITLE_UPDATED 事件不携带权威 updatedAt，时间戳可能尚未来得及同步。
   const mergedFetched = fetched.map((session) => {
     const local = previousById.get(session.id)
-    return local && local.updatedAt >= session.updatedAt ? local : session
+    if (!local) return session
+    const localActivity = getAgentSessionActivityTime(local)
+    const fetchedActivity = getAgentSessionActivityTime(session)
+    return localActivity >= fetchedActivity
+      ? { ...local, lastActivityAt: localActivity }
+      : { ...session, lastActivityAt: fetchedActivity }
   })
 
   return sortAgentSessionsByUpdatedAtDesc([...mergedFetched, ...survivingLocalOnly])

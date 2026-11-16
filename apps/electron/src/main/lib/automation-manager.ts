@@ -11,11 +11,13 @@
 import { randomUUID } from 'node:crypto'
 import { writeJsonFileAtomic, readJsonFileSafe } from './safe-file'
 import { getAutomationsPath } from './config-paths'
+import { markInterruptedRuns, normalizeAutomationRunHistory } from './automation-run-history'
 import {
   AUTOMATION_MAX_HISTORY,
   AUTOMATION_DEFAULT_PERMISSION_MODE,
   type Automation,
   type AutomationRun,
+  type AutomationRunStatus,
   type CreateAutomationInput,
   type UpdateAutomationInput,
 } from '@proma/shared'
@@ -26,7 +28,29 @@ interface AutomationsIndex {
   automations: Automation[]
 }
 
-const INDEX_VERSION = 4
+const INDEX_VERSION = 5
+
+/** 一次运行结算的输入（runId 之外的终态字段） */
+export interface AutomationRunSettlement {
+  status: Exclude<AutomationRunStatus, 'running'>
+  sessionId?: string
+  finishedAt?: number
+  durationMs?: number
+  error?: string
+  skipReason?: string
+}
+
+/** 结算未生效的原因 */
+export type AutomationRunSettleFailureReason = 'automation-missing' | 'run-missing' | 'already-settled'
+
+export interface AutomationRunFinishResult {
+  /** 是否本次调用真正写入了终态（重复回调 / 记录已被截断时为 false） */
+  applied: boolean
+  reason?: AutomationRunSettleFailureReason
+  automation?: Automation
+  /** 结算后的运行记录 */
+  run?: AutomationRun
+}
 
 /**
  * 兼容历史字段：
@@ -81,6 +105,12 @@ function migrateLegacyFields(data: AutomationsIndex): boolean {
       a.lastSessionId = undefined
       changed = true
     }
+    // v5：运行历史补 runId / finishedAt，清理非法条目；不删除任务、不动 completedAt / permissionMode 等本地字段
+    const normalizedHistory = normalizeAutomationRunHistory(a.runHistory)
+    if (!Array.isArray(a.runHistory) || normalizedHistory.changed) {
+      a.runHistory = normalizedHistory.runHistory
+      changed = true
+    }
   }
   if (data.version < INDEX_VERSION) {
     data.version = INDEX_VERSION
@@ -132,7 +162,9 @@ function readIndex(): AutomationsIndex {
   cachedIndex = data
   if (migrated) {
     writeIndex(data)
-    console.log('[定时任务] 索引已迁移至最新版本（sessionMode: new → daily，permissionMode: auto → bypassPermissions）')
+    console.log(
+      `[定时任务] 索引已迁移至 v${INDEX_VERSION}（sessionMode: new → daily，permissionMode: auto → bypassPermissions，运行历史补 runId）`,
+    )
   }
   return cachedIndex
 }
@@ -153,7 +185,7 @@ function writeIndex(index: AutomationsIndex): void {
  * - interval：from + 间隔分钟
  * - daily：今天/明天的 timeOfDay
  * - weekly：本周/下周 dayOfWeek 的 timeOfDay
- * - once：直接返回固定的 scheduledAt（不做任何前进推算），跑完后由 appendRun 自动停用
+ * - once：直接返回固定的 scheduledAt（不做任何前进推算），跑完后由 settleAutomationRun 自动停用
  * - interval 叠加 activeWindowStart/activeWindowEnd 时，仅在每日窗口内运行；窗口外自动跳至下一天窗口开始
  *
  * 返回值保证为有限正整数。输入非法时回退到 from + 10min 并打印警告。
@@ -171,7 +203,7 @@ export function computeNextRunAt(
   if (a.scheduleType === 'once') {
     // 一次性任务：永远返回固定的绝对时间戳，不随 from 前进。
     // 即使该时刻已过去（如应用重启后恢复），也保持过去值——让调度器在下个 tick 补跑一次，
-    // 这正是「该跑没跑就补上」的期望行为；跑完后 appendRun 会把任务自动停用，不会重复触发。
+    // 这正是「该跑没跑就补上」的期望行为；跑完后 settleAutomationRun 会把任务自动停用，不会重复触发。
     result = Number.isFinite(a.scheduledAt) && a.scheduledAt! > 0
       ? a.scheduledAt!
       : from + FALLBACK_INTERVAL_MS
@@ -571,26 +603,102 @@ export function deleteAutomation(id: string): boolean {
   return true
 }
 
+/** 把运行记录压入历史（最新在前）并截断超限部分 */
+function pushRunHistory(target: Automation, run: AutomationRun): void {
+  // 前向版本索引可能缺 runHistory（未走迁移），这里兜底保证写入安全
+  if (!Array.isArray(target.runHistory)) target.runHistory = []
+  target.runHistory.unshift(run)
+  if (target.runHistory.length > AUTOMATION_MAX_HISTORY) {
+    target.runHistory = target.runHistory.slice(0, AUTOMATION_MAX_HISTORY)
+  }
+}
+
 /**
- * 记录一次运行结果并推进下次触发时间
+ * 新增一条运行记录（不推进调度计时）
  *
- * 由调度器在运行完成/失败/跳过后调用。
- * - 成功/失败：从「现在」起算下次触发时间，并累加 runCount
- * - 跳过：不动 nextRunAt、不计入 runCount——否则任务因重入持续跳过时，每次跳过都会把下次触发再推一个完整间隔，
- *   实际周期会被拉成 N×interval。保留原 nextRunAt 让下一个 tick 立刻有机会再次尝试。
- * - 成功/跳过：清零连续失败计数；失败：累加（调度器据此判断是否自动暂停）
- * - once 跑完一次 / 达到 maxRuns 上限：自动停用并标记 completedAt，区别于手动暂停
+ * - 运行开始时以 status:'running' 原子落盘，保证进程崩溃后仍能在启动时恢复为中断
+ * - 重入跳过时直接落一条 skipped 终态记录
+ * @returns 更新后的任务；任务不存在时 undefined
  */
-export function appendRun(id: string, run: AutomationRun): Automation | undefined {
+export function insertAutomationRun(id: string, run: AutomationRun): Automation | undefined {
   const index = readIndex()
   const target = index.automations.find((a) => a.id === id)
   if (!target) return undefined
 
   const now = Date.now()
-  target.runHistory.unshift(run)
-  if (target.runHistory.length > AUTOMATION_MAX_HISTORY) {
-    target.runHistory = target.runHistory.slice(0, AUTOMATION_MAX_HISTORY)
+  pushRunHistory(target, run)
+  // 跳过不推进调度，但清零连续失败计数（沿用旧行为：跳过不算一次失败）
+  if (run.status === 'skipped') target.consecutiveFailures = 0
+  target.updatedAt = now
+  writeIndex(index)
+  return target
+}
+
+/**
+ * 为进行中的运行补记子会话 ID（会话创建发生在 running 落盘之后）
+ * 同时更新任务的 lastSessionId，供下一次运行按 sessionMode 复用。
+ */
+export function attachAutomationRunSession(
+  id: string,
+  runId: string,
+  sessionId: string,
+): Automation | undefined {
+  const index = readIndex()
+  const target = index.automations.find((a) => a.id === id)
+  if (!target) return undefined
+
+  let changed = false
+  if (!Array.isArray(target.runHistory)) target.runHistory = []
+  const run = target.runHistory.find((item) => item.runId === runId)
+  if (run && run.status === 'running' && run.sessionId !== sessionId) {
+    run.sessionId = sessionId
+    changed = true
   }
+  if (target.lastSessionId !== sessionId) {
+    target.lastSessionId = sessionId
+    changed = true
+  }
+  if (!changed) return target
+
+  target.updatedAt = Date.now()
+  writeIndex(index)
+  return target
+}
+
+/**
+ * 按 runId 结算一次运行
+ *
+ * 幂等：只有当前记录仍是 running 时才写入终态并推进调度。
+ * 迟到回调（超时后 onComplete、上一轮遗留回调）不会覆盖新一轮，也不会重复计数。
+ */
+export function settleAutomationRun(
+  id: string,
+  runId: string,
+  settlement: AutomationRunSettlement,
+): AutomationRunFinishResult {
+  const index = readIndex()
+  const target = index.automations.find((a) => a.id === id)
+  if (!target) return { applied: false, reason: 'automation-missing' }
+
+  if (!Array.isArray(target.runHistory)) target.runHistory = []
+  const run = target.runHistory.find((item) => item.runId === runId)
+  if (!run) {
+    // 记录已被历史截断：既不补写也不计数，避免同一次运行出现两条记录
+    console.warn(`[定时任务] 运行记录已被截断，忽略结算: automation=${id}, run=${runId}`)
+    return { applied: false, reason: 'run-missing' }
+  }
+  if (run.status !== 'running') {
+    return { applied: false, reason: 'already-settled', automation: target, run }
+  }
+
+  const now = Date.now()
+  const finishedAt = settlement.finishedAt ?? now
+  run.status = settlement.status
+  run.finishedAt = finishedAt
+  run.durationMs = settlement.durationMs ?? Math.max(0, finishedAt - run.runAt)
+  run.error = settlement.error
+  run.skipReason = settlement.skipReason
+  if (settlement.sessionId) run.sessionId = settlement.sessionId
 
   if (run.status !== 'skipped') {
     target.lastRunAt = run.runAt
@@ -614,7 +722,31 @@ export function appendRun(id: string, run: AutomationRun): Automation | undefine
 
   target.updatedAt = now
   writeIndex(index)
-  return target
+  return { applied: true, automation: target, run }
+}
+
+/**
+ * 启动恢复：把上次进程遗留的 running 记录改标为 interrupted。
+ *
+ * 只改运行记录，不推进 nextRunAt / runCount，也不触发任何运行，
+ * 避免应用重启后对中断任务盲目重跑。
+ * @returns 被改标的记录条数
+ */
+export function recoverInterruptedAutomationRuns(): number {
+  const index = readIndex()
+  const now = Date.now()
+  let recovered = 0
+
+  for (const automation of index.automations) {
+    if (!Array.isArray(automation.runHistory)) continue
+    recovered += markInterruptedRuns(automation.runHistory, now)
+  }
+
+  if (recovered > 0) {
+    writeIndex(index)
+    console.warn(`[定时任务] 已将 ${recovered} 条上次未结束的运行记录标记为中断`)
+  }
+  return recovered
 }
 
 /** 设置 nextRunAt（调度器恢复过期任务时用，避免重启雪崩触发） */

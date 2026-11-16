@@ -7,26 +7,26 @@
 
 import * as React from 'react'
 import { useAtomValue, useSetAtom } from 'jotai'
-import { RotateCw, AlertTriangle, CheckCircle2, Ban, ChevronDown, ChevronRight } from 'lucide-react'
+import {
+  RotateCw,
+  AlertTriangle,
+  CheckCircle2,
+  Ban,
+  ChevronDown,
+  ChevronRight,
+} from 'lucide-react'
 import { WelcomeEmptyState } from '@/components/welcome/WelcomeEmptyState'
-import {
-  BasePathsProvider,
-  Message,
-  MessageContent,
-  MessageHeader,
-} from '@/components/ai-elements/message'
-import {
-  Conversation,
-  ConversationContent,
-} from '@/components/ai-elements/conversation'
+import { BasePathsProvider, Message, MessageContent } from '@/components/ai-elements/message'
+import { Conversation, ConversationContent } from '@/components/ai-elements/conversation'
 import { ScrollMinimap } from '@/components/ai-elements/scroll-minimap'
 import type { MinimapItem } from '@/components/ai-elements/scroll-minimap'
 import { useStickToBottomContext } from 'use-stick-to-bottom'
-import { formatMessageTime } from '@/components/chat/ChatMessageItem'
+import { shouldStopScrollFollow, shouldStopScrollFollowOnTouch } from '@/lib/scroll-follow'
+import { formatMessageTime } from '@/lib/message-time'
 import { resolveModelDisplayName } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
 import { tabMinimapCacheAtom } from '@/atoms/tab-atoms'
-import { channelsAtom } from '@/atoms/chat-atoms'
+import { channelsAtom } from '@/atoms/channel-atoms'
 import { ScrollPositionManager } from '@/hooks/useScrollPositionMemory'
 import { cn } from '@/lib/utils'
 import {
@@ -39,13 +39,27 @@ import {
 import { toTranscript } from '@proma/session-core'
 import { Spinner } from '@/components/ui/spinner'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
-import { groupIntoTurns, AssistantLogo, MessageGroupRenderer, getGroupId, getGroupPreview, extractUserText, buildTaskProgressDataForTurn, type MessageGroup } from './SDKMessageRenderer'
+import {
+  groupIntoTurns,
+  MessageGroupRenderer,
+  getGroupId,
+  getGroupPreview,
+  extractUserText,
+  type MessageGroup,
+} from './SDKMessageRenderer'
 import { buildLiveGroupSet } from './live-group-set'
 import { AgentBrowserLinkProvider } from '@/components/browser/AgentBrowserLinkProvider'
 import { AgentHistorySelectionLayer } from './AgentHistorySelectionLayer'
-import { TaskProgressOverlay, type ContextCompactionProgress } from './TaskProgressOverlay'
+import { ChatBottomControls, type ContextCompactionProgress } from './ChatBottomControls'
 import { createMessageGroupRenderCache, groupMessagesForRendering } from './message-group-rendering'
-import type { AgentEventUsage, RetryAttempt, SDKAssistantMessage, SDKMessage, SDKSystemMessage, SDKTextBlock, SDKThinkingBlock } from '@proma/shared'
+import type {
+  RetryAttempt,
+  SDKAssistantMessage,
+  SDKMessage,
+  SDKSystemMessage,
+  SDKTextBlock,
+  SDKThinkingBlock,
+} from '@proma/shared'
 import { getSDKCompactStatus } from '@proma/shared'
 import { agentLiveMessagesAtomFamily, agentSessionStreamingStateAtomFamily, type AgentStreamState } from '@/atoms/agent-atoms'
 import type { QuotedSelection } from '@/atoms/preview-atoms'
@@ -522,47 +536,7 @@ function RetryAttemptItem({
   )
 }
 
-/** 格式化耗时（毫秒 → 可读字符串） */
-export function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`
-  const seconds = ms / 1000
-  if (seconds < 60) return `${seconds.toFixed(1)}s`
-  const m = Math.floor(seconds / 60)
-  const s = seconds % 60
-  return `${m}m ${s.toFixed(0)}s`
-}
-
-/** 构建 usage tooltip 多行文本 */
-export function buildUsageTooltip(durationMs: number, usage?: AgentEventUsage): string {
-  const lines: string[] = []
-  lines.push(`耗时: ${formatDuration(durationMs)}`)
-
-  if (usage) {
-    const pureInput = (usage.inputTokens ?? 0) - (usage.cacheReadTokens ?? 0) - (usage.cacheCreationTokens ?? 0)
-    if (pureInput > 0) lines.push(`输入: ${pureInput.toLocaleString()}`)
-    if (usage.outputTokens) lines.push(`输出: ${usage.outputTokens.toLocaleString()}`)
-    if (usage.cacheCreationTokens) lines.push(`缓存写入: ${usage.cacheCreationTokens.toLocaleString()}`)
-    if (usage.cacheReadTokens) lines.push(`缓存读取: ${usage.cacheReadTokens.toLocaleString()}`)
-  }
-
-  return lines.join('\n')
-}
-
-/** 耗时徽章 — 悬浮显示 token 用量明细 */
-export function DurationBadge({ durationMs, usage }: { durationMs: number; usage?: AgentEventUsage }): React.ReactElement {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <span className="text-[15px] tabular-nums font-light cursor-default">
-          {formatDuration(durationMs)}
-        </span>
-      </TooltipTrigger>
-      <TooltipContent side="top">
-        <p className="whitespace-pre-line text-left">{buildUsageTooltip(durationMs, usage)}</p>
-      </TooltipContent>
-    </Tooltip>
-  )
-}
+export { buildUsageTooltip, formatDuration } from '@/lib/turn-usage'
 
 /** Agent 运行指示器 — Shimmer Spinner + 无括号的运行时间 */
 function AgentRunningIndicator({ startedAt }: { startedAt?: number }): React.ReactElement {
@@ -775,6 +749,34 @@ const AgentTranscriptHistory = React.forwardRef<AgentTranscriptHistoryHandle, Ag
 
   const firstGroupId = groups[0] ? getGroupId(groups[0]) : undefined
   const groupCount = groups.length
+
+  // 官方 0.22.60：任何向上的滚轮/触摸手势都立即停止自动跟随，
+  // 避免缓慢上滑时被下一帧强制拉回底部；回到底部后由 StickToBottom 恢复。
+  React.useEffect(() => {
+    const element = scrollRef.current
+    if (!element) return
+    let touchStartY: number | null = null
+    const onWheel = (event: WheelEvent): void => {
+      if (shouldStopScrollFollow(event.deltaY)) stopScroll()
+    }
+    const onTouchStart = (event: TouchEvent): void => {
+      touchStartY = event.touches[0]?.clientY ?? null
+    }
+    const onTouchMove = (event: TouchEvent): void => {
+      const currentY = event.touches[0]?.clientY
+      if (touchStartY !== null && currentY !== undefined && shouldStopScrollFollowOnTouch(touchStartY, currentY)) {
+        stopScroll()
+      }
+    }
+    element.addEventListener('wheel', onWheel, { passive: true })
+    element.addEventListener('touchstart', onTouchStart, { passive: true })
+    element.addEventListener('touchmove', onTouchMove, { passive: true })
+    return () => {
+      element.removeEventListener('wheel', onWheel)
+      element.removeEventListener('touchstart', onTouchStart)
+      element.removeEventListener('touchmove', onTouchMove)
+    }
+  }, [scrollRef, stopScroll])
 
   React.useLayoutEffect(() => {
     const element = scrollRef.current
@@ -990,11 +992,6 @@ export const AgentMessages = React.memo(function AgentMessages({
   // 避免每个 sdk_delta 同时更新 transcript 和 legacy content 两条路径。
   const retrying = streamState?.retrying
   const startedAt = streamState?.startedAt
-  const optimisticModelId = streamState?.model || sessionModelId
-  const optimisticModel = optimisticModelId
-    ? resolveModelDisplayName(optimisticModelId, channels)
-    : undefined
-  const optimisticTime = startedAt ? formatMessageTime(startedAt) : undefined
 
   // Agent 消息区不使用 StickToBottom 的 smooth resize。切换会话、虚拟列表测量和
   // 历史消息加载都必须立即定位，避免 ResizeObserver 触发滚动 spring 动画。
@@ -1044,24 +1041,6 @@ export const AgentMessages = React.memo(function AgentMessages({
       .map((message) => getSDKMessageStableKey(message))
       .join('\u0000')
   ), [allSDKMessages])
-
-  // 在当前 run 的全部 live turn 中汇总任务。压缩边界或后台唤醒会拆开 turn，
-  // 不能只取最后一段，否则此前已创建但未再次更新的任务会从进度卡消失。
-  const liveTaskActivities = React.useMemo(() => {
-    const currentRunMessages = (liveMessages ?? []).filter((message) => {
-      const record = message as Record<string, unknown>
-      const messageRunGeneration = record._promaLiveRunGeneration
-      const messageRunStartedAt = record._promaLiveRunStartedAt
-      if (streamState?.runGeneration != null && typeof messageRunGeneration === 'number') {
-        return messageRunGeneration === streamState.runGeneration
-      }
-      return startedAt == null || messageRunStartedAt == null || messageRunStartedAt === startedAt
-    })
-    return groupIntoTurns(currentRunMessages, sessionModelId)
-      .flatMap((group) => group.type === 'assistant-turn'
-        ? buildTaskProgressDataForTurn(group).taskActivities
-        : [])
-  }, [liveMessages, sessionModelId, startedAt, streamState?.runGeneration])
 
   const contextCompaction = React.useMemo(
     () => getContextCompactionProgress(liveMessages ?? [], streamState?.isCompacting, streamState?.contextCompaction),
@@ -1145,18 +1124,16 @@ export const AgentMessages = React.memo(function AgentMessages({
     [localSearchRecords],
   )
 
-  // 迷你地图数据 — 只依赖结构快照，流式 token 不触发 getGroupPreview 正则
+  // 官方 0.22.0：左侧消息导航只保留用户消息。
   const minimapItems: MinimapItem[] = React.useMemo(
-    () => structuralGroups.map((group) => ({
-      id: getGroupId(group),
-      role: group.type === 'user' ? 'user' as const
-        : group.type === 'system' ? 'status' as const
-        : 'assistant' as const,
-      preview: getGroupPreview(group),
-      avatar: group.type === 'user' ? userProfile.avatar : undefined,
-      model: group.type === 'assistant-turn' ? group.model : undefined,
-    })),
-    [structuralGroups, userProfile.avatar]
+    () => structuralGroups
+      .filter((group) => group.type === 'user')
+      .map((group) => ({
+        id: getGroupId(group),
+        role: 'user' as const,
+        preview: getGroupPreview(group),
+      })),
+    [structuralGroups]
   )
 
   // 同步 minimap 缓存到 Tab 级别（供 Tab hover 预览使用）。
@@ -1207,7 +1184,8 @@ export const AgentMessages = React.memo(function AgentMessages({
       `}</style>
           <Conversation resize="instant" className={ready ? 'opacity-100' : 'opacity-0'}>
         <ScrollPositionManager id={sessionId} ready={ready} />
-        <ConversationContent>
+        {/* 左侧消息导航占住左侧留白，正文右移避免与横杠贴边 */}
+        <ConversationContent className="pl-16">
           {!hasContent && !streaming ? (
             <EmptyState />
           ) : (
@@ -1239,7 +1217,7 @@ export const AgentMessages = React.memo(function AgentMessages({
               {/* 不使用 mt：ConversationContent 的 gap-1(4px) 已提供间距，
                   匹配内部 MessageActions 的 gap-0.5(2px)+mt-0.5(2px)=4px 间距 */}
               {hasLiveAssistantContent && !suppressAgentRunning && (
-                <div className="pl-[56px] min-h-[28px]">
+                <div className="min-h-[28px]">
                   {retrying && <RetryingNotice retrying={retrying} />}
                   {streaming && <AgentRunningIndicator startedAt={startedAt} />}
                 </div>
@@ -1248,11 +1226,6 @@ export const AgentMessages = React.memo(function AgentMessages({
               {/* 首个 live assistant block 到达前，先乐观渲染 assistant 外壳和 Logo；文本仍完全由 SDKMessage 渲染。 */}
               {!hasLiveAssistantContent && !suppressAgentRunning && (streaming || retrying) && (
                 <Message from="assistant">
-                  <MessageHeader
-                    model={optimisticModel}
-                    time={optimisticTime}
-                    logo={<AssistantLogo model={optimisticModelId} />}
-                  />
                   <MessageContent>
                     {retrying && <RetryingNotice retrying={retrying} />}
                     {streaming && <AgentRunningIndicator startedAt={startedAt} />}
@@ -1264,9 +1237,8 @@ export const AgentMessages = React.memo(function AgentMessages({
           )}
         </ConversationContent>
         <ScrollMinimap items={minimapItems} searchMessages={searchMessages} />
-        <TaskProgressOverlay
+        <ChatBottomControls
           key={sessionId}
-          activities={liveTaskActivities}
           streaming={streaming}
           contextCompaction={contextCompaction}
         />

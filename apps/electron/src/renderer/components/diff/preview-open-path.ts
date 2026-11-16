@@ -82,6 +82,7 @@ export function getPreviewFileAccess(
     sessionId,
     // 仅用户主动从文件面板选中的外部文件可放宽范围；模型回复中的路径保持会话授权边界。
     unrestricted: file.unrestricted === true,
+    ...(file.explicitPreviewFiles?.length ? { explicitPreviewFiles: file.explicitPreviewFiles } : {}),
     ...(file.workspaceSkillSlug ? { workspaceSkillSlug: file.workspaceSkillSlug } : {}),
     ...(file.legacySkillFilePath ? { legacySkillFilePath: file.legacySkillFilePath } : {}),
     candidateBasePaths: getPreviewCandidateBasePaths(

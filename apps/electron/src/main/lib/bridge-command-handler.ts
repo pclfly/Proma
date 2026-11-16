@@ -9,14 +9,10 @@
 
 import type { AgentStreamPayload } from '@proma/shared'
 import { getMainWindow } from './main-window-store'
+import { describeBridgeWorkspaceFailure, resolveBridgeWorkspace, type BridgeWorkspaceResolution } from './bridge-workspace-resolution'
 import { AGENT_IPC_CHANNELS } from '@proma/shared'
 import { createAgentSession, listAgentSessions, getAgentSessionMeta } from './agent-session-manager'
-import {
-  listAgentWorkspacesByUpdatedAt,
-  getAgentWorkspace,
-  getProjectFilesPath,
-  getWorkspaceCapabilities,
-} from './agent-workspace-manager'
+import { listAgentWorkspacesByUpdatedAt, getAgentWorkspace, getProjectFilesPath, getWorkspaceCapabilities } from './agent-workspace-manager'
 import { runAgentHeadless, agentEventBus, stopAgent, isAgentSessionActive } from './agent-service'
 import { getSettings } from './settings-service'
 import { buildAttachedFilesBlock, buildSessionFileTree, buildFileTree } from './bridge-attachment-utils'
@@ -28,7 +24,7 @@ import {
   describeBindingModel,
 } from './bridge-model-utils'
 import type { BridgeChatBindingStore } from './bridge-binding-store'
-import { filterExistingBridgeBindings } from './bridge-binding-store'
+import { BridgeWorkspaceSwitchError, commitBridgeWorkspaceSwitch } from './bridge-workspace-switch'
 import { extractFinalAssistantText } from './bridge-agent-message-utils'
 import { redactSensitiveLogText, redactSensitiveLogValue } from './bridge-log-redaction'
 
@@ -59,7 +55,7 @@ export interface BridgeCommandHandlerConfig {
   /** 获取默认工作区 ID */
   getDefaultWorkspaceId?: () => string | undefined
   /** 工作区切换后的回调 */
-  onWorkspaceSwitched?: (workspaceId: string) => void
+  onWorkspaceSwitched?: (workspaceId: string | undefined) => void | Promise<void>
   /** 可选持久化存储：用于跨应用重启恢复 chatId → sessionId 绑定 */
   bindingStore?: BridgeChatBindingStore
   /** 仅改变传给 Agent 的文本；会话中仍保存未经处理的原始消息。 */
@@ -91,16 +87,21 @@ export class BridgeCommandHandler {
 
   /** chatId → 聊天绑定 */
   private chatBindings = new Map<string, BridgeChatBinding>()
+  /** 保留已知失效的外部chat，直到用户明确/new、/switch或/workspace，不自动改投默认项目。 */
+  private rejectedBindings = new Map<string, BridgeChatBinding>()
   /** sessionId → chatId（反向索引） */
   private sessionToChat = new Map<string, string>()
   /** sessionId → 回复缓冲 */
   private sessionBuffers = new Map<string, SessionBuffer>()
   /** EventBus 取消订阅 */
   private eventBusUnsubscribe: (() => void) | null = null
+  private workspaceSwitchPending = false
+  private workspaceSwitchBlocked = false
 
   constructor(config: BridgeCommandHandlerConfig) {
     this.config = config
     this.log = (msg: string) => console.log(`[${config.platformName} Bridge] ${redactSensitiveLogText(msg)}`)
+    this.workspaceSwitchBlocked = config.bindingStore?.workspaceSwitchJournal?.isPending() ?? false
     this.loadPersistedBindings()
   }
 
@@ -112,12 +113,22 @@ export class BridgeCommandHandler {
     text: string,
     contextData?: unknown,
     attachments?: BridgeAttachment[],
-  ): Promise<void> {
+    expectedTarget?: Pick<BridgeChatBinding, 'sessionId' | 'workspaceId'>,
+  ): Promise<boolean> {
+    const readOnlyCommand = /^\/(?:stop|now|help)(?:\s|$)/i.test(text.trim())
+    if ((this.workspaceSwitchPending && !readOnlyCommand)
+      || (this.workspaceSwitchBlocked && !readOnlyCommand && !/^\/(?:workspace|ws)(?:\s|$)/i.test(text.trim()))) {
+      await this.send(chatId, this.workspaceSwitchPending
+        ? '项目切换仍在保存，请等待完成后再发送。'
+        : '上次项目切换未完成，已暂停自动处理。请用 /workspace 重新选择项目。', contextData)
+      return false
+    }
     if (text.trimStart().startsWith('/')) {
       // 命令消息不携带附件（附件由 Bridge 缓冲，等普通消息触发）
       await this.handleCommand(chatId, text, contextData)
+      return false
     } else {
-      await this.handleUserMessage(chatId, text, contextData, attachments)
+      return this.handleUserMessage(chatId, text, contextData, attachments, expectedTarget)
     }
   }
 
@@ -127,14 +138,18 @@ export class BridgeCommandHandler {
    * 如果未配置 Agent 渠道，返回 null
    */
   ensureBinding(chatId: string): BridgeChatBinding | null {
+    if (this.workspaceSwitchPending || this.workspaceSwitchBlocked || this.rejectedBindings.has(chatId)) return null
     const existing = this.getValidBinding(chatId)
     if (existing) return existing
+    if (this.rejectedBindings.has(chatId)) return null
 
     const settings = getSettings()
     const channelId = settings.agentChannelId
     if (!channelId) return null
 
     const workspaceId = this.resolveValidWorkspaceId(settings.agentWorkspaceId)
+    // 没有可证明有效的项目就不创建会话：避免 workspaceId 为空、消息无处归属。
+    if (!workspaceId) return null
 
     // 保持默认标题，让首条外部消息复用 Agent 编排器的统一自动命名流程。
     // 平台来源由 binding 保存，不能作为会话标题，否则会被视为用户已命名。
@@ -152,12 +167,20 @@ export class BridgeCommandHandler {
       channelId,
       modelId: settings.agentModelId ?? undefined,
     }
-    this.chatBindings.set(chatId, binding)
-    this.sessionToChat.set(session.id, chatId)
-    this.saveBindings()
+    this.commitBinding(chatId, binding)
     this.log(`为 ${chatId.slice(0, 8)}... 创建会话: ${session.id.slice(0, 8)}`)
     this.notifySessionCreated(session.id, session.title)
     return binding
+  }
+
+  /** 媒体预处理与文字路由共用同一失败原因，不把项目失效误报成渠道缺失。 */
+  getBindingFailureMessage(chatId?: string): string {
+    if (chatId && this.rejectedBindings.has(chatId)) return '原会话或项目不可用。请用 /workspace 或 /switch 明确选择项目/会话。'
+    if (this.workspaceSwitchPending) return '项目切换仍在保存，请稍后重试。'
+    if (this.workspaceSwitchBlocked) return '项目切换尚未完成，请用 /workspace 重新选择项目。'
+    const settings = getSettings()
+    if (!settings.agentChannelId) return '请先在 Proma 设置中选择 Agent 渠道。'
+    return this.describeWorkspaceProblem(settings.agentWorkspaceId) ?? '无法建立会话，请检查项目和渠道配置后重试。'
   }
 
   /** 检查指定 chatId 的 session 是否正在运行 */
@@ -208,6 +231,7 @@ export class BridgeCommandHandler {
   /** 清理所有状态 */
   clear(): void {
     this.chatBindings.clear()
+    this.rejectedBindings.clear()
     this.sessionToChat.clear()
     this.sessionBuffers.clear()
     this.saveBindings()
@@ -217,29 +241,52 @@ export class BridgeCommandHandler {
     const bindings = this.config.bindingStore?.load()
     if (!bindings || bindings.length === 0) return
 
-    const existingBindings = filterExistingBridgeBindings(bindings, (sessionId) => Boolean(getAgentSessionMeta(sessionId)))
-      .filter((binding) => this.isBindingValid(binding))
-    for (const binding of existingBindings) {
+    for (const binding of bindings) {
+      if (!this.isBindingValid(binding)) {
+        this.rejectedBindings.set(binding.chatId, binding)
+        continue
+      }
       this.chatBindings.set(binding.chatId, binding)
       this.sessionToChat.set(binding.sessionId, binding.chatId)
     }
+    if (this.chatBindings.size > 0) this.log(`已恢复 ${this.chatBindings.size} 个聊天绑定`)
+  }
 
-    if (existingBindings.length !== bindings.length) {
-      this.config.bindingStore?.save(existingBindings)
-    }
-    if (existingBindings.length > 0) {
-      this.log(`已恢复 ${existingBindings.length} 个聊天绑定`)
-    }
+  private persistedBindings(): BridgeChatBinding[] {
+    return [...this.rejectedBindings.values(), ...this.chatBindings.values()]
   }
 
   private saveBindings(): void {
-    this.config.bindingStore?.save(Array.from(this.chatBindings.values()))
+    this.config.bindingStore?.save(this.persistedBindings())
   }
 
-  private resolveValidWorkspaceId(fallbackWorkspaceId?: string): string {
-    const requestedWorkspaceId = this.config.getDefaultWorkspaceId?.() ?? fallbackWorkspaceId ?? ''
-    if (requestedWorkspaceId && getAgentWorkspace(requestedWorkspaceId)) return requestedWorkspaceId
-    return listAgentWorkspacesByUpdatedAt()[0]?.id ?? ''
+  private commitBinding(chatId: string, next: BridgeChatBinding): void {
+    this.config.bindingStore?.save([...this.persistedBindings().filter((item) => item.chatId !== chatId), next])
+    const old = this.chatBindings.get(chatId)
+    if (old && this.sessionToChat.get(old.sessionId) === chatId) this.sessionToChat.delete(old.sessionId)
+    this.rejectedBindings.delete(chatId)
+    this.chatBindings.set(chatId, next)
+    this.sessionToChat.set(next.sessionId, chatId)
+  }
+
+  /** 失效/缺失项目必须显式拒绝，不能以空 workspaceId 建孤儿会话，也不能静默换项目。 */
+  private resolveWorkspace(fallbackWorkspaceId?: string): BridgeWorkspaceResolution {
+    return resolveBridgeWorkspace({
+      candidates: [this.config.getDefaultWorkspaceId?.(), fallbackWorkspaceId],
+      exists: (id) => Boolean(getAgentWorkspace(id)),
+      list: () => listAgentWorkspacesByUpdatedAt(),
+    })
+  }
+
+  private resolveValidWorkspaceId(fallbackWorkspaceId?: string): string | undefined {
+    const resolution = this.resolveWorkspace(fallbackWorkspaceId)
+    return resolution.ok ? resolution.workspaceId : undefined
+  }
+
+  /** 供调用方向 IM 用户说明为什么当前不能建立会话。 */
+  describeWorkspaceProblem(fallbackWorkspaceId?: string): string | null {
+    const resolution = this.resolveWorkspace(fallbackWorkspaceId)
+    return resolution.ok ? null : describeBridgeWorkspaceFailure(resolution)
   }
 
   private isBindingValid(binding: BridgeChatBinding): boolean {
@@ -248,10 +295,11 @@ export class BridgeCommandHandler {
 
     const sessionWorkspaceId = session.workspaceId ?? ''
     if (sessionWorkspaceId !== binding.workspaceId) return false
-    return !binding.workspaceId || Boolean(getAgentWorkspace(binding.workspaceId))
+    return Boolean(binding.workspaceId && getAgentWorkspace(binding.workspaceId))
   }
 
   private removeBinding(chatId: string, binding: BridgeChatBinding): void {
+    this.rejectedBindings.set(chatId, binding)
     this.chatBindings.delete(chatId)
     if (this.sessionToChat.get(binding.sessionId) === chatId) {
       this.sessionToChat.delete(binding.sessionId)
@@ -351,22 +399,16 @@ export class BridgeCommandHandler {
       return
     }
 
-    // 确定工作区；若设置仍指向已删除项目，回退到现存项目而不是创建孤儿会话。
+    // 确定工作区；配置指向已删除项目时明确拒绝，而不是创建孤儿会话或静默换项目。
     const workspaceId = this.resolveValidWorkspaceId(settings.agentWorkspaceId)
-
-    const session = createAgentSession(
-      title || '新会话',
-      channelId,
-      workspaceId || undefined,
-      undefined
-    )
-
-    // 清理旧绑定
-    const oldBinding = this.chatBindings.get(chatId)
-    if (oldBinding) {
-      this.sessionToChat.delete(oldBinding.sessionId)
+    if (!workspaceId) {
+      await this.send(chatId, this.describeWorkspaceProblem(settings.agentWorkspaceId) ?? '请先在 Proma 中选择项目。', contextData)
+      return
     }
 
+    const session = createAgentSession(title || '新会话', channelId, workspaceId, undefined)
+
+    // 旧绑定在新绑定成功落盘前保持不变。
     const binding: BridgeChatBinding = {
       chatId,
       sessionId: session.id,
@@ -374,9 +416,7 @@ export class BridgeCommandHandler {
       channelId,
       modelId: settings.agentModelId ?? undefined,
     }
-    this.chatBindings.set(chatId, binding)
-    this.sessionToChat.set(session.id, chatId)
-    this.saveBindings()
+    this.commitBinding(chatId, binding)
 
     // 通知渲染进程刷新会话列表
     this.notifySessionCreated(session.id, session.title)
@@ -460,22 +500,20 @@ export class BridgeCommandHandler {
       return
     }
 
-    // 清理旧绑定
-    const oldBinding = this.chatBindings.get(chatId)
-    if (oldBinding) {
-      this.sessionToChat.delete(oldBinding.sessionId)
+    // 先验证目标，不破坏仍可用的旧绑定与反向索引。
+    const workspaceId = match.workspaceId
+    if (!workspaceId || !getAgentWorkspace(workspaceId)) {
+      await this.send(chatId, '该会话所属项目已不存在，请用 /workspace 重新选择项目后再试。', contextData)
+      return
     }
-
     const binding: BridgeChatBinding = {
       chatId,
       sessionId: match.id,
-      workspaceId: match.workspaceId ?? this.config.getDefaultWorkspaceId?.() ?? settings.agentWorkspaceId ?? '',
+      workspaceId,
       channelId: match.channelId ?? settings.agentChannelId ?? '',
       modelId: settings.agentModelId ?? undefined,
     }
-    this.chatBindings.set(chatId, binding)
-    this.sessionToChat.set(match.id, chatId)
-    this.saveBindings()
+    this.commitBinding(chatId, binding)
 
     await this.send(chatId, `✅ 已切换到会话: ${match.title} (${match.id.slice(0, 8)})`, contextData)
   }
@@ -516,15 +554,42 @@ export class BridgeCommandHandler {
       return
     }
 
-    // 清理旧绑定（切换工作区后需要新建会话）
-    if (binding) {
-      this.sessionToChat.delete(binding.sessionId)
-      this.chatBindings.delete(chatId)
-      this.saveBindings()
+    const persistDefault = this.config.onWorkspaceSwitched
+    if (!persistDefault) {
+      await this.send(chatId, '此平台未提供项目保存能力，请在 Proma 设置中选择项目。', contextData)
+      return
     }
-
-    // 通知平台持久化
-    this.config.onWorkspaceSwitched?.(match.id)
+    const previousBindings = new Map(this.chatBindings)
+    const previousRejected = new Map(this.rejectedBindings)
+    const previousPersisted = this.persistedBindings()
+    const previousIndex = new Map(this.sessionToChat)
+    const before = JSON.stringify(previousPersisted)
+    this.workspaceSwitchPending = true
+    try {
+      await commitBridgeWorkspaceSwitch({
+        workspaceId: match.id,
+        getDefaultWorkspaceId: () => this.config.getDefaultWorkspaceId?.(),
+        persistDefaultWorkspaceId: persistDefault,
+        validate: () => Boolean(getAgentWorkspace(match.id))
+          && JSON.stringify(this.persistedBindings()) === before,
+        persistBindings: () => this.config.bindingStore?.save(previousPersisted.filter((item) => item.chatId !== chatId)),
+        restoreBindings: () => this.config.bindingStore?.save(previousPersisted),
+        commitMemory: () => {
+          this.chatBindings.delete(chatId)
+          this.rejectedBindings.delete(chatId)
+          if (binding && this.sessionToChat.get(binding.sessionId) === chatId) this.sessionToChat.delete(binding.sessionId)
+        },
+        restoreMemory: () => { this.chatBindings = previousBindings; this.rejectedBindings = previousRejected; this.sessionToChat = previousIndex },
+        journal: this.config.bindingStore?.workspaceSwitchJournal,
+      })
+      this.workspaceSwitchBlocked = false
+    } catch (error) {
+      this.workspaceSwitchBlocked ||= error instanceof BridgeWorkspaceSwitchError && error.requiresRepair
+      await this.send(chatId, error instanceof BridgeWorkspaceSwitchError ? error.message : '项目切换失败，请重试。', contextData)
+      return
+    } finally {
+      this.workspaceSwitchPending = false
+    }
 
     // 列出该工作区下最近会话
     const sessions = listAgentSessions()
@@ -705,14 +770,12 @@ export class BridgeCommandHandler {
     if (!binding) {
       binding = this.ensureBinding(chatId) ?? undefined
       if (!binding) {
-        await this.send(chatId, '请先发送一条消息创建会话，或在 Proma 设置中选择 Agent 渠道。', contextData)
+        await this.send(chatId, this.describeWorkspaceProblem(getSettings().agentWorkspaceId) ?? '请先发送一条消息创建会话，或在 Proma 设置中选择 Agent 渠道。', contextData)
         return
       }
     }
 
-    binding.channelId = channel.id
-    binding.modelId = model.id
-    this.saveBindings()
+    this.commitBinding(chatId, { ...binding, channelId: channel.id, modelId: model.id })
 
     await this.send(
       chatId,
@@ -728,26 +791,30 @@ export class BridgeCommandHandler {
     text: string,
     contextData?: unknown,
     attachments?: BridgeAttachment[],
-  ): Promise<void> {
+    expectedTarget?: Pick<BridgeChatBinding, 'sessionId' | 'workspaceId'>,
+  ): Promise<boolean> {
     const settings = getSettings()
     const channelId = settings.agentChannelId
     if (!channelId) {
       await this.send(chatId, '请先在 Proma 设置中选择 Agent 渠道。', contextData)
-      return
+      return false
     }
 
-    let binding = this.ensureBinding(chatId)
-    if (!binding) {
-      await this.send(chatId, '请先在 Proma 设置中选择 Agent 渠道。', contextData)
-      return
+    const binding = expectedTarget ? this.getValidBinding(chatId) : this.ensureBinding(chatId)
+    if (!binding || (expectedTarget && (binding.sessionId !== expectedTarget.sessionId || binding.workspaceId !== expectedTarget.workspaceId))) {
+      await this.send(chatId, this.getBindingFailureMessage(chatId), contextData)
+      return false
     }
 
     // 并发保护：如果该会话的 Agent 仍在运行，直接拒绝，不要触碰 buffer
     if (isAgentSessionActive(binding.sessionId)) {
       await this.send(chatId, '❌ 上一条消息仍在处理中，请稍候再试', contextData)
-      return
+      return false
     }
 
+    // 本轮目标不可在确认消息的await后被创建型解析器替换。
+    const targetSessionId = binding.sessionId
+    const targetWorkspaceId = binding.workspaceId
     // 即时确认：[workspace_name]->[session_title]: ⏳ Agent 处理中...
     const workspace = binding.workspaceId ? getAgentWorkspace(binding.workspaceId) : undefined
     const session = getAgentSessionMeta(binding.sessionId)
@@ -755,21 +822,21 @@ export class BridgeCommandHandler {
     const chatName = session?.title ?? '新会话'
     await this.send(chatId, `${wsName} → ${chatName}: ⏳ Agent 处理中...`, contextData)
 
-    // 发送确认消息期间项目可能刚被删除。再次 ensure 后才允许进入无头 Agent，
-    // 确保不会把失效 session/workspace 传给 runAgentHeadless。
-    binding = this.ensureBinding(chatId)
-    if (!binding) {
-      await this.send(chatId, '当前项目已不可用，请在 Proma 中重新选择项目后再试。', contextData)
-      return
+    // 只核验首次目标，不ensure/创建/回退到剩余项目；并发switch也必须拒绝旧轮。
+    if (this.workspaceSwitchPending || this.workspaceSwitchBlocked
+      || this.chatBindings.get(chatId) !== binding || binding.sessionId !== targetSessionId
+      || binding.workspaceId !== targetWorkspaceId || !this.isBindingValid(binding)) {
+      await this.send(chatId, '本条消息的会话或项目已变化，请确认当前项目后重新发送。', contextData)
+      return false
+    }
+    if (isAgentSessionActive(binding.sessionId) || this.sessionBuffers.has(binding.sessionId)) {
+      await this.send(chatId, '❌ 上一条消息仍在处理中，请稍候再试', contextData)
+      return false
     }
 
     // 初始化回复缓冲
-    this.sessionBuffers.set(binding.sessionId, {
-      text: '',
-      chatId,
-      contextData,
-      startedAt: Date.now(),
-    })
+    const ownBuffer: SessionBuffer = { text: '', chatId, contextData, startedAt: Date.now() }
+    this.sessionBuffers.set(targetSessionId, ownBuffer)
 
     // 渠道/模型解析：binding（per-chat 用户在 IM 里切过的）优先，其次全局设置
     const latestSettings = getSettings()
@@ -798,8 +865,10 @@ export class BridgeCommandHandler {
     runAgentHeadless(input, {
       onError: (error) => {
         this.log(`Agent 错误: ${error}`)
-        this.send(chatId, `❌ Agent 错误: ${error}`, contextData).catch((sendError) => console.error(`[${this.config.platformName} Bridge] 发送错误消息失败:`, redactSensitiveLogValue(sendError)))
-        this.sessionBuffers.delete(binding!.sessionId)
+        if (this.sessionBuffers.get(targetSessionId) === ownBuffer) {
+          this.sessionBuffers.delete(targetSessionId)
+          this.send(chatId, `❌ Agent 错误: ${error}`, contextData).catch((sendError) => console.error(`[${this.config.platformName} Bridge] 发送错误消息失败:`, redactSensitiveLogValue(sendError)))
+        }
       },
       onComplete: () => {
         // complete 由 EventBus listener 处理
@@ -807,7 +876,12 @@ export class BridgeCommandHandler {
       onTitleUpdated: () => {},
     }).catch((error) => {
       this.log(`Agent 运行异常: ${error}`)
+      if (this.sessionBuffers.get(targetSessionId) === ownBuffer) {
+        this.sessionBuffers.delete(targetSessionId)
+        this.send(chatId, '❌ Agent 未能接受本轮消息，请稍后重试。', contextData).catch((sendError) => console.error(`[${this.config.platformName} Bridge] 发送调度错误失败:`, redactSensitiveLogValue(sendError)))
+      }
     })
+    return true
   }
 
   // ===== EventBus 事件处理 =====
@@ -841,7 +915,7 @@ export class BridgeCommandHandler {
 
     this.log(`Agent 回复 (${duration}s): ${replyText.slice(0, 100)}${replyText.length > 100 ? '...' : ''}`)
     this.send(buffer.chatId, replyText, buffer.contextData).catch((sendError) => console.error(`[${this.config.platformName} Bridge] 发送回复失败:`, redactSensitiveLogValue(sendError)))
-    this.sessionBuffers.delete(sessionId)
+    if (this.sessionBuffers.get(sessionId) === buffer) this.sessionBuffers.delete(sessionId)
   }
 
   // ===== 工具方法 =====

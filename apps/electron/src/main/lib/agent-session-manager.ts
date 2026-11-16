@@ -5,10 +5,20 @@
  * - 会话索引：~/.proma/agent-sessions.json（轻量元数据）
  * - 消息存储：~/.proma/agent-sessions/{id}.jsonl（JSONL 格式，逐行追加）
  *
- * 照搬 conversation-manager.ts 的模式。
+ * 使用可移植的会话索引与JSONL消息文件。
  */
 
-import { readFileSync, appendFileSync, existsSync, mkdirSync, unlinkSync, readdirSync, createReadStream, createWriteStream, statSync, type WriteStream } from 'node:fs'
+import {
+  readFileSync,
+  appendFileSync,
+  existsSync,
+  unlinkSync,
+  readdirSync,
+  createReadStream,
+  createWriteStream,
+  statSync,
+  type WriteStream,
+} from 'node:fs'
 import { createInterface } from 'node:readline'
 import { readFile } from 'node:fs/promises'
 import { writeJsonFileAtomic, writeTextFileAtomic, readJsonFileSafe } from './safe-file'
@@ -23,11 +33,7 @@ import {
   getAgentWorkspacePath,
   getSdkConfigDir,
 } from './config-paths'
-import {
-  getAgentWorkspace,
-  getProjectFilesPath,
-  listAgentWorkspaces,
-} from './agent-workspace-manager'
+import { getAgentWorkspace, getProjectFilesPath, listAgentWorkspaces } from './agent-workspace-manager'
 import { resolvePiThinkingLevel } from './agent-thinking-level'
 import { getSettings } from './settings-service'
 import type {
@@ -45,10 +51,11 @@ import type {
   AgentActiveWorktree,
   SessionWorkbenchLayout,
 } from '@proma/shared'
-import { migratePermissionMode, mergeSkillActivations, findBestSearchMatch, insertTopSearchResult } from '@proma/shared'
-import { getConversationMessages } from './conversation-manager'
+import { migratePermissionMode, mergeSkillActivations, findBestSearchMatch, insertTopSearchResult, isCodexSpeed } from '@proma/shared'
+
 // 旧格式 → SDKMessage 的转换逻辑下沉到 @proma/session-core 作为唯一真源，避免主进程与渲染层各存一份。
 import { convertLegacyMessage } from '@proma/session-core'
+import { copyProjectScopeState } from './adapters/pi-project-scope-state'
 import { assertEnabledModelForChannel } from './agent-model-selection'
 import { copyForkWorkspaceFiles } from './agent-fork-workspace-copy'
 import { getAgentFileChangeTracker } from './agent-file-change-tracker'
@@ -63,6 +70,8 @@ interface AgentSessionsIndex {
   sessions: AgentSessionMeta[]
   /** 是否已将旧版默认关闭的 OpenAI 推理会话升级为默认开启。 */
   openAIThinkingDefaultEnabledMigrationCompleted?: boolean
+  /** 是否已为存量会话补齐 `lastActivityAt`（官方 0.22.0 侧栏排序口径）。 */
+  lastActivityAtMigrationCompleted?: boolean
 }
 
 /** 当前索引版本：v2 将 Claude runtime 退役为 Pi-only。 */
@@ -172,6 +181,21 @@ function migrateLegacyPermissionMode(index: AgentSessionsIndex): boolean {
  * 在此版本前，所有新建 OpenAI Agent 会话都会写入 off，无法与用户主动关闭区分。
  * 因此仅执行一次历史升级；之后用户手动关闭会保留 off。
  */
+/**
+ * 官方 0.22.0：侧栏按 `lastActivityAt` 排序。存量会话没有该字段时用
+ * `updatedAt` 补齐一次，之后元数据更新不会再改变活动时间。
+ */
+function migrateLastActivityAt(index: AgentSessionsIndex): boolean {
+  if (index.lastActivityAtMigrationCompleted) return false
+  for (const session of index.sessions) {
+    if (session.lastActivityAt === undefined) {
+      session.lastActivityAt = session.updatedAt
+    }
+  }
+  index.lastActivityAtMigrationCompleted = true
+  return true
+}
+
 function migrateLegacyOpenAIThinkingDefault(index: AgentSessionsIndex): boolean {
   if (index.openAIThinkingDefaultEnabledMigrationCompleted) return false
 
@@ -260,7 +284,14 @@ function readIndex(): AgentSessionsIndex {
     const permissionModeMigrated = migrateLegacyPermissionMode(data)
     const thinkingDefaultMigrated = migrateLegacyOpenAIThinkingDefault(data)
     const retiredClaudeRuntimeMigrated = migrateRetiredClaudeRuntime(data)
-    if (permissionModeMigrated || thinkingDefaultMigrated || retiredClaudeRuntimeMigrated || data.version < INDEX_VERSION) {
+    const lastActivityMigrated = migrateLastActivityAt(data)
+    if (
+      permissionModeMigrated
+      || thinkingDefaultMigrated
+      || retiredClaudeRuntimeMigrated
+      || lastActivityMigrated
+      || data.version < INDEX_VERSION
+    ) {
       data.version = INDEX_VERSION
       // writeIndex 会按写入后的文件状态刷新缓存。
       writeIndex(data)
@@ -282,6 +313,7 @@ function readIndex(): AgentSessionsIndex {
     version: INDEX_VERSION,
     sessions: [],
     openAIThinkingDefaultEnabledMigrationCompleted: true,
+    lastActivityAtMigrationCompleted: true,
   }
 }
 
@@ -300,9 +332,19 @@ function writeIndex(index: AgentSessionsIndex): void {
   }
 }
 
-/** 按最近更新时间排序会话副本，避免修改索引数组本身。 */
+/**
+ * 会话新鲜度只看真实对话活动时间；元数据更新（标题/模型/思考档位）不能顶起会话。
+ * 历史数据没有 `lastActivityAt` 时回退到 `updatedAt`。
+ */
+export function getAgentSessionActivityTime(
+  session: Pick<AgentSessionMeta, 'lastActivityAt' | 'updatedAt'>,
+): number {
+  return session.lastActivityAt ?? session.updatedAt
+}
+
+/** 按最近活动时间排序会话副本，避免修改索引数组本身。 */
 function sortSessionsByUpdatedAtDesc(sessions: AgentSessionMeta[]): AgentSessionMeta[] {
-  return [...sessions].sort((a, b) => b.updatedAt - a.updatedAt)
+  return [...sessions].sort((a, b) => getAgentSessionActivityTime(b) - getAgentSessionActivityTime(a))
 }
 
 /** 获取所有会话（按 updatedAt 降序） */
@@ -426,7 +468,10 @@ export function createAgentSession(
     isDraft: isDraft || undefined,
     // 新会话继承已持久化的全局思考偏好，之后仍可按会话单独调整。
     reasoningLevel: defaultThinkingLevel,
+    // 速度档同样在建立时定基线；模型不支持时由 resolveCodexSpeed 回退 standard。
+    ...(isCodexSpeed(settings.defaultCodexSpeed) ? { codexSpeed: settings.defaultCodexSpeed } : {}),
     createdAt: now,
+    lastActivityAt: now,
     updatedAt: now,
   }
 
@@ -483,12 +528,15 @@ export function appendAgentMessage(id: string, message: AgentMessage): void {
     const line = JSON.stringify(message) + '\n'
     appendFileSync(filePath, line, 'utf-8')
 
-    // 追加消息时更新 updatedAt，若已归档则自动恢复活跃
+    // 追加消息是真实对话活动：同时推进 lastActivityAt 与 updatedAt；
+    // 若已归档则自动恢复活跃。
     const index = readIndex()
     const idx = index.sessions.findIndex((s) => s.id === id)
     if (idx !== -1) {
       const session = index.sessions[idx]!
-      session.updatedAt = Date.now()
+      const now = Date.now()
+      session.lastActivityAt = now
+      session.updatedAt = now
       if (session.archived) session.archived = false
       writeIndex(index)
     }
@@ -644,7 +692,7 @@ export async function getAgentSessionSDKMessagesForUi(id: string): Promise<SDKMe
  */
 export function updateAgentSessionMeta(
   id: string,
-  updates: Partial<Pick<AgentSessionMeta, 'title' | 'channelId' | 'modelId' | 'sdkSessionId' | 'piSessionFile' | 'piEntryBindings' | 'codexFastMode' | 'reasoningLevel' | 'openAIThinkingLevel' | 'workspaceId' | 'activeWorktree' | 'pinned' | 'starred' | 'archived' | 'isDraft' | 'attachedDirectories' | 'attachedFiles' | 'forkSourceDir' | 'explorationParentSessionId' | 'explorationSourceMessageId' | 'explorationSourceLabel' | 'explorationTitleInitializedAt' | 'stoppedByUser' | 'permissionMode' | 'completedButUnconfirmed' | 'sourceAutomationId' | 'automationGraduated' | 'parentSessionId' | 'rootSessionId' | 'sourceDelegationId' | 'delegationRole' | 'delegationStatus' | 'delegationDepth' | 'delegationGoal'>>,
+  updates: Partial<Pick<AgentSessionMeta, 'title' | 'channelId' | 'modelId' | 'sdkSessionId' | 'piSessionFile' | 'piEntryBindings' | 'codexFastMode' | 'codexSpeed' | 'reasoningLevel' | 'openAIThinkingLevel' | 'workspaceId' | 'activeWorktree' | 'checkoutHistory' | 'pinned' | 'starred' | 'starredAt' | 'archived' | 'isDraft' | 'attachedDirectories' | 'attachedFiles' | 'forkSourceDir' | 'explorationParentSessionId' | 'explorationSourceMessageId' | 'explorationSourceLabel' | 'explorationTitleInitializedAt' | 'stoppedByUser' | 'permissionMode' | 'armorEnabled' | 'completedButUnconfirmed' | 'sourceAutomationId' | 'automationGraduated' | 'parentSessionId' | 'rootSessionId' | 'sourceDelegationId' | 'delegationRole' | 'delegationStatus' | 'delegationRunGeneration' | 'delegationStartedAt' | 'delegationCompletedAt' | 'delegationError' | 'delegationResultUuid' | 'delegationAttemptId' | 'collaborationScope' | 'delegationDepth' | 'delegationGoal'>>,
 ): AgentSessionMeta {
   const index = readIndex()
   const idx = index.sessions.findIndex((s) => s.id === id)
@@ -656,7 +704,7 @@ export function updateAgentSessionMeta(
   const existing = index.sessions[idx]!
   const updateKeys = Object.keys(updates)
   // 星标只是侧栏的视觉标记，不应改变会话的新鲜度或归档状态。
-  const isStarredOnly = updateKeys.every((key) => key === 'starred')
+  const isStarredOnly = updateKeys.every((key) => key === 'starred' || key === 'starredAt')
   // 非手动归档操作时，若会话已归档则自动恢复为活跃（仅更新 stoppedByUser 或 starred 不触发解归档）
   const isStoppedByUserOnly = updateKeys.every((key) => key === 'stoppedByUser')
   const autoUnarchive = existing.archived && !('archived' in updates) && !isStoppedByUserOnly && !isStarredOnly
@@ -664,6 +712,8 @@ export function updateAgentSessionMeta(
     ...existing,
     ...updates,
     ...(autoUnarchive ? { archived: false } : {}),
+    // 元数据更新不是对话活动：保留 lastActivityAt，避免标题/模型改动把会话顶到最前。
+    lastActivityAt: getAgentSessionActivityTime(existing),
     updatedAt: isStarredOnly ? existing.updatedAt : Date.now(),
   }
 
@@ -841,44 +891,6 @@ export function moveSessionToWorkspace(sessionId: string, targetWorkspaceId: str
 }
 
 /**
- * 迁移 Chat 对话记录到 Agent 会话
- *
- * 读取 Chat 对话的消息，转换为 AgentMessage 格式，
- * 追加到目标 Agent 会话的 JSONL 文件中。
- *
- * 仅迁移 user 和 assistant 角色的消息文本内容，
- * 工具活动、推理、附件等 Chat 特有字段不迁移。
- */
-export function migrateChatToAgentSession(conversationId: string, agentSessionId: string): void {
-  const chatMessages = getConversationMessages(conversationId)
-
-  if (chatMessages.length === 0) {
-    console.log(`[Agent 会话] Chat 对话无消息，跳过迁移 (${conversationId})`)
-    return
-  }
-
-  let count = 0
-  for (const cm of chatMessages) {
-    // 仅迁移 user 和 assistant 消息
-    if (cm.role !== 'user' && cm.role !== 'assistant') continue
-    if (!cm.content.trim()) continue
-
-    const agentMsg: AgentMessage = {
-      id: randomUUID(),
-      role: cm.role,
-      content: cm.content,
-      createdAt: cm.createdAt,
-      model: cm.role === 'assistant' ? cm.model : undefined,
-    }
-
-    appendAgentMessage(agentSessionId, agentMsg)
-    count++
-  }
-
-  console.log(`[Agent 会话] 已迁移 ${count} 条消息到 Agent 会话 (${conversationId} → ${agentSessionId})`)
-}
-
-/**
  * 分叉 Pi Agent 会话。
  *
  * 退役 Claude transcript 仅可阅读，不能映射为 Pi session artifact 后续执行。
@@ -936,6 +948,7 @@ async function forkPiAgentSession(sourceMeta: AgentSessionMeta, input: ForkSessi
     const forkedManager = sdk.SessionManager.forkFrom(branchFile, destDir ?? sourceDir ?? process.cwd(), sessionDir)
     const piSessionFile = forkedManager.getSessionFile()
     if (!piSessionFile || !existsSync(piSessionFile)) throw new Error('Pi 分叉 artifact 校验失败')
+    copyProjectScopeState(sourceMeta.piSessionFile, piSessionFile, forkedManager.getBranch().map((entry) => entry.id))
     // 新 branch 只包含分叉点之前的 entry；不能把源树后续 turn 的映射带入 metadata。
     const branchBindings = Object.fromEntries(
       Object.entries(sourceMeta.piEntryBindings ?? {})
@@ -947,12 +960,20 @@ async function forkPiAgentSession(sourceMeta: AgentSessionMeta, input: ForkSessi
       explorationSourceMessageId: targetUuid,
       explorationSourceLabel: input.explorationSourceLabel,
     } : {}
+    /**
+     * 星标继承：用户主动分叉一个收藏会话时，派生出的新会话也进收藏。
+     * 探索/委派等系统派生不继承——它们本就不该占用用户的收藏列表。
+     */
+    const inheritStarred = sourceMeta.starred === true && input.explorationSourceLabel === undefined
+      ? { starred: true as const }
+      : {}
     updateAgentSessionMeta(newMeta.id, {
       sdkSessionId: forkedManager.getSessionId(),
       piSessionFile,
       piEntryBindings: branchBindings,
       activeWorktree: sourceActiveWorktree,
       forkSourceDir: sourceDir,
+      ...inheritStarred,
       ...explorationMeta,
     })
     newMeta.sdkSessionId = forkedManager.getSessionId()
@@ -1007,6 +1028,7 @@ export async function rewindPiAgentSession(sessionId: string, assistantMessageUu
   const branchFile = manager.createBranchedSession(entryId)
   if (!branchFile || !existsSync(branchFile)) throw new Error('Pi 未能生成回退 session artifact')
   const rewindManager = sdk.SessionManager.open(branchFile, join(getSdkConfigDir(), 'sessions'), cwd)
+  copyProjectScopeState(meta.piSessionFile, branchFile, rewindManager.getBranch().map((entry) => entry.id))
   const retainedAssistantUuids = new Set(
     kept.flatMap((message) => {
       const candidate = message as { uuid?: unknown; type?: unknown }
@@ -1256,7 +1278,7 @@ export function updateSDKUserMessageSkillActivations(
 /**
  * 自动归档超过指定天数未更新的 Agent 会话
  *
- * 置顶会话不会被归档。
+ * 置顶、星标和草稿会话不会被自动归档；手动归档仍按用户操作执行。
  *
  * @param daysThreshold 天数阈值
  * @returns 本次归档的会话数量
@@ -1268,7 +1290,7 @@ export function autoArchiveAgentSessions(daysThreshold: number): number {
 
   for (const session of index.sessions) {
     // 草稿没有侧栏入口；自动归档后无法由 Welcome 恢复，会变成不可达记录。
-    if (!session.isDraft && !session.pinned && !session.archived && session.updatedAt < threshold) {
+    if (!session.isDraft && !session.pinned && !session.starred && !session.archived && session.updatedAt < threshold) {
       session.archived = true
       count++
     }
@@ -1298,7 +1320,8 @@ export function markRunningDelegationsAsInterrupted(): number {
   for (const session of index.sessions) {
     if (session.sourceDelegationId && session.delegationStatus === 'running') {
       session.delegationStatus = 'interrupted'
-      session.updatedAt = Date.now()
+      session.delegationCompletedAt = Date.now()
+      session.updatedAt = session.delegationCompletedAt
       count++
     }
   }

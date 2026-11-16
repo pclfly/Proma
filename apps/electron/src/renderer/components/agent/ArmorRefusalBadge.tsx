@@ -3,7 +3,7 @@
  *
  * 位置：输入框上方常驻状态行（对应 gen-3 的 conversation.input.dock）。
  * 行为：
- * - 仅在 personalDirective 开启时显示；
+ * - 仅在本会话开启破甲（sessionMeta.armorEnabled）时显示；
  * - 会话流式进行中显示「思考中…」（绿色呼吸）；
  * - 最近一条助手消息开头窗口命中拒绝话术 → 红色「✗ 拒绝: <短语>」；
  * - 命中改口 / 安全替代话术 → 黄色「⚠ 改口: <短语>」；
@@ -11,17 +11,17 @@
  *
  * 注意：本组件只读不改——它只把模型输出里的拒答话术可视化出来，
  * 不重新注入提示词、不改变模型行为。
- * enabled 状态在挂载 / 切换会话时从 settings 读取（与 PersonalDirectiveToggle 同源）。
+ * enabled 状态由会话元数据派生（与 PersonalDirectiveToggle 同源）。
  */
 
 import * as React from 'react'
-import { useAtom, useAtomValue } from 'jotai'
+import { useAtomValue } from 'jotai'
 import {
   agentSDKMessagesCacheAtom,
   agentSessionStreamingStateAtomFamily,
+  sessionArmorEnabledAtom,
 } from '@/atoms/agent-atoms'
 import { scoreResponse, lastAssistantText, type ArmorDomain } from '@/lib/armor-score'
-import { personalDirectiveEnabledAtom } from '@/atoms/personal-directive-atoms'
 
 /** ArmorRefusalBadge 属性接口 */
 interface ArmorRefusalBadgeProps {
@@ -68,30 +68,13 @@ const STYLES = {
 } as const
 
 export function ArmorRefusalBadge({ sessionId }: ArmorRefusalBadgeProps): React.ReactElement | null {
-  // 与 PersonalDirectiveToggle 共用同一 atom，开关翻转时即时跟随。
-  const [enabled, setEnabled] = useAtom(personalDirectiveEnabledAtom)
-  const [loaded, setLoaded] = React.useState(false)
+  // 破甲是会话级：直接订阅该会话的开关，切换后即时跟随。
+  // 不再从全局 settings 回填 —— 那会让徽标在没开破甲的会话里也显示。
+  const enabled = useAtomValue(sessionArmorEnabledAtom(sessionId))
   const streamingState = useAtomValue(agentSessionStreamingStateAtomFamily(sessionId))
   const messagesCache = useAtomValue(agentSDKMessagesCacheAtom)
 
-  // 挂载 / 切换会话时从 settings 回填共享开关状态（幂等；不覆盖开关的实时翻转）。
-  React.useEffect(() => {
-    let mounted = true
-    window.electronAPI.getSettings()
-      .then((s) => {
-        if (!mounted) return
-        setEnabled(s.personalDirective?.enabled ?? false)
-        setLoaded(true)
-      })
-      .catch((error) => {
-        if (!mounted) return
-        console.error('[ArmorRefusalBadge] 读取设置失败:', error)
-        setLoaded(true)
-      })
-    return (): void => { mounted = false }
-  }, [sessionId, setEnabled])
-
-  if (!loaded || !enabled) return null
+  if (!enabled) return null
 
   const running = streamingState?.running ?? false
   const messages = messagesCache.get(sessionId)

@@ -10,6 +10,9 @@ import { readFileSync, existsSync } from 'node:fs'
 import { safeStorage } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { getChannelsPath } from './config-paths'
+import { filterManagedCodexChannelModels } from './codex-model-policy'
+import { parseVolcengineModels } from './volcengine-models'
+import { disableUnconfiguredDeepSeekChannel } from './deepseek-channel-migration'
 import type {
   Channel,
   ChannelCreateInput,
@@ -47,7 +50,9 @@ import { refreshXaiOAuth } from './xai-oauth-service'
 import { refreshXaiOAuthCredentialsSerial, rememberXaiOAuthCredentials } from './xai-oauth-credentials'
 import { parseCodexPlanQuotaResponse } from './codex-plan-quota'
 import { queryGithubCopilotPlanQuota } from './github-copilot-plan-quota'
-import { listCodexModels, listGithubCopilotModels, listXaiModels } from './adapters/pi-model-registry'
+import { extractKimiUserLevelName, formatKimiPlanName, resolveKimiPlanQuotaUrl } from './kimi-plan-tier'
+import { parseZhipuQuotaData, type ZhipuQuotaResponse } from './zhipu-plan-quota'
+import { listCodexModels, listGithubCopilotModels, listXaiModels, resolvePiBuiltInContextWindow } from './adapters/pi-model-registry'
 import { getFetchFn } from './proxy-fetch'
 import { getEffectiveProxyUrl } from './proxy-settings-service'
 import {
@@ -63,7 +68,7 @@ import { writeJsonFileAtomic } from './safe-file'
 import pkg from '../../../package.json' with { type: 'json' }
 
 /** 当前配置版本 */
-const CONFIG_VERSION = 7
+const CONFIG_VERSION = 8
 const RETIRED_VOLCENGINE_PROVIDERS = new Set<string>(['doubao', 'ark-coding-plan'])
 const RETIRED_OPENCODE_PROVIDER = 'opencode-go-openai'
 const RETIRED_OPENCODE_MESSAGE = 'OpenCode Go 渠道已停止支持，请选择其他供应商或自定义渠道'
@@ -83,8 +88,8 @@ const DEEPSEEK_PRESET_MODELS: ChannelModel[] = [
   { id: 'deepseek-v4-flash-vision-exp', name: 'DeepSeek V4 Flash Vision Exp', enabled: true },
 ]
 const KIMI_PRESET_MODELS: ChannelModel[] = [
+  { id: 'kimi-k3.1-pro', name: 'Kimi K3.1 Pro', enabled: true },
   { id: 'kimi-k3', name: 'Kimi K3', enabled: true },
-  { id: 'kimi-k2.6', name: 'Kimi K2.6', enabled: true },
 ]
 const XIAOMI_PRESET_MODELS: ChannelModel[] = [
   { id: 'mimo-v2.6-pro', name: 'MiMo V2.6 Pro', enabled: true },
@@ -300,6 +305,9 @@ function inferProviderFromBaseUrl(provider: ProviderType, baseUrl: string): Prov
  *
  * v6 → v7：删除火山方舟 Token Plan 与 Agent Plan 存量渠道；火山引擎 API 保留。
  *
+ * v7 → v8：关闭“已启用但未配置 API Key”的 DeepSeek 渠道（与官方 0.21.92 的
+ * 未配置渠道迁移对齐；本地 fork 的 schema 版本号独立，不复用官方 v11）。
+ *
  * @returns 迁移后的配置；`changed` 标记是否发生实际变更（决定是否需要回写文件）
  */
 function migrateConfig(config: ChannelsConfig): { config: ChannelsConfig; changed: boolean } {
@@ -346,6 +354,21 @@ function migrateConfig(config: ChannelsConfig): { config: ChannelsConfig; change
         ...migratedChannel,
         provider: 'qwen',
         baseUrl: PROVIDER_DEFAULT_URLS.qwen,
+      }
+    }
+    if (version < 8 && migratedChannel.provider === 'deepseek' && migratedChannel.enabled) {
+      let apiKey = ''
+      try {
+        apiKey = decryptKey(migratedChannel.apiKey)
+      } catch {
+        console.warn(
+          `[渠道管理] v${version}→v8 无法读取 DeepSeek 渠道 ${migratedChannel.name} 的 API Key，按未配置处理`,
+        )
+      }
+      const before = migratedChannel
+      migratedChannel = disableUnconfiguredDeepSeekChannel(migratedChannel, apiKey)
+      if (migratedChannel !== before) {
+        console.log(`[渠道管理] v${version}→v8 关闭未配置 API Key 的 DeepSeek 渠道：${before.name}`)
       }
     }
     return migratedChannel
@@ -436,10 +459,16 @@ function readConfig(): ChannelsConfig {
     const parsed = JSON.parse(raw) as ChannelsConfig
     const schemaMigration = migrateConfig(parsed)
     const presetModelUpdate = applyPresetModelCandidateUpdates(schemaMigration.config)
-    const config = presetModelUpdate.config
-    if (schemaMigration.changed || presetModelUpdate.changed) {
+    const codexModelFilter = filterManagedCodexChannelModels(presetModelUpdate.config)
+    const config = codexModelFilter.config
+    if (schemaMigration.changed || presetModelUpdate.changed || codexModelFilter.changed) {
       writeConfig(config)
-      console.log('[渠道管理] 渠道配置已迁移并持久化')
+      if (codexModelFilter.changed) {
+        console.log('[渠道管理] 已按当前策略自动过滤存量 Codex 模型列表')
+      }
+      if (schemaMigration.changed || presetModelUpdate.changed) {
+        console.log('[渠道管理] 渠道配置已迁移并持久化')
+      }
     }
     return config
   } catch (error) {
@@ -507,35 +536,9 @@ function decryptKey(encryptedKey: string): string {
  * 获取所有渠道
  *
  * 返回的渠道中 apiKey 保持加密状态。
- * 首次调用时，如果没有任何 DeepSeek 渠道，自动创建预设渠道。
  */
 export function listChannels(): Channel[] {
-  const config = readConfig()
-
-  // 首次使用：如果没有 DeepSeek 渠道，自动创建预设
-  const hasDeepSeek = config.channels.some(
-    (c) => c.provider === 'deepseek' || c.baseUrl.includes('api.deepseek.com'),
-  )
-  if (!hasDeepSeek) {
-    const now = Date.now()
-    const presetChannel: Channel = {
-      id: randomUUID(),
-      name: 'DeepSeek',
-      provider: 'deepseek',
-      baseUrl: PROVIDER_DEFAULT_URLS.deepseek,
-      apiKey: encryptApiKey(''),
-      models: cloneModels(DEEPSEEK_PRESET_MODELS),
-      enabled: false,
-      createdAt: now,
-      updatedAt: now,
-    }
-    config.channels.push(presetChannel)
-    writeConfig(config)
-    console.log('[渠道管理] 已自动创建 DeepSeek 预设渠道')
-    return config.channels
-  }
-
-  return config.channels
+  return readConfig().channels
 }
 
 /**
@@ -1201,9 +1204,10 @@ async function queryCodexPlanQuota(
   }
 }
 
-async function queryKimiPlanQuota(apiKey: string, proxyUrl?: string): Promise<ChannelPlanQuotaResult> {
+async function queryKimiPlanQuota(apiKey: string, baseUrl: string, proxyUrl?: string): Promise<ChannelPlanQuotaResult> {
   const fetchFn = getFetchFn(proxyUrl)
-  const response = await fetchFn('https://api.kimi.com/coding/v1/usages', withTimeout({
+  // 国内 api.kimi.com 与海外 api.kimi.ai 的 coding 额度端点不同。
+  const response = await fetchFn(resolveKimiPlanQuotaUrl(baseUrl), withTimeout({
     method: 'GET',
     headers: {
       'Content-Type': 'application/json',
@@ -1272,10 +1276,12 @@ async function queryKimiPlanQuota(apiKey: string, proxyUrl?: string): Promise<Ch
     })
   }
 
+  const tier = extractKimiUserLevelName(data)
   return {
     supported: true,
     provider: 'kimi-coding',
-    planName: 'Kimi For Coding',
+    planName: formatKimiPlanName(tier),
+    ...(tier ? { tier } : {}),
     windows,
     updatedAt: Date.now(),
   }
@@ -1456,31 +1462,6 @@ async function queryDeepSeekBalance(apiKey: string, baseUrl: string, proxyUrl?: 
   }
 }
 
-interface ZhipuQuotaLimitItem {
-  type: 'TIME_LIMIT' | 'TOKENS_LIMIT'
-  unit?: number
-  number?: number
-  percentage?: number
-  remaining?: number
-  usage?: number
-  currentValue?: number
-  nextResetTime?: number
-  usageDetails?: Array<{
-    modelCode: string
-    usage: number
-  }>
-}
-
-interface ZhipuQuotaResponse {
-  code?: number
-  msg?: string
-  success?: boolean
-  data?: {
-    limits?: ZhipuQuotaLimitItem[]
-    level?: string
-  }
-}
-
 function createZhipuQuotaUrl(baseUrl: string, query?: Record<string, string>): string {
   let requestUrl = 'https://bigmodel.cn/api/monitor/usage/quota/limit'
   try {
@@ -1609,78 +1590,6 @@ async function testZhipuCodingTeam(
   return await testAnthropicCompatible(baseUrl, apiKey, proxyUrl, 'zhipu-coding-team')
 }
 
-function parseZhipuQuotaData(
-  data: ZhipuQuotaResponse,
-  planName: string,
-  provider: ProviderType = 'zhipu-coding',
-): ChannelPlanQuotaResult {
-  if (!data.success || data.code !== 200) {
-    return createUnsupportedPlanQuota(provider, data.msg || '智谱 Coding Plan 额度查询失败')
-  }
-
-  const limits = data.data?.limits ?? []
-  const windows: ChannelPlanQuotaWindow[] = []
-  const tokenLimits = limits
-    .filter((item) => item.type === 'TOKENS_LIMIT')
-    .map((item, index) => ({ item, index }))
-    .sort((left, right) => {
-      const leftReset = normalizePlanQuotaTimestamp(left.item.nextResetTime)
-      const rightReset = normalizePlanQuotaTimestamp(right.item.nextResetTime)
-      if (leftReset && rightReset && leftReset !== rightReset) {
-        return leftReset - rightReset
-      }
-      return left.index - right.index
-    })
-
-  for (const { item, index } of tokenLimits) {
-    const used = clampPercent(item.percentage ?? 0)
-    const type = item.unit === 3
-      ? '5h'
-      : item.unit === 6
-        ? 'weekly'
-        : item.unit == null && index === 0
-          ? '5h'
-          : item.unit == null && index === 1
-            ? 'weekly'
-            : undefined
-    if (!type) continue
-    windows.push({
-      type,
-      label: type === '5h' ? '每 5 小时' : '每周额度',
-      remainingPercent: clampPercent(100 - used),
-      usedPercent: used,
-      ...planQuotaResetAt(item.nextResetTime),
-    })
-  }
-
-  const timeLimit = limits.find((item) => item.type === 'TIME_LIMIT')
-  if (timeLimit) {
-    const remainingCount = Number(timeLimit.remaining ?? 0)
-    const totalCount = Number(timeLimit.usage ?? 0)
-    const usedCount = Number(timeLimit.currentValue ?? (totalCount > 0 ? totalCount - remainingCount : 0))
-    const total = totalCount > 0 ? totalCount : remainingCount + usedCount
-    const remainingPercent = total > 0 ? (remainingCount / total) * 100 : 0
-    windows.push({
-      type: 'custom',
-      label: 'MCP 每月',
-      remainingPercent: clampPercent(remainingPercent),
-      usedPercent: clampPercent(100 - remainingPercent),
-    })
-  }
-
-  if (windows.length === 0) {
-    return createUnsupportedPlanQuota(provider, '智谱 Coding Plan 未返回窗口额度数据')
-  }
-
-  return {
-    supported: true,
-    provider,
-    planName,
-    windows,
-    updatedAt: Date.now(),
-  }
-}
-
 async function queryZhipuPlanQuota(
   apiKey: string,
   baseUrl: string,
@@ -1757,8 +1666,8 @@ export async function getChannelPlanQuota(channelId: string): Promise<ChannelPla
     if (provider === 'deepseek') {
       return await queryDeepSeekBalance(apiKey, channel.baseUrl, proxyUrl)
     }
-    if (provider === 'kimi-coding' || channel.baseUrl.includes('api.kimi.com/coding')) {
-      return await queryKimiPlanQuota(apiKey, proxyUrl)
+    if (provider === 'kimi-coding' || channel.baseUrl.includes('api.kimi.com/coding') || channel.baseUrl.includes('api.kimi.ai/coding')) {
+      return await queryKimiPlanQuota(apiKey, channel.baseUrl, proxyUrl)
     }
     if (provider === 'minimax') {
       return await queryMiniMaxPlanQuota(apiKey, channel.baseUrl, proxyUrl)
@@ -1874,6 +1783,23 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
  * 针对不同供应商使用不同的 API 端点和响应解析。
  */
 export async function fetchModels(input: FetchModelsInput): Promise<FetchModelsResult> {
+  const result = await fetchProviderModels(input)
+  if (!result.success) return result
+  const provider = inferProviderFromBaseUrl(input.provider, input.baseUrl)
+  // 参考元数据与用户 contextWindow 覆盖分离；启用模型时由表单填入。
+  const models = await Promise.all(result.models.map(async (model) => {
+    try {
+      const builtInContextWindow = await resolvePiBuiltInContextWindow(provider, model.id)
+      return { ...model, ...(builtInContextWindow !== undefined ? { builtInContextWindow } : {}) }
+    } catch (error) {
+      console.warn(`[渠道管理] 无法读取模型内置上下文: ${model.id}`, error)
+      return model
+    }
+  }))
+  return { ...result, models }
+}
+
+async function fetchProviderModels(input: FetchModelsInput): Promise<FetchModelsResult> {
   if (input.provider === RETIRED_OPENCODE_PROVIDER) return { success: false, message: RETIRED_OPENCODE_MESSAGE, models: [] }
   const proxyUrl = await getEffectiveProxyUrl()
   const provider = inferProviderFromBaseUrl(input.provider, input.baseUrl)
@@ -2151,6 +2077,27 @@ async function fetchOpenAICompatibleModels(
   }
 
   const data = await response.json() as { data?: OpenAIModelItem[] }
+
+  // 火山方舟目录带 token_limits / effort / thinking 等字段；直接复用通用映射会
+  // 丢掉官方能力表与上下文窗口，导致未登记型号只能回退默认值。
+  if (provider === 'doubao-api') {
+    const volcengineModels = parseVolcengineModels(data)
+    if (volcengineModels.length > 0) {
+      const models: ChannelModel[] = volcengineModels.map((item) => ({
+        id: item.id,
+        name: item.name,
+        enabled: true,
+        ...(item.contextWindow !== undefined && { builtInContextWindow: item.contextWindow }),
+      }))
+      models.sort((a, b) => a.id.localeCompare(b.id))
+      return {
+        success: true,
+        message: `成功获取 ${models.length} 个模型`,
+        models,
+      }
+    }
+  }
+
   const items = data.data ?? []
 
   const models: ChannelModel[] = items.map((item) => ({

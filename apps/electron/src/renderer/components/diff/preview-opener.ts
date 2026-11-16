@@ -106,15 +106,15 @@ export function tearOffPreviewToSplit(store: JotaiStore, tabId: string): void {
     return m
   })
 
-  store.set(previewPanelOpenMapAtom, (prev) => {
-    const next = new Map(prev)
-    next.set(sessionId, true)
-    return next
-  })
+  // 旧单文件投影也归一化到统一入口，补齐文件列表、动态Tab与临时侧栏生命周期。
+  const file = store.get(previewFileMapAtom).get(sessionId)
+    ?? store.get(previewFilesMapAtom).get(sessionId)?.[0]
+  if (file) {
+    openPreviewInStore(store, sessionId, file)
+    return
+  }
+  // 无文件的旧空Tab不制造预览身份，也不触发临时侧栏让位。
+  store.set(previewPanelOpenMapAtom, (prev) => new Map(prev).set(sessionId, true))
   store.set(agentSidePanelOpenAtomFamily(sessionId), true)
-  store.set(agentDiffPanelTabAtom, (prev) => {
-    const next = new Map(prev)
-    next.set(sessionId, 'preview')
-    return next
-  })
+  store.set(agentDiffPanelTabAtom, (prev) => new Map(prev).set(sessionId, 'preview'))
 }

@@ -13,7 +13,6 @@ import { getWindowTitlebarDragInsetStyle } from "@/lib/window-titlebar-layout";
 import {
   Settings,
   Radio,
-  Eye,
   Palette,
   Info,
   Globe,
@@ -23,8 +22,10 @@ import {
   ArrowLeft,
   Keyboard,
   Mic,
+  Monitor,
   HardDriveDownload,
   HardDrive,
+  Activity,
 } from "lucide-react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { ShortcutKeycaps } from "@/components/shortcuts/ShortcutKeycaps";
@@ -52,7 +53,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { ChannelSettings } from "./ChannelSettings";
-import { VisionRelaySettings } from "./VisionRelaySettings";
 import { GeneralSettings } from "./GeneralSettings";
 import { ProxySettings } from "./ProxySettings";
 import { AppearanceSettings } from "./AppearanceSettings";
@@ -64,6 +64,8 @@ import { VoiceInputSettings } from "./VoiceInputSettings";
 import { MigrationSettings } from "./MigrationSettings";
 import { StorageSettings } from "./StorageSettings";
 import { OnboardingSettings } from "./OnboardingSettings";
+import { ComputerUseSettings } from "./ComputerUseSettings";
+import { NetworkDiagnosticsSettings } from "./NetworkDiagnosticsSettings";
 import { useOpenSession } from '@/hooks/useOpenSession'
 
 /** 设置 Tab 定义 */
@@ -77,9 +79,9 @@ interface TabItem {
 const BASE_TABS: TabItem[] = [
   { id: "general", label: "通用设置", icon: <Settings size={16} /> },
   { id: "channels", label: "模型配置", icon: <Radio size={16} /> },
-  { id: "vision-relay", label: "视觉助手", icon: <Eye size={16} /> },
   { id: "prompts", label: "提示词管理", icon: <BookOpen size={16} /> },
   { id: "proxy", label: "代理设置", icon: <Globe size={16} /> },
+  { id: "network", label: "网络诊断", icon: <Activity size={16} /> },
 ];
 
 const BOTS_TAB: TabItem = {
@@ -104,6 +106,7 @@ const VOICE_INPUT_TAB: TabItem = {
 };
 /** 尾部 Tabs */
 const TAIL_TABS: TabItem[] = [
+  { id: "computer-use", label: "Computer Use", icon: <Monitor size={16} /> },
   { id: "migration", label: "数据迁移", icon: <HardDriveDownload size={16} /> },
   { id: "storage", label: "磁盘管理", icon: <HardDrive size={16} /> },
   { id: "appearance", label: "外观设置", icon: <Palette size={16} /> },
@@ -118,12 +121,12 @@ function renderTabContent(tab: SettingsTab): React.ReactElement {
       return <GeneralSettings />;
     case "channels":
       return <ChannelSettings />;
-    case "vision-relay":
-      return <VisionRelaySettings />;
     case "prompts":
       return <PromptSettings />;
     case "proxy":
       return <ProxySettings />;
+    case "network":
+      return <NetworkDiagnosticsSettings />;
     case "appearance":
       return <AppearanceSettings />;
     case "about":
@@ -134,6 +137,8 @@ function renderTabContent(tab: SettingsTab): React.ReactElement {
       return <ShortcutSettings />;
     case "voice-input":
       return <VoiceInputSettings />;
+    case "computer-use":
+      return <ComputerUseSettings />;
     case "migration":
       return <MigrationSettings />;
     case "storage":

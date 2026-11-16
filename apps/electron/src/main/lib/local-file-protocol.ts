@@ -11,6 +11,7 @@ import { existsSync, realpathSync, statSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { net } from 'electron'
+import { createMediaFileResponse, getMediaMimeType } from './local-media-response'
 
 type RegisteredEntry = {
   root: string
@@ -21,6 +22,13 @@ type RegisteredEntry = {
 const registeredEntries = new Map<string, RegisteredEntry>()
 const ENTRY_TTL_MS = 60 * 60 * 1000
 const MAX_ENTRIES = 500
+
+export {
+  MEDIA_MIME_TYPES,
+  createMediaFileResponse,
+  getMediaMimeType,
+  parseSingleByteRange,
+} from './local-media-response'
 
 function pruneEntries(): void {
   const now = Date.now()
@@ -102,5 +110,8 @@ export function handlePromaFileRequest(request: Request): Promise<Response> | Re
     return new Response('Not Found', { status: 404 })
   }
 
+  if (getMediaMimeType(target)) {
+    return createMediaFileResponse(target, request)
+  }
   return net.fetch(pathToFileURL(target).toString())
 }
