@@ -16,4 +16,13 @@ export {
   type HighlightToken,
   type HighlightTokensResult,
 } from './shiki-service.ts'
+export {
+  canReuseStreamingTokens,
+  createStreamingHighlightCache,
+  highlightStreamingCode,
+  isStatefulLanguage,
+  type HighlightTokenizeFn,
+  type StreamingHighlightCache,
+  type StreamingHighlightCacheOptions,
+} from './streaming-highlight.ts'
 export { detectLanguage } from './language-detector.ts'

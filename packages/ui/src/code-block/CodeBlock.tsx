@@ -5,10 +5,11 @@
  * 用于 react-markdown 的 pre 元素自定义渲染。
  *
  * 流式渲染策略（类 Cherry Studio 方案）：
- * 1. 使用 highlightToTokens 获取结构化 token，逐行渲染为 React 元素
- * 2. 稳定的行级 key → React reconciliation 只更新变化/新增的行
- * 3. 节流 80ms → 避免每个 token 都触发高亮计算
- * 4. 首次挂载异步初始化 → 后续全部同步
+ * 1. 使用 highlightStreamingCode 获取结构化 token，逐行渲染为 React 元素
+ * 2. 模块级增量缓存：追加式流式输出时复用已完成行的 token，只重算尾行与新增内容
+ * 3. 稳定的行级 key → React reconciliation 只更新变化/新增的行
+ * 4. 节流 80ms → 避免每个 token 都触发高亮计算
+ * 5. 首次挂载异步初始化 → 后续全部同步
  *
  * 结构：
  * ┌─────────────────────────────────────────┐
@@ -20,7 +21,12 @@
  */
 
 import * as React from 'react'
-import { getDisplayName, highlightToTokens, onHighlighterReady } from '@proma/core'
+import {
+  createStreamingHighlightCache,
+  getDisplayName,
+  highlightStreamingCode,
+  onHighlighterReady,
+} from '@proma/core'
 import type { HighlightToken, HighlightTokensResult } from '@proma/core'
 
 /** react-markdown 传入的 <code> 元素 props */
@@ -38,6 +44,9 @@ interface CodeBlockProps {
 
 /** 节流间隔（ms）：流式输出时限制高亮更新频率 */
 const THROTTLE_MS = 80
+
+/** 模块级流式高亮缓存：同语言/主题的追加式更新共享已完成行 token */
+const streamingHighlightCache = createStreamingHighlightCache()
 
 // ===== 工具函数 =====
 
@@ -131,7 +140,8 @@ const CodeLine = React.memo(function CodeLine({ tokens, rawLine }: CodeLineProps
  * CodeBlock 代码块组件
  *
  * 渲染策略：
- * - 逐行渲染：highlightToTokens → 每行独立 React 元素 + 稳定 key
+ * - 逐行渲染：highlightStreamingCode → 每行独立 React 元素 + 稳定 key
+ * - 增量高亮：追加式流式输出复用已完成行 token，只重算尾行与新增内容
  * - 节流 80ms：流式输出时控制重计算频率
  * - 异步兜底：首次挂载高亮器未就绪时，异步初始化后触发一次更新
  */
@@ -145,7 +155,7 @@ export function CodeBlock({ children, onCopy }: CodeBlockProps): React.ReactElem
 
   // ---- 节流 token 高亮 ----
   const [tokenResult, setTokenResult] = React.useState<HighlightTokensResult | null>(
-    () => highlightToTokens({ code: trimmedCode, language: langOrText })
+    () => highlightStreamingCode(streamingHighlightCache, { code: trimmedCode, language: langOrText })
   )
   const pendingCodeRef = React.useRef(trimmedCode)
   const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -153,13 +163,25 @@ export function CodeBlock({ children, onCopy }: CodeBlockProps): React.ReactElem
 
   pendingCodeRef.current = trimmedCode
 
+  // 语言切换时旧语言的缓存不再具备复用价值，先清空再进入下面的高亮流程
+  const prevLanguageRef = React.useRef(langOrText)
+  React.useEffect(() => {
+    if (prevLanguageRef.current !== langOrText) {
+      prevLanguageRef.current = langOrText
+      streamingHighlightCache.clear()
+    }
+  }, [langOrText])
+
   React.useEffect(() => {
     const now = Date.now()
     const elapsed = now - lastUpdateRef.current
 
     const doHighlight = () => {
       const currentCode = pendingCodeRef.current
-      const result = highlightToTokens({ code: currentCode, language: langOrText })
+      const result = highlightStreamingCode(streamingHighlightCache, {
+        code: currentCode,
+        language: langOrText,
+      })
       if (result) {
         lastUpdateRef.current = Date.now()
         setTokenResult(result)
@@ -167,7 +189,10 @@ export function CodeBlock({ children, onCopy }: CodeBlockProps): React.ReactElem
     }
 
     // 同步路径可用时
-    const syncResult = highlightToTokens({ code: trimmedCode, language: langOrText })
+    const syncResult = highlightStreamingCode(streamingHighlightCache, {
+      code: trimmedCode,
+      language: langOrText,
+    })
     if (syncResult) {
       if (elapsed >= THROTTLE_MS) {
         // 距上次更新已超过节流间隔，立即执行

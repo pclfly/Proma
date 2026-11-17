@@ -103,6 +103,7 @@ import { markRunningDelegationsAsInterrupted } from './lib/agent-session-manager
 
 import { configureUpdater, initAutoUpdater, cleanupUpdater } from './lib/updater/auto-updater'
 import { startWorkspaceWatcher, stopWorkspaceWatcher } from './lib/workspace-watcher'
+import { disposeWorkspaceFileSearch } from './lib/workspace-file-search'
 import { startChatToolsWatcher, stopChatToolsWatcher } from './lib/chat-tools-watcher'
 import { getIsQuitting, setQuitting } from './lib/app-lifecycle'
 import { getMainWindow as getStoredMainWindow, setMainWindow as setStoredMainWindow } from './lib/main-window-store'
@@ -923,6 +924,8 @@ app.on('before-quit', () => {
   cleanupUpdater()
   // 停止工作区文件监听
   stopWorkspaceWatcher()
+  // 释放工作区文件搜索索引缓存
+  disposeWorkspaceFileSearch()
   // 停止 Chat 工具配置文件监听
   stopChatToolsWatcher()
   // 停止所有 Bridge

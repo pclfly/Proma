@@ -13,6 +13,7 @@ import {
 } from './agent-workspace-manager'
 import { listAgentSessions } from './agent-session-manager'
 import { unwatchAttachedDirectory } from './workspace-watcher'
+import { forgetWorkspaceFileIndex } from './workspace-file-search'
 
 export function releaseDirectoryWatcherIfUnreferenced(dirPath: string): void {
   const isStillReferenced = listAgentWorkspaces().some((workspace) =>
@@ -24,7 +25,10 @@ export function releaseDirectoryWatcherIfUnreferenced(dirPath: string): void {
     || session.attachedFiles?.some((filePath) => dirname(filePath) === dirPath),
   )
 
-  if (!isStillReferenced) unwatchAttachedDirectory(dirPath)
+  if (isStillReferenced) return
+  unwatchAttachedDirectory(dirPath)
+  // 目录已无可引用方：监听与文件索引一起释放，避免已删除目录继续占用缓存。
+  forgetWorkspaceFileIndex(dirPath)
 }
 
 export function releaseAttachedFileWatchers(filePaths: readonly string[] | undefined): void {

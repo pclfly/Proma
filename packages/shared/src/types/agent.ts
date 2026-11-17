@@ -1781,6 +1781,10 @@ export interface FileSearchResult {
   sessionEntries: FileIndexEntry[]
   /** 工作区文件条目（来自 workspace files + 附加目录） */
   workspaceEntries: FileIndexEntry[]
+  /** 参与本次结果的最旧索引构建时间（ms）；无索引时缺省 */
+  scannedAt?: number
+  /** 索引是否因深度/条目上限被截断 */
+  truncated?: boolean
 }
 
 // ===== Agent 附件 =====

@@ -43,7 +43,8 @@ import { detectLanguage } from '@proma/core'
 import { FilePathChip, ResolvableFilePathChip, isAbsoluteFilePath, isImageFilePath, isLocalFileReference, isRelativeFilePath } from './file-path-chip'
 import { getFileName } from './file-path-chip-utils'
 import { buildAgentHistoryQuoteLabel, parseAgentHistoryQuoteMention } from '@/lib/quoted-selection'
-import { createMentionPattern } from '@/lib/mention-patterns'
+import { CustomMarkdownRenderer, shouldUseCustomMarkdownRenderer, type CustomMarkdownComponents } from '@/components/markdown/CustomMarkdownRenderer'
+import { safeDecodeMention, splitMentionText, type MentionType } from '@/components/markdown/mention-tokens'
 import { resolveSkillMentionName } from '@/lib/skill-mention-name'
 import { useSkillMentionNames } from '@/components/agent/SkillMentionNamesProvider'
 import { useAgentBrowserLink } from '@/components/browser/AgentBrowserLinkProvider'
@@ -269,8 +270,6 @@ function walkMdastText(
 
 // ----- MentionChip 组件 -----
 
-type MentionType = 'file' | 'skill' | 'mcp' | 'session' | 'todo' | 'calendar_event' | 'quote'
-
 const MENTION_STYLES: Record<MentionType, { icon: typeof FileText; className: string }> = {
   file: { icon: FileText, className: 'bg-primary/10 text-primary' },
   skill: { icon: Sparkles, className: 'bg-[hsl(270_60%_60%/0.15)] text-[hsl(270_60%_50%)]' },
@@ -279,14 +278,6 @@ const MENTION_STYLES: Record<MentionType, { icon: typeof FileText; className: st
   todo: { icon: ListTodo, className: 'bg-amber-500/15 text-amber-800 dark:text-amber-200' },
   calendar_event: { icon: CalendarDays, className: 'bg-cyan-500/15 text-cyan-800 dark:text-cyan-200' },
   quote: { icon: Quote, className: 'bg-primary/10 text-primary' },
-}
-
-function safeDecode(raw: string): string {
-  try {
-    return decodeURIComponent(raw)
-  } catch {
-    return raw
-  }
 }
 
 /**
@@ -403,7 +394,7 @@ function MentionChip({ type, value }: { type: MentionType; value: string }): Rea
     )
   }
 
-  const decoded = safeDecode(value)
+  const decoded = safeDecodeMention(value)
   // 避免用户只能看到文件名而无法查看内容。
   if (type === 'file' && isImageFilePath(decoded)) {
     return <FilePathChip filePath={decoded} basePaths={contextBasePaths} sessionId={pathResolutionContext?.sessionId} />
@@ -442,51 +433,15 @@ function MentionChip({ type, value }: { type: MentionType; value: string }): Rea
 export function remarkMentions() {
   return (tree: MdastParent) => {
     walkMdastText(tree, (node, index, parent) => {
-      const text = node.value
-      // 每次调用创建独立正则实例，避免 /g 状态在并发 remark pipeline 间互相干扰。
-      // Mention 值已编码，遇到紧邻的 CJK 普通文本时应立即结束。
-      const mentionPattern = createMentionPattern()
-      if (!mentionPattern.test(text)) return
-      mentionPattern.lastIndex = 0
+      const segments = splitMentionText(node.value)
+      // 没有 mention 时保持原文本节点，避免无意义的节点替换。
+      if (segments.length === 1 && segments[0]?.type === 'text') return
 
-      const parts: MdastNode[] = []
-      let lastIdx = 0
-      let m: RegExpExecArray | null
-
-      while ((m = mentionPattern.exec(text)) !== null) {
-        if (m.index > lastIdx) {
-          parts.push({ type: 'text', value: text.slice(lastIdx, m.index) })
-        }
-        const mType: MentionType = m[1]
-          ? 'file'
-          : m[2]
-            ? 'skill'
-            : m[3]
-              ? 'mcp'
-              : m[4]
-                ? 'session'
-                : m[6]
-                  ? 'todo'
-                  : m[8]
-                    ? 'calendar_event'
-                    : 'quote'
-        const referenceId = m[1] ?? m[2] ?? m[3] ?? m[4] ?? m[6] ?? m[8] ?? m[10] ?? ''
-        const encodedLabel = m[5] ?? m[7] ?? m[9]
-        const rawValue = encodedLabel ? `${referenceId}::${safeDecode(encodedLabel)}` : referenceId
-        // 文件/Skill/MCP 旧消息可能已经编码；带标题的 named reference 始终重新编码整个值。
-        const alreadyEncoded = !encodedLabel && /%[0-9A-Fa-f]{2}/.test(referenceId)
-        const safeValue = alreadyEncoded ? referenceId : encodeURIComponent(rawValue)
-        parts.push({
-          type: 'link',
-          url: `mention://${mType}/${safeValue}`,
-          children: [{ type: 'text', value: m[0] }],
-        })
-        lastIdx = m.index + m[0].length
-      }
-
-      if (lastIdx < text.length) {
-        parts.push({ type: 'text', value: text.slice(lastIdx) })
-      }
+      const parts: MdastNode[] = segments.map((segment) => (
+        segment.type === 'text'
+          ? { type: 'text', value: segment.value }
+          : { type: 'link', url: segment.href, children: [{ type: 'text', value: segment.text }] }
+      ))
 
       parent.children.splice(index, 1, ...parts)
       return index + parts.length
@@ -550,7 +505,7 @@ const REHYPE_PLUGINS = [rehypeKatex]
 
 /** 允许 mention:// 和本地绝对路径通过 URL 清洗 */
 function mentionUrlTransform(url: string): string {
-  if (url.startsWith('mention://') || isAbsoluteFilePath(safeDecode(url))) return url
+  if (url.startsWith('mention://') || isAbsoluteFilePath(safeDecodeMention(url))) return url
   return defaultUrlTransform(url)
 }
 
@@ -575,7 +530,7 @@ const MarkdownLink = React.memo(function MarkdownLink({
       return <MentionChip type={mentionMatch[1] as MentionType} value={mentionMatch[2] ?? ''} />
     }
 
-    const filePath = safeDecode(href)
+    const filePath = safeDecodeMention(href)
     if (isLocalFileReference(filePath)) {
       return (
         <ResolvableFilePathChip
@@ -621,7 +576,7 @@ const MarkdownImage = React.memo(function MarkdownImage({
   const contextBasePaths = pathResolutionContext?.basePaths
   const [resolvedSrc, setResolvedSrc] = React.useState<string | null>(null)
   const [failed, setFailed] = React.useState(false)
-  const decodedSrc = src ? safeDecode(src) : ''
+  const decodedSrc = src ? safeDecodeMention(src) : ''
   const isLocalSource = isLocalFileReference(decodedSrc)
   // Markdown 里的媒体通常写成 ![x](clip.mp4)；按扩展名升级为真正的播放器。
   const mediaKind = getInlineMediaKind(decodedSrc)
@@ -842,7 +797,11 @@ const MarkdownInlineCode = React.memo(function MarkdownInlineCode({
   return fallbackCode
 })
 
-/** 使用 react-markdown 渲染 assistant 消息内容，代码块使用 Shiki 语法高亮 */
+/**
+ * 渲染 assistant 消息内容。
+ * 默认走自研 markdown-it 管线（代码块仍由 Shiki/Mermaid 渲染）；
+ * 调用方追加 remark 插件或解析失败时，整条消息回退到 react-markdown。
+ */
 export const MessageResponse = React.memo(
   function MessageResponse({ children, className, basePath, basePaths, remarkPlugins }: MessageResponseProps): React.ReactElement {
     // 合并内置 + 外部 remark 插件（保持引用稳定）
@@ -861,10 +820,31 @@ export const MessageResponse = React.memo(
       ),
     }), [basePath, basePaths])
 
+    // 自研管线复用同一批组件，URL 清洗语义与 react-markdown 的 urlTransform 一致
+    const customComponents = React.useMemo<CustomMarkdownComponents>(() => ({
+      link: MarkdownLink,
+      image: MarkdownImage,
+      pre: MarkdownPre,
+      code: components.code,
+      transformUrl: mentionUrlTransform,
+    }), [components])
+
     const renderedMarkdown = (remarkPlugins?.includes(remarkMentions)
       ? normalizeNamedReferenceDelimiters(children)
       : children
     ).replace(/<!--PROMA_AUTOMATION:[\s\S]*?-->/g, '').trim()
+
+    const preparedMarkdown = normalizeLatexDelimiters(normalizeMalformedStrongDelimiters(renderedMarkdown))
+    const legacyMarkdown = (
+      <Markdown
+        remarkPlugins={mergedRemarkPlugins}
+        rehypePlugins={REHYPE_PLUGINS}
+        urlTransform={mentionUrlTransform}
+        components={components}
+      >
+        {preparedMarkdown}
+      </Markdown>
+    )
 
     return (
       <div
@@ -876,14 +856,15 @@ export const MessageResponse = React.memo(
           className
         )}
       >
-        <Markdown
-          remarkPlugins={mergedRemarkPlugins}
-          rehypePlugins={REHYPE_PLUGINS}
-          urlTransform={mentionUrlTransform}
-          components={components}
-        >
-          {normalizeLatexDelimiters(normalizeMalformedStrongDelimiters(renderedMarkdown))}
-        </Markdown>
+        {shouldUseCustomMarkdownRenderer(remarkPlugins)
+          ? (
+              <CustomMarkdownRenderer
+                source={preparedMarkdown}
+                components={customComponents}
+                fallback={() => legacyMarkdown}
+              />
+            )
+          : legacyMarkdown}
       </div>
     )
   },
