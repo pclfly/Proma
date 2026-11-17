@@ -231,11 +231,13 @@ describe('自研 Markdown 管线：代码块与回退', () => {
     expect(rich.value).toContain('$不是公式$')
   })
 
-  test('Given 原始 HTML When 解析 Then 返回回退标记而不是丢弃内容', () => {
-    for (const source of ['<div>块级</div>', '行内 <span>标签</span>', '<!-- 注释 -->']) {
+  test('Given 原始 HTML When 解析 Then 按字面量保留且不回退', () => {
+    const cases = ['<div>块级</div>', '行内 <span>标签</span>', '<!-- 注释 -->']
+    for (const source of cases) {
       const result = parseCustomMarkdown(source)
-      expect(result.ok).toBe(false)
-      if (!result.ok) expect(result.reason.length).toBeGreaterThan(0)
+      if (!result.ok) throw new Error(result.reason)
+      const text = JSON.stringify(result.nodes)
+      expect(text).toContain(source.includes('注释') ? '注释' : source.includes('块级') ? '块级' : '标签')
     }
   })
 

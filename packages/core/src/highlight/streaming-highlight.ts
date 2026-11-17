@@ -213,6 +213,7 @@ function reuseCompletedLines(
   nextCode: string,
   options: HighlightOptions,
   tokenize: HighlightTokenizeFn,
+  plainIncompleteTail: boolean,
 ): HighlightTokensResult | null {
   const completedLineCount = countNewlines(entry.code)
   if (completedLineCount === 0) return null
@@ -222,21 +223,25 @@ function reuseCompletedLines(
   const suffix = nextCode.slice(incompleteLineStart)
   if (suffix.length === 0) return null
 
-  const tail = tokenize({ ...options, code: suffix })
-  if (!tail) return null
-  if (tail.lines.length !== countNewlines(suffix) + 1) return null
+  // stateful 语言的未完成尾行可能与全量语法状态不同：这一帧不着色，
+  // 换行到达后由全量重算补上正确颜色，避免短暂显示错误 token。
+  const tailLines = plainIncompleteTail
+    ? suffix.split(String.fromCharCode(10)).map((line) => [{ content: line }])
+    : tokenize({ ...options, code: suffix })?.lines
+  if (!tailLines) return null
+  if (tailLines.length !== countNewlines(suffix) + 1) return null
 
   const lines = [
     ...entry.result.lines.slice(0, completedLineCount),
-    ...tail.lines,
+    ...tailLines,
   ]
   if (lines.length !== countNewlines(nextCode) + 1) return null
 
   return {
     lines,
-    bgColor: tail.bgColor,
-    fgColor: tail.fgColor,
-    language: tail.language,
+    bgColor: entry.result.bgColor,
+    fgColor: entry.result.fgColor,
+    language: entry.result.language,
   }
 }
 
@@ -276,7 +281,7 @@ export function highlightStreamingCode(
     return runFullHighlight()
   }
 
-  const reused = reuseCompletedLines(entry, code, options, state.tokenize)
+  const reused = reuseCompletedLines(entry, code, options, state.tokenize, isStatefulLanguage(language))
   if (!reused) return runFullHighlight()
 
   storeEntry(state, key, {

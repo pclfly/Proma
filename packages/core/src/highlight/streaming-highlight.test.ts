@@ -86,16 +86,22 @@ describe('流式增量高亮', () => {
     expect(second?.lines[1]?.[0]?.color).toBe('call-2')
   })
 
-  test('Given stateful 语言追加同行内容 When 高亮 Then 复用完整行、尾行重算', () => {
+  test('Given stateful 语言追加同行内容 When 高亮 Then 复用完整行、尾行暂不着色', () => {
     const { tokenize, calls } = createProbeTokenizer()
     const cache = createStreamingHighlightCache({ tokenize })
 
     const first = highlightStreamingCode(cache, { code: 'const a = 1\nconst b', language: 'typescript' })
     const second = highlightStreamingCode(cache, { code: 'const a = 1\nconst b = 2', language: 'typescript' })
 
-    expect(calls).toEqual(['const a = 1\nconst b', 'const b = 2'])
+    // 未完成尾行不再独立 token 化，避免显示与全量语法状态不符的颜色。
+    expect(calls).toEqual(['const a = 1\nconst b'])
     expect(second?.lines[0]).toBe(first?.lines[0])
     expect(second?.lines[1]?.[0]?.content).toBe('const b = 2')
+    expect(second?.lines[1]?.[0]?.color).toBeUndefined()
+
+    const third = highlightStreamingCode(cache, { code: 'const a = 1\nconst b = 2\n', language: 'typescript' })
+    expect(calls).toHaveLength(2)
+    expect(third?.lines[1]?.[0]?.color).toBe('call-2')
   })
 
   test('Given 相同代码重复请求 When 高亮 Then 命中缓存返回同一结果对象', () => {

@@ -5,8 +5,8 @@ import { getTokenStringAttr } from './token-utils'
 /**
  * markdown-it 行内 token → 虚拟节点。
  *
- * 只接受已知 token；遇到 html_inline 或未知类型直接抛错，由上层把整条消息
- * 回退到 react-markdown，绝不做「尽量渲染一部分」的降级。
+ * 只接受已知 token；原始 HTML 按字面量展示（与 react-markdown 未启用
+ * rehype-raw 一致），未知类型抛错后由上层整条回退。
  */
 
 interface InlineCursor {
@@ -106,7 +106,10 @@ function parseInlineNodes(cursor: InlineCursor, terminator: string | null): Mark
         break
       }
       case 'html_inline':
-        throw new Error('不支持原始 HTML 行内标签')
+        // 与 react-markdown 未启用 rehype-raw 时一致：标签按字面量显示。
+        pushTextNodes(nodes, token.content ?? '')
+        cursor.index += 1
+        break
       default:
         throw new Error(`未知行内 token: ${token.type}`)
     }

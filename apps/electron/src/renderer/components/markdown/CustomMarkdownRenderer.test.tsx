@@ -40,12 +40,13 @@ describe('CustomMarkdownRenderer 渲染接线', () => {
     expect(markup).not.toContain('data-fallback')
   })
 
-  test('Given 原始 HTML When 渲染 Then 整条消息交给回退管线', () => {
+  test('Given 原始 HTML When 渲染 Then 按字面量展示且不整条回退', () => {
     const source = '<div>块级</div>\n\n之后的段落'
     const markup = render(source)
-    expect(markup).toContain('data-fallback')
-    expect(markup).not.toContain('<h1>')
-    // 回退拿到的是完整源码
+    // 与 react-markdown 未启用 rehype-raw 的行为一致：标签是文本，不是 DOM。
+    expect(markup).not.toContain('data-fallback')
+    expect(markup).not.toContain('<div')
+    expect(markup).toContain('&lt;div&gt;块级&lt;/div&gt;')
     expect(markup).toContain('之后的段落')
   })
 

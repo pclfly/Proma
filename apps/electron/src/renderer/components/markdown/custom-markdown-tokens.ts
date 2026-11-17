@@ -1,6 +1,5 @@
 import MarkdownIt from 'markdown-it'
 import { parseInlineChildren } from './custom-markdown-inline'
-import { containsRawHtml } from './custom-markdown-raw-html'
 import { markdownMathPlugin } from './markdown-math-plugin'
 import { getTokenAttr, getTokenStringAttr } from './token-utils'
 import type {
@@ -17,7 +16,7 @@ import type {
 /**
  * markdown-it token 流 → 虚拟节点。
  *
- * 解析只在明确支持的语法上成功：遇到 html_block、未知 token 或未闭合容器时抛错，
+ * 解析只在明确支持的语法上成功：原始 HTML 按字面量保留；遇到未知 token 或未闭合容器时抛错，
  * 由 parseCustomMarkdown 把整条消息交给 react-markdown 回退，保证内容不丢。
  */
 
@@ -218,7 +217,10 @@ function parseBlockToken(cursor: BlockCursor): MarkdownBlockNode | null {
     case 'table_open':
       return parseTable(cursor)
     case 'html_block':
-      throw new Error('不支持原始 HTML 块')
+      // react-markdown 未启用 rehype-raw，原始 HTML 一直按字面量展示；
+      // 自研管线保持同一行为，不再整条消息回退。
+      cursor.index += 1
+      return { type: 'paragraph', tight: true, children: [{ type: 'text', value: token.content ?? '' }] }
     default:
       throw new Error(`未知块级 token: ${token.type}`)
   }
@@ -235,9 +237,6 @@ export function parseMarkdownTokens(tokens: readonly MarkdownTokenLike[]): Markd
 /** Markdown 源文本 → 虚拟节点；失败时返回回退标记，由调用方整条交给 react-markdown。 */
 export function parseCustomMarkdown(source: string): CustomMarkdownParseResult {
   if (!source.trim()) return { ok: true, nodes: [] }
-  if (containsRawHtml(source)) {
-    return { ok: false, reason: '源码含原始 HTML，回退到 react-markdown' }
-  }
 
   try {
     const tokens = getCustomMarkdownIt().parse(source, {})
